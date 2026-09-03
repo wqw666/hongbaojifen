@@ -1,0 +1,7 @@
+# 部署/构建脚本会被 scp 到 Ubuntu 服务器直接执行，必须保持 LF（CRLF 会导致 bad interpreter）
+*.sh text eol=lf
+VERSION text eol=lf
+deploy.sh text eol=lf
+start.sh text eol=lf
+stop.sh text eol=lf
+build.sh text eol=lf
