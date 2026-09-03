@@ -31,6 +31,15 @@ class AppConfig:
     first_run_done: bool = False
     onebot_http_base: str = "http://127.0.0.1:3001"
 
+    # ---- 总后台对接（执行器功能 v1）----
+    backend_base: str = "http://localhost:8892"  # 总后台地址
+    backend_api_key: str = "hbjf-open-2026"      # X-Api-Key 对接密钥
+    executor_token: str = ""                     # 执行器 token（总后台新增执行器生成）
+    executor_name: str = ""                      # 执行器名称（仅展示）
+    heartbeat_interval_sec: int = 30             # 心跳/命令轮询间隔（秒，最小 5）
+    member_group_id: str = ""                    # 会员群号（成员自动注册为该群会员）
+    auto_sync_members: bool = False              # 周期任务里自动同步会员（≥5 分钟一次）
+
     def watch_group_list(self) -> list[str]:
         return [x.strip() for x in self.watch_groups.replace("，", ",").split(",") if x.strip()]
 

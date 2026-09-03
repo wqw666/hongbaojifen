@@ -33,7 +33,8 @@ excludes = [
 
 a = Analysis(
     [str(GUI / "main.py")],
-    pathex=[str(GUI)],
+    # GUI 之外还必须含根目录：顶层 integration 包（总后台对接）靠它进包
+    pathex=[str(GUI), str(ROOT)],
     binaries=[],
     datas=datas,
     hiddenimports=["customtkinter", "requests", "urllib3", "certifi", "qrcode", "PIL", "PIL.Image"],

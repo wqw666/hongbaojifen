@@ -55,6 +55,7 @@ def main() -> int:
         src_root / "client",
         src_root / "plugin_bundle",
         src_root / "scripts",
+        src_root / "integration",
     ):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -97,6 +98,8 @@ def main() -> int:
         shutil.copy2(plugin_mjs, src_root / "plugin" / "dist" / "index.mjs")
     for name in ("package.json", "tsconfig.json", "vite.config.ts"):
         shutil.copy2(root / "plugin" / name, src_root / "plugin" / name)
+    for f in (root / "integration").glob("*.py"):
+        shutil.copy2(f, src_root / "integration" / f.name)
     shutil.copy2(root / "client" / "query.py", src_root / "client" / "query.py")
     bundle_dir = root / "plugin_bundle"
     if bundle_dir.exists():

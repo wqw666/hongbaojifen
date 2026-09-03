@@ -13,6 +13,7 @@ from typing import Callable
 import customtkinter as ctk
 
 from .api_client import ApiError, PluginClient
+from .backend_tab import BackendTab
 from .config_manager import AppConfig, find_napcat_launcher, load_config, save_config
 from .napcat_paths import find_napcat_dir, qrcode_png_path
 from .napcat_webui import NapCatWebUI
@@ -150,6 +151,7 @@ class MainWindow(ctk.CTk):
         self.tab_monitor = self.tabs.add("实时监控")
         self.tab_query = self.tabs.add("历史查询")
         self.tab_settings = self.tabs.add("设置")
+        self.tab_backend = self.tabs.add("总后台对接")
         self.tab_help = self.tabs.add("使用说明")
 
         self._build_login_tab()
@@ -157,6 +159,7 @@ class MainWindow(ctk.CTk):
         self._build_monitor_tab()
         self._build_query_tab()
         self._build_settings_tab()
+        self._build_backend_tab()
         self._build_help_tab()
 
     def _build_login_tab(self) -> None:
@@ -1324,6 +1327,17 @@ class MainWindow(ctk.CTk):
         sec = max(1.0, float(self.cfg.poll_interval_sec))
         self._poll_job = self.after(int(sec * 1000), self._schedule_poll)
 
+    def _build_backend_tab(self) -> None:
+        """总后台对接（执行器功能）：独立模块挂载，见 backend_tab.BackendTab。"""
+        self.backend_tab = BackendTab(
+            self.tab_backend,
+            cfg=self.cfg,
+            client=self.client,
+            save_config=save_config,
+            app_version=APP_VERSION,
+        )
+        self.backend_tab.pack(fill="both", expand=True)
+
     def _on_close(self) -> None:
         self._polling = False
         if self._login_poll_job:
@@ -1336,4 +1350,10 @@ class MainWindow(ctk.CTk):
                 self.after_cancel(self._poll_job)
             except Exception:
                 pass
+        # 停掉总后台对接线程，避免关窗后残留 daemon 线程刷事件
+        try:
+            if getattr(self, "backend_tab", None):
+                self.backend_tab.shutdown()
+        except Exception:
+            pass
         self.destroy()
