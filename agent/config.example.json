@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "autoGrab": true,
+  "autoPullDetail": true,
+  "watchGroups": [],
+  "delayMin": 800,
+  "delayMax": 2000,
+  "handlePassword": true,
+  "masterQQ": ""
+}

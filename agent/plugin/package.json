@@ -1,0 +1,21 @@
+{
+  "name": "napcat-plugin-hongbao-monitor",
+  "plugin": "红包监控",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "description": "对接 QQ 电脑端：收红包、查红包领取详情（领取人/时间/金额）。发红包请手动。",
+  "author": "qqjiankong",
+  "napcat": {
+    "tags": ["工具", "红包"],
+    "minVersion": "4.14.0"
+  },
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "vite": "^6.0.0"
+  }
+}
