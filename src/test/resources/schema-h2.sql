@@ -56,3 +56,14 @@ CREATE TABLE IF NOT EXISTS admin_users (
     password_hash VARCHAR(255) NOT NULL, nickname VARCHAR(64) DEFAULT '',
     created_at VARCHAR(19) DEFAULT '', updated_at VARCHAR(19) DEFAULT ''
 );
+-- V1.0.1 执行器命令通道（与迁移 V1.0.1__executor_commands.sql 一致；FK 级联删命令）
+CREATE TABLE IF NOT EXISTS executor_commands (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    executor_id BIGINT NOT NULL,
+    command VARCHAR(64) DEFAULT '',
+    params TEXT, status VARCHAR(16) DEFAULT 'pending',
+    result TEXT, dispatched_at VARCHAR(19) DEFAULT '',
+    created_at VARCHAR(19) DEFAULT '', updated_at VARCHAR(19) DEFAULT '',
+    CONSTRAINT fk_cmds_executor FOREIGN KEY (executor_id) REFERENCES executors(id) ON DELETE CASCADE
+);
+

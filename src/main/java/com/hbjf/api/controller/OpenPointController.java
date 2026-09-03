@@ -1,10 +1,14 @@
 package com.hbjf.api.controller;
 
 import com.hbjf.api.service.MemberService;
+import com.hbjf.api.service.OpenMemberService;
 import com.hbjf.api.util.MapBuilder;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -14,6 +18,7 @@ import java.util.Map;
  *   POST /api/open/points/up     {qq, points, reason, bizNo?}   上分
  *   POST /api/open/points/down   {qq, points, reason, bizNo?}   下分（余额不足拒绝）
  *   GET  /api/open/points/{qq}                                  查积分
+ *   GET  /api/open/points/batch?qqs=10001,10002,...             批量查积分（≤500，逗号分隔）
  *   GET  /api/open/points/records?qq=&page=&size=               查流水
  */
 @RestController
@@ -21,11 +26,14 @@ import java.util.Map;
 public class OpenPointController {
 
     private static final String OPERATOR = "open";
+    private static final int QUERY_BATCH_MAX = 500;
 
     private final MemberService memberService;
+    private final OpenMemberService openMemberService;
 
-    public OpenPointController(MemberService memberService) {
+    public OpenPointController(MemberService memberService, OpenMemberService openMemberService) {
         this.memberService = memberService;
+        this.openMemberService = openMemberService;
     }
 
     /** 上分（增加积分） */
@@ -63,6 +71,20 @@ public class OpenPointController {
                 "total_outcome", m.get("total_outcome"),
                 "nickname", m.get("nickname"),
                 "exists", true)));
+    }
+
+    /** 批量查积分（逗号分隔 qqs，去重保序，最多 500 个；缺失返回 exists=false） */
+    @GetMapping("/batch")
+    public ResponseEntity<Map<String, Object>> batchQuery(@RequestParam String qqs) {
+        if (qqs == null || qqs.trim().isEmpty()) return err("qqs不能为空");
+        List<String> list = new ArrayList<>(new LinkedHashSet<>());
+        for (String part : qqs.split(",")) {
+            String q = part.trim();
+            if (!q.isEmpty()) list.add(q);
+        }
+        if (list.isEmpty()) return err("qqs不能为空");
+        if (list.size() > QUERY_BATCH_MAX) return err("一次最多查询 " + QUERY_BATCH_MAX + " 个QQ");
+        return ok(MapBuilder.of("list", openMemberService.queryPointsBatch(list), "total", list.size()));
     }
 
     /** 查询积分增减记录 */
