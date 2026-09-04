@@ -5,12 +5,17 @@ import com.hbjf.api.dao.RowMapMapper;
 import com.hbjf.api.exception.ApiException;
 import com.hbjf.api.exception.ErrorCode;
 import com.hbjf.api.util.MapBuilder;
+import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -26,6 +31,12 @@ import java.util.UUID;
 public class PlayRuleService {
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final Logger log = LoggerFactory.getLogger(PlayRuleService.class);
+    /** 随 jar 内置的默认玩法（classpath:seed_rules/；迁移 V1.0.2 已插对应元数据行） */
+    private static final String[][] SEED_RULES = {
+            {"seed_rules/rule_add1.py", "seed_rule_add1.py"},
+            {"seed_rules/rule_add2.py", "seed_rule_add2.py"},
+    };
 
     private final JdbcTemplate jdbc;
     private final AppProperties props;
@@ -43,6 +54,30 @@ public class PlayRuleService {
         return dir;
     }
 
+    /** 首次启动把默认玩法文件从 classpath 落盘到 rules-dir（纯 SQL 写不了磁盘文件，
+     *  元数据由迁移插入，二者配合才构成可用玩法）。文件已存在则跳过 ——
+     *  不覆盖用户重传/替换过的同名玩法；失败只告警，不阻断启动。 */
+    @PostConstruct
+    public void ensureSeedRules() {
+        for (String[] pair : SEED_RULES) {
+            try {
+                ClassPathResource cp = new ClassPathResource(pair[0]);
+                if (!cp.exists()) {
+                    log.warn("默认玩法资源缺失，跳过: {}", pair[0]);
+                    continue;
+                }
+                File target = new File(rulesDir().getAbsoluteFile(), pair[1]);
+                if (target.exists()) continue;
+                try (InputStream in = cp.getInputStream()) {
+                    Files.copy(in, target.toPath());
+                }
+                log.info("默认玩法已落盘: {}", target.getAbsolutePath());
+            } catch (Exception e) {
+                log.warn("默认玩法落盘失败: {}", pair[0], e);
+            }
+        }
+    }
+
     /** 上传玩法文件 */
     public Map<String, Object> upload(String name, String description, String version, MultipartFile file) {
         if (name == null || name.trim().isEmpty()) throw new ApiException(ErrorCode.PARAM_INVALID, "玩法名称不能为空");
@@ -54,9 +89,12 @@ public class PlayRuleService {
         int dot = original.lastIndexOf('.');
         if (dot >= 0) ext = original.substring(dot).toLowerCase();
         String diskName = UUID.randomUUID().toString().replace("-", "") + ext;
-        File target = new File(rulesDir(), diskName);
+        // transferTo 遇到相对路径会解析到 Servlet 临时目录（Tomcat 行为），导致与
+        // getFile()/delete() 的 File("./data/rules") 基准不一致（上传成功、下载即"文件已丢失"）。
+        // 统一转绝对路径，确保存到 rulesDir() 同一个目录。
+        File target = new File(rulesDir().getAbsoluteFile(), diskName);
         try {
-            file.transferTo(target);
+            file.transferTo(target.getAbsoluteFile());
         } catch (IOException e) {
             throw new ApiException(ErrorCode.INTERNAL_ERROR, "文件保存失败: " + e.getMessage());
         }

@@ -18,6 +18,12 @@ export interface PluginConfig {
   handlePassword: boolean;
   /** 主人 QQ（通知用，可空） */
   masterQQ: string;
+  /** 玩法转发总开关（false=不把群消息推给 agent 玩法引擎） */
+  playEnabled: boolean;
+  /** 玩法转发群白名单（空=全部群） */
+  playGroups: string[];
+  /** agent 本地玩法引擎回调地址 */
+  playCallback: string;
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -30,6 +36,9 @@ export const DEFAULT_CONFIG: PluginConfig = {
   delayMax: 2000,
   handlePassword: true,
   masterQQ: '',
+  playEnabled: false,
+  playGroups: [],
+  playCallback: 'http://127.0.0.1:6101/play/msg',
 };
 
 /** 红包消息里提取到的上下文 */

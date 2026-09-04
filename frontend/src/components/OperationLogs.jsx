@@ -1,13 +1,16 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { Card, Table, Input, Button, Space, Tag } from 'antd'
+import { Card, Input, Button, Space, Tag } from 'antd'
 import { SearchOutlined, ReloadOutlined } from '@ant-design/icons'
 import api from '../api'
+import ResizableTable from './ResizableTable'
 
 const ACTION_COLOR = {
   登录: 'blue', 上分: 'green', 下分: 'red', 新增会员: 'cyan', 更新会员: 'geekblue',
-  删除会员: 'red', 新增QQ号: 'purple', 批量新增QQ号: 'purple', 删除QQ号: 'red',
-  新增QQ群: 'orange', 更新QQ群: 'gold', 删除QQ群: 'red',
+  删除会员: 'red', 新增操作员: 'purple', 更新操作员: 'geekblue', 删除操作员: 'red',
+  新增QQ号: 'purple', 批量新增QQ号: 'purple', 删除QQ号: 'red', // 历史操作记录兼容
+  新增QQ群: 'orange', 更新QQ群: 'gold', 删除QQ群: 'red', 封禁QQ群: 'red', 解封QQ群: 'green',
   新增执行器: 'volcano', 更新执行器: 'volcano', 删除执行器: 'red', 重置执行器token: 'volcano',
+  封禁执行器: 'red', 封禁并重置执行器token: 'magenta', 解封执行器: 'green',
   上传玩法: 'magenta', 更新玩法: 'magenta', 删除玩法: 'red',
 }
 
@@ -38,14 +41,14 @@ export default function OperationLogs() {
   ]
 
   return (
-    <Card title="页面操作记录">
+    <Card title="操作记录">
       <Space style={{ marginBottom: 16 }}>
         <Input placeholder="操作人/对象/详情 模糊搜索" allowClear style={{ width: 240 }} value={keyword}
                onChange={e => setKeyword(e.target.value)} onPressEnter={load} />
         <Button type="primary" icon={<SearchOutlined />} onClick={load}>查询</Button>
         <Button icon={<ReloadOutlined />} onClick={() => { setKeyword(''); load() }}>刷新</Button>
       </Space>
-      <Table rowKey="id" size="middle" columns={columns} dataSource={list} loading={loading}
+      <ResizableTable rowKey="id" size="middle" columns={columns} dataSource={list} loading={loading}
              pagination={{ pageSize: 50, showTotal: t => `共 ${t} 条` }} />
     </Card>
   )

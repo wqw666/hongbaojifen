@@ -1,8 +1,9 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react'
-import { Card, Table, Input, Button, Space, Modal, Form, Upload, message, Popconfirm, Tag, Alert, Typography } from 'antd'
+import { Card, Input, Button, Space, Modal, Form, Upload, Select, message, Popconfirm, Tag, Alert, Typography } from 'antd'
 import { PlusOutlined, SearchOutlined, ReloadOutlined, EditOutlined, DeleteOutlined,
          DownloadOutlined, InboxOutlined } from '@ant-design/icons'
 import api from '../api'
+import ResizableTable from './ResizableTable'
 
 const { Text } = Typography
 const { Dragger } = Upload
@@ -71,14 +72,20 @@ export default function PlayRuleManager() {
   }
 
   const download = async row => {
-    // 直接打开下载链接（带 token）
-    const token = localStorage.getItem('at')
-    const a = document.createElement('a')
-    a.href = `/api/admin/rules/${row.id}/download`
-    a.download = row.name
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
+    // 下载接口需 JWT，必须走 axios 带 Authorization 头拿 blob，<a href> 跳转会 401
+    try {
+      const res = await api.get(`/api/admin/rules/${row.id}/download`, { responseType: 'blob' })
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = row.name
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      message.error('下载失败：' + (e?.response?.data?.message || e.message))
+    }
   }
 
   const columns = [
@@ -120,7 +127,7 @@ export default function PlayRuleManager() {
                 onClick={() => { uploadForm.resetFields(); setFile(null); setUploadOpen(true) }}>上传玩法文件</Button>
       </Space>
 
-      <Table rowKey="id" size="middle" columns={columns} dataSource={list} loading={loading}
+      <ResizableTable rowKey="id" size="middle" columns={columns} dataSource={list} loading={loading}
              pagination={{ pageSize: 20, showTotal: t => `共 ${t} 条` }} />
 
       {/* 上传 */}

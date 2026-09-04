@@ -10,7 +10,7 @@ from .backend_client import HbjfClient
 
 
 def register_self_admin_qq(client: HbjfClient, login_info_provider, nickname: str = "", remark: str = "agent登录QQ") -> dict:
-    """把当前登录的 QQ 上报到总后台 qq_accounts（type=admin_qq）。返回总后台响应 data。"""
+    """把当前登录的 QQ 上报到总后台 qq_accounts（操作员，type=admin_qq）。返回总后台响应 data。"""
     info = login_info_provider() or {}
     qq = str(info.get("uin") or info.get("user_id") or "").strip()
     if not qq or not qq.isdigit():
@@ -18,4 +18,4 @@ def register_self_admin_qq(client: HbjfClient, login_info_provider, nickname: st
     if not nickname:
         # NapCat GetQQLoginInfo 的昵称键是 nick；兼容 nickname/card
         nickname = str(info.get("nick") or info.get("nickname") or info.get("card") or "")
-    return client.upsert_qq_account(qq, qq_type="admin_qq", nickname=nickname, remark=remark)
+    return client.upsert_qq_account(qq, nickname=nickname, remark=remark)

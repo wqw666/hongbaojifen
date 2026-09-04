@@ -83,16 +83,12 @@ class OpenManageTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.created").value(false));
 
-        mvc.perform(get("/api/open/qq-accounts").param("type", "admin_qq").header("X-Api-Key", KEY))
+        // 语义已收窄为操作员(admin_qq)：type 参数废弃，列表恒返回操作员
+        mvc.perform(get("/api/open/qq-accounts").header("X-Api-Key", KEY))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.length()").value(1))
                 .andExpect(jsonPath("$.data[0].qq").value("10001"))
                 .andExpect(jsonPath("$.data[0].nickname").value("机器人2"));
-
-        // 普通类型列表不含 admin
-        mvc.perform(get("/api/open/qq-accounts").param("type", "qq").header("X-Api-Key", KEY))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.length()").value(0));
 
         mvc.perform(delete("/api/open/qq-accounts/10001").header("X-Api-Key", KEY))
                 .andExpect(status().isOk());

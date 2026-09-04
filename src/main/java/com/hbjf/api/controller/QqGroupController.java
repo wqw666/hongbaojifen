@@ -11,7 +11,8 @@ import org.springframework.web.bind.annotation.*;
 import java.util.Map;
 
 /**
- * QQ群管理
+ * QQ群管理（管理员）
+ * 状态：active 正常 / banned 封禁（封群=停玩停同步）；封禁可填原因
  */
 @RestController
 @RequestMapping("/api/admin/qq-groups")
@@ -47,9 +48,27 @@ public class QqGroupController {
     public ResponseEntity<Map<String, Object>> update(@PathVariable Long id, @RequestBody Map<String, String> body,
                                                       Authentication auth, HttpServletRequest request) {
         qqGroupService.update(id, body.get("group_name"), body.get("owner_qq"), body.get("admin_qqs"),
-                body.get("member_count"), body.get("status"));
+                body.get("member_count"), body.get("status"), body.get("note"));
         operationLogService.log(operator(auth), "更新QQ群", String.valueOf(id), body.get("group_name"), clientIp(request));
         return ResponseEntity.ok(MapBuilder.of("code", 0, "message", "已更新"));
+    }
+
+    /** 封禁（停玩停同步） */
+    @PostMapping("/{id}/ban")
+    public ResponseEntity<Map<String, Object>> ban(@PathVariable Long id, @RequestBody Map<String, String> body,
+                                                   Authentication auth, HttpServletRequest request) {
+        qqGroupService.ban(id, body.get("reason"));
+        operationLogService.log(operator(auth), "封禁QQ群", String.valueOf(id), body.get("reason"), clientIp(request));
+        return ResponseEntity.ok(MapBuilder.of("code", 0, "message", "已封禁，该群玩法与成员同步将停止"));
+    }
+
+    /** 解封 */
+    @PostMapping("/{id}/unban")
+    public ResponseEntity<Map<String, Object>> unban(@PathVariable Long id, Authentication auth,
+                                                     HttpServletRequest request) {
+        qqGroupService.unban(id);
+        operationLogService.log(operator(auth), "解封QQ群", String.valueOf(id), "", clientIp(request));
+        return ResponseEntity.ok(MapBuilder.of("code", 0, "message", "已解封"));
     }
 
     /** 删除 */

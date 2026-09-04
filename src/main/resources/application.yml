@@ -34,3 +34,5 @@ app:
     api-key: hbjf-open-2026
   # 玩法规则文件存储目录
   rules-dir: ./data/rules
+  # 执行器离线判定：超过该秒数未收到心跳即置为离线（agent 心跳默认 10s，此处 30s≈3 个周期容错；封禁中的执行器不受影响）
+  executor-offline-seconds: 30

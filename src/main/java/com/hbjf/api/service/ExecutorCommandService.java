@@ -34,9 +34,11 @@ public class ExecutorCommandService {
     private static final int LIST_LIMIT = 200;
 
     private final JdbcTemplate jdbc;
+    private final ExecutorService executorService;
 
-    public ExecutorCommandService(JdbcTemplate jdbc) {
+    public ExecutorCommandService(JdbcTemplate jdbc, ExecutorService executorService) {
         this.jdbc = jdbc;
+        this.executorService = executorService;
     }
 
     // ========== 管理端：下发/查询 ==========
@@ -105,9 +107,9 @@ public class ExecutorCommandService {
 
     // ========== 开放端：poll / 回报 ==========
 
-    /** agent 拉取待执行命令（token 校验；sent 超时重排 + 原子取走标记） */
+    /** agent 拉取待执行命令（token 校验+封禁守卫；sent 超时重排 + 原子取走标记） */
     public List<Map<String, Object>> poll(String token) {
-        Map<String, Object> exe = findExecutorByToken(token);
+        Map<String, Object> exe = executorService.resolveByToken(token);
 
         // 1) 重排：sent 超过 5 分钟未回报 → 回 pending 重新投递
         String staleBefore = LocalDateTime.now().minusMinutes(SENT_TIMEOUT_MINUTES).format(FMT);
@@ -132,9 +134,9 @@ public class ExecutorCommandService {
         return rows;
     }
 
-    /** agent 回报命令执行结果（仅能回报自己的命令） */
+    /** agent 回报命令执行结果（仅能回报自己的命令；封禁中被拒） */
     public void reportResult(String token, Long commandId, String status, String message) {
-        Map<String, Object> exe = findExecutorByToken(token);
+        Map<String, Object> exe = executorService.resolveByToken(token);
         if (commandId == null) throw new ApiException(ErrorCode.PARAM_INVALID, "命令id不能为空");
         if (!"done".equals(status) && !"failed".equals(status)) {
             throw new ApiException(ErrorCode.PARAM_INVALID, "status 只能是 done/failed");
@@ -143,16 +145,5 @@ public class ExecutorCommandService {
         int rows = jdbc.update("UPDATE executor_commands SET status=?, result=?, updated_at=? WHERE id=? AND executor_id=?",
                 status, message == null ? "" : message, now, commandId, exe.get("id"));
         if (rows == 0) throw new ApiException(ErrorCode.NOT_FOUND, "命令不存在或不属于该执行器");
-    }
-
-    /** token → 执行器（与 ExecutorService.heartbeat 同款校验，因命令服务独立故局部实现） */
-    private Map<String, Object> findExecutorByToken(String token) {
-        if (token == null || token.isEmpty()) throw new ApiException(ErrorCode.NOT_LOGGED_IN, "token不能为空");
-        try {
-            return jdbc.queryForObject("SELECT id, name FROM executors WHERE token=?",
-                    new RowMapMapper(), token);
-        } catch (org.springframework.dao.EmptyResultDataAccessException e) {
-            throw new ApiException(ErrorCode.NOT_FOUND, "执行器不存在或token已重置");
-        }
     }
 }

@@ -36,12 +36,30 @@ class AppConfig:
     backend_api_key: str = "hbjf-open-2026"      # X-Api-Key 对接密钥
     executor_token: str = ""                     # 执行器 token（总后台新增执行器生成）
     executor_name: str = ""                      # 执行器名称（仅展示）
-    heartbeat_interval_sec: int = 30             # 心跳/命令轮询间隔（秒，最小 5）
+    heartbeat_interval_sec: int = 10             # 心跳/命令轮询间隔（秒，默认 10，最小 5）
     member_group_id: str = ""                    # 会员群号（成员自动注册为该群会员）
     auto_sync_members: bool = False              # 周期任务里自动同步会员（≥5 分钟一次）
 
+    # ---- 游戏玩法（v2：多游戏群 + 结算上报）----
+    play_rule_id: int = 0                        # 启用中的玩法 id（0=未启用）
+    play_rule_name: str = ""                     # 玩法名@版本（仅展示）
+    play_group_id: str = ""                      # 游戏群号（逗号分隔多个）
+    play_enabled: bool = False                   # 玩法运行开关
+    play_callback_port: int = 6101               # agent 本地玩法回调端口（插件转发目标）
+    play_auto_register_members: bool = False     # 启用玩法后自动把游戏群成员注册为会员（幂等）
+
+    def plays_dir(self) -> Path:
+        """玩法规则文件本地缓存目录（%APPDATA%/QQHongbaoMonitor/plays）。"""
+        d = config_dir() / "plays"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
     def watch_group_list(self) -> list[str]:
         return [x.strip() for x in self.watch_groups.replace("，", ",").split(",") if x.strip()]
+
+    def play_group_list(self) -> list[str]:
+        """游戏群号列表（play_group_id 逗号分隔，容忍中文逗号）。"""
+        return [x.strip() for x in self.play_group_id.replace("，", ",").split(",") if x.strip()]
 
     def plugin_api(self, path: str) -> str:
         base = self.napcat_base.rstrip("/")

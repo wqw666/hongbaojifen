@@ -34,6 +34,8 @@ public class ApiException extends RuntimeException {
             case WRONG_CREDENTIALS:
                 return HttpStatus.UNAUTHORIZED;
             case PERMISSION_DENIED:
+            case EXECUTOR_BANNED:
+            case OPERATOR_DISABLED:
                 return HttpStatus.FORBIDDEN;
             case NOT_FOUND:
                 return HttpStatus.NOT_FOUND;

@@ -30,9 +30,14 @@ public class OpenGroupService {
         this.qqGroupService = qqGroupService;
     }
 
-    /** 上报/更新群信息（group_id 必填；返回 created 区分新增/更新） */
+    /**
+     * 上报/更新群信息（group_id 必填；返回 created 区分新增/更新）
+     * @param executorId 上报执行器 id（>=1 时绑定为当前管理执行器，展示用）
+     * @param createTime 群创建时间（QQ 群信息接口值；空不覆盖已有值）
+     */
     public Map<String, Object> upsert(String groupId, String groupName, String ownerQq,
-                                      String adminQqs, String memberCount, String note) {
+                                      String adminQqs, String memberCount, String note,
+                                      Long executorId, String createTime) {
         if (groupId == null || !groupId.trim().matches("\\d{5,12}")) {
             throw new ApiException(ErrorCode.PARAM_INVALID, "群号格式不正确");
         }
@@ -49,35 +54,51 @@ public class OpenGroupService {
             }
         }
 
+        // create_time 只接受 yyyy-MM-dd HH:mm:ss 格式（防空串/脏值覆盖真值）
+        String ct = normalizeCreateTime(createTime);
+        Long exeId = executorId == null ? 0L : executorId;
+
         Map<String, Object> exists = findByGroupId(gid);
         if (exists != null) {
             jdbc.update("UPDATE qq_groups SET group_name=COALESCE(NULLIF(?,''),group_name),"
                             + " owner_qq=COALESCE(NULLIF(?,''),owner_qq),"
                             + " admin_qqs=COALESCE(NULLIF(?,''),admin_qqs),"
                             + " member_count=COALESCE(?,member_count),"
+                            + " create_time=COALESCE(NULLIF(?,''),create_time),"
+                            + " executor_id=CASE WHEN ? > 0 THEN ? ELSE executor_id END,"
                             + " updated_at=? WHERE group_id=?",
                     groupName == null ? "" : groupName, ownerQq == null ? "" : ownerQq,
-                    adminQqs == null ? "" : adminQqs, count, now, gid);
+                    adminQqs == null ? "" : adminQqs, count, ct, exeId, exeId, now, gid);
             return MapBuilder.of("group_id", gid, "created", false);
         }
 
         try {
-            jdbc.update("INSERT INTO qq_groups (group_id, group_name, owner_qq, admin_qqs, member_count, status, note, created_at, updated_at)"
-                            + " VALUES (?,?,?,?,?,?,?,?,?)",
+            jdbc.update("INSERT INTO qq_groups (group_id, group_name, owner_qq, admin_qqs, member_count, status,"
+                            + " create_time, note, executor_id, created_at, updated_at)"
+                            + " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     gid, groupName == null ? "" : groupName, ownerQq == null ? "" : ownerQq,
                     adminQqs == null ? "" : adminQqs, count == null ? 0 : count, "active",
-                    note == null ? "" : note, now, now);
+                    ct, note == null ? "" : note, exeId, now, now);
         } catch (org.springframework.dao.DuplicateKeyException e) {
             // 并发新增兜底：改走更新
             jdbc.update("UPDATE qq_groups SET group_name=COALESCE(NULLIF(?,''),group_name),"
                             + " owner_qq=COALESCE(NULLIF(?,''),owner_qq),"
                             + " admin_qqs=COALESCE(NULLIF(?,''),admin_qqs),"
                             + " member_count=COALESCE(?,member_count),"
+                            + " create_time=COALESCE(NULLIF(?,''),create_time),"
+                            + " executor_id=CASE WHEN ? > 0 THEN ? ELSE executor_id END,"
                             + " updated_at=? WHERE group_id=?",
                     groupName == null ? "" : groupName, ownerQq == null ? "" : ownerQq,
-                    adminQqs == null ? "" : adminQqs, count, now, gid);
+                    adminQqs == null ? "" : adminQqs, count, ct, exeId, exeId, now, gid);
         }
         return MapBuilder.of("group_id", gid, "created", true);
+    }
+
+    private String normalizeCreateTime(String createTime) {
+        if (createTime == null || createTime.trim().isEmpty()) return "";
+        String t = createTime.trim();
+        if (t.length() != 19 || !t.matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}")) return "";
+        return t;
     }
 
     /** 群列表（委托管理端读路径） */

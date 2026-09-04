@@ -2,6 +2,7 @@ import type { PluginModule } from './napcat-shim.js';
 import { config, initStore, saveConfig } from './store.js';
 import { onGrabRedBagNotify, onRawRedPacketMessage, onRedPacketMessage, registerRoutes } from './api.js';
 import { attachGrabRedBagListener, attachKernelMsgListener, hookPullDetailForDebug, setPullDetailCaptureDir } from './redpacket.js';
+import { handlePlayMessage, registerPlayRoutes } from './play.js';
 
 let detachKernel: (() => void) | null = null;
 let detachGrab: (() => void) | null = null;
@@ -10,6 +11,7 @@ export const plugin_init: PluginModule['plugin_init'] = async (ctx) => {
   initStore(ctx.dataPath, ctx.configPath);
   setPullDetailCaptureDir(ctx.dataPath);
   registerRoutes(ctx);
+  registerPlayRoutes(ctx);
 
   detachKernel = attachKernelMsgListener(ctx, (raw) => onRawRedPacketMessage(ctx, raw));
   detachGrab = attachGrabRedBagListener(ctx, (info) => onGrabRedBagNotify(ctx, info));
@@ -26,11 +28,12 @@ export const plugin_init: PluginModule['plugin_init'] = async (ctx) => {
 };
 
 export const plugin_onmessage: PluginModule['plugin_onmessage'] = async (ctx, event) => {
-  // 别人发的是 message；自己发的是 message_sent —— 都要处理
+  // 别人发的是 message；自己发的是 message_sent —— 都要处理（红包两者都看；玩法只看 message）
   const pt = event?.post_type;
   if (pt !== 'message' && pt !== 'message_sent') return;
   try {
     await onRedPacketMessage(ctx, event);
+    await handlePlayMessage(ctx, event);
   } catch (e) {
     ctx.logger?.error?.('[红包监控] 处理消息异常', e);
   }

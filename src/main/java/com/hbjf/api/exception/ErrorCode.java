@@ -11,6 +11,8 @@ public enum ErrorCode {
     TOKEN_EXPIRED(40101, "Token 已过期"),
     WRONG_CREDENTIALS(40102, "用户名或密码错误"),
     PERMISSION_DENIED(40300, "权限不足"),
+    EXECUTOR_BANNED(40310, "执行器已被封禁"),
+    OPERATOR_DISABLED(40311, "操作员QQ已停用"),
     NOT_FOUND(40400, "资源不存在"),
     BALANCE_NOT_ENOUGH(40900, "积分不足"),
     DUPLICATE_BIZ(40901, "重复的业务单号"),

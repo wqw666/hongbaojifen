@@ -4,7 +4,10 @@
 - 连接设置：总后台地址 / X-Api-Key / 执行器 token / 名称 / 心跳间隔
 - 测试连接、保存到 AppConfig；启动/停止 SyncWorker（心跳 + 远程命令执行回报）
 - 会员群：选择群（总后台群列表 / 手动上报插件监控群）设为会员群，一键同步全部成员为会员
-- 管理员 QQ：上报本机登录 QQ / 手动新增 / 删除（总后台 qq_accounts）
+  群已被总后台封禁（status=banned）→ 拒设会员群/拒立即同步
+- 操作员QQ：通过本 agent 登录并连总后台的 QQ 均为操作员（普通QQ即群会员，走会员同步，总后台
+  QQ 号管理模块已删除）。对接启动后自动随心跳登记/续活并记录最近登录时间/登录IP/登录位置
+- 封禁停摆：执行器被封禁（40310）或操作员被停用（40311）→ 对接线程停摆红字提示，解封后可重启
 - 命令/事件日志
 
 线程纪律：所有网络操作在临时 daemon 线程，UI 一律 after(0) 回主线程改控件
@@ -19,14 +22,32 @@ from typing import Any, Callable
 
 import customtkinter as ctk
 
-from integration.backend_client import BackendError, HbjfClient
-from integration.member_sync import run_member_sync
+from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
+from integration.member_sync import group_create_time_str, run_member_sync
 from integration.sync_worker import SyncWorker
 
 if False:  # pragma: no cover — 仅类型注释用
     from .config_manager import AppConfig
 
-_TYPE_LABELS = {"admin_qq": "管理员QQ", "qq": "普通QQ"}
+_QQ_STATUS_TEXT = {"active": "正常", "disabled": "已停用"}
+
+
+def _qq_row_line(r: dict) -> str:
+    """操作员QQ 列表行：QQ 昵称 [状态] [手动上下分] 最近登录时间/IP/位置 备注。"""
+    status = str(r.get("status") or "active")
+    manual = str(r.get("can_manual_points") or "allowed")
+    line = (f"{r.get('qq')}  {r.get('nickname') or '（无昵称）'}  "
+            f"[{_QQ_STATUS_TEXT.get(status, status)}]  "
+            f"[{'可手动上下分' if manual == 'allowed' else '禁手动'}]")
+    extra = []
+    login = " ".join(str(x).strip() for x in (r.get("last_login_at"),
+                                              r.get("last_login_ip"),
+                                              r.get("last_host")) if str(x).strip())
+    if login:
+        extra.append("最近登录 " + login)
+    if r.get("remark"):
+        extra.append("备注:" + str(r.get("remark")))
+    return line + ("  " + "  ".join(extra) if extra else "")
 
 
 class BackendTab(ctk.CTkScrollableFrame):
@@ -43,6 +64,7 @@ class BackendTab(ctk.CTkScrollableFrame):
         self._payload_cache: dict[str, tuple[float, dict]] = {}
         self._group_rows: list[dict] = []
         self._qq_rows: list[dict] = []
+        self._login_cache: tuple[float, dict | None] | None = None  # 本机登录QQ信息缓存（心跳 admin_qq 用）
 
         self._build_ui()
 
@@ -120,24 +142,20 @@ class BackendTab(ctk.CTkScrollableFrame):
         self.lbl_sync = ctk.CTkLabel(card, text="同步结果：—", text_color="gray", wraplength=720, justify="left", anchor="w")
         self.lbl_sync.pack(fill="x", padx=10, pady=(2, 8))
 
-        # ---- QQ 号管理 ----
+        # ---- 操作员QQ ----
         card = ctk.CTkFrame(self)
         card.pack(fill="x", padx=4, pady=6)
-        ctk.CTkLabel(card, text="QQ 号管理（总后台）", font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", padx=10, pady=(8, 2))
+        ctk.CTkLabel(card, text="操作员QQ（总后台登记；普通QQ=群会员，走会员同步）",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", padx=10, pady=(8, 2))
 
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=2)
-        self.var_qq_type = ctk.StringVar(value="admin_qq")
-        opt = ctk.CTkOptionMenu(row, values=["管理员QQ", "普通QQ"], width=110,
-                                command=lambda _v: self._qq_type_changed())
-        opt.pack(side="left")
-        ctk.CTkButton(row, text="刷新列表", width=100, command=self._refresh_qqs).pack(side="left", padx=6)
-        ctk.CTkButton(row, text="上报本机登录QQ", width=140,
-                      command=self._upload_self_qq).pack(side="left", padx=6)
-        ctk.CTkLabel(row, text="通过本 agent 登录连接总后台的 QQ = 管理员QQ", text_color="gray",
-                     font=ctk.CTkFont(size=11)).pack(side="left", padx=8)
+        ctk.CTkButton(row, text="刷新列表", width=100, command=self._refresh_qqs).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(row, text="上报本机登录QQ", width=140, command=self._upload_self_qq).pack(side="left", padx=6)
+        ctk.CTkLabel(row, text="对接启动后本机登录QQ自动随心跳登记/续活并记录登录信息，也可手动上报",
+                     text_color="gray", font=ctk.CTkFont(size=11)).pack(side="left", padx=8)
 
-        self.txt_qqs = ctk.CTkTextbox(card, height=110, state="disabled", font=ctk.CTkFont(size=12))
+        self.txt_qqs = ctk.CTkTextbox(card, height=120, state="disabled", font=ctk.CTkFont(size=12))
         self.txt_qqs.pack(fill="x", padx=10, pady=2)
 
         row = ctk.CTkFrame(card, fg_color="transparent")
@@ -231,6 +249,7 @@ class BackendTab(ctk.CTkScrollableFrame):
             members_provider=self._members_provider,
             group_provider=self._group_provider,
             plugin_config_sync=getattr(self.client, "sync_plugin_config", None),
+            admin_qq_provider=self._admin_qq_provider,
             version=self.app_version or "dev",
         )
         self.worker.start_worker()
@@ -241,7 +260,7 @@ class BackendTab(ctk.CTkScrollableFrame):
         try:
             return max(5, int(self.var_interval.get()))
         except ValueError:
-            return 30
+            return 10
 
     def _stop_worker(self) -> None:
         if self.worker:
@@ -284,6 +303,15 @@ class BackendTab(ctk.CTkScrollableFrame):
         elif kind == "fatal":
             self.lbl_state.configure(text="异常退出", text_color="#e74c3c")
             self._log(f"对接线程异常：{payload}")
+        elif kind == "banned":
+            self._mark_banned(payload)
+
+    def _mark_banned(self, reason) -> None:
+        """执行器被封禁/操作员被停用 → 停摆红字（须在 UI 线程调用）。"""
+        self.lbl_state.configure(text="已封禁/停用（停摆）", text_color="#e74c3c")
+        self._set_hb("心跳已停（停摆）", "#e74c3c")
+        self.lbl_sync.configure(text=f"停摆：{reason}", text_color="#e74c3c")
+        self._log(f"执行器停摆：{reason}。需总后台解封/停用解除或更换 token 后重新「启动对接」")
 
     # ================= 群管理 =================
 
@@ -298,6 +326,7 @@ class BackendTab(ctk.CTkScrollableFrame):
                 rows = client.list_groups()
                 self._group_rows = rows
                 labels = [f"{g.get('group_id')}  {g.get('group_name')}（{g.get('member_count')}人）"
+                          + ("  [已封禁]" if str(g.get("status")) == "banned" else "")
                           for g in rows]
                 self.after(0, lambda: self._fill_group_menu(labels))
             except BackendError as e:
@@ -315,10 +344,20 @@ class BackendTab(ctk.CTkScrollableFrame):
         text = self.opt_group.get()
         return text.split("  ", 1)[0].strip() if text and text != "（暂无群）" and text != "（先刷新群列表）" else ""
 
+    def _group_status(self, gid: str) -> str:
+        """总后台群列表里该群的状态（active/banned）；没刷新/总后台没建档返回 ''（不拦首次上报）。"""
+        for g in self._group_rows:
+            if str(g.get("group_id")) == str(gid):
+                return str(g.get("status") or "active")
+        return ""
+
     def _set_member_group(self) -> None:
         gid = self._selected_group_id()
         if not gid:
             self._log("请先在列表中选中一个群")
+            return
+        if self._group_status(gid) == "banned":
+            self._log(f"群 {gid} 已被总后台封禁（停玩停同步），不能设为会员群")
             return
         self.var_member_group.set(gid)
         self.cfg.member_group_id = gid
@@ -338,8 +377,10 @@ class BackendTab(ctk.CTkScrollableFrame):
             for gid in groups:
                 payload = self._fetch_payload(gid)
                 try:
-                    client.upsert_group(gid, group_name=(payload or {}).get("group_name", ""),
-                                        member_count=(payload or {}).get("member_count", ""))
+                    payload = payload or {}
+                    client.upsert_group(gid, group_name=payload.get("group_name", ""),
+                                        member_count=payload.get("member_count", ""),
+                                        create_time=group_create_time_str(payload))
                     ok += 1
                 except BackendError as e:
                     self.after(0, lambda e=e, gid=gid: self._log(f"上报群 {gid} 失败：{e}"))
@@ -380,6 +421,9 @@ class BackendTab(ctk.CTkScrollableFrame):
         if not gid:
             self._log("请先填写会员群号（或从群列表「设为会员群」）")
             return
+        if self._group_status(gid) == "banned":
+            self._log(f"群 {gid} 已被总后台封禁（停玩停同步），本次同步取消")
+            return
         self.var_member_group.set(gid)
         self._apply_to_cfg()
         self.save_config(self.cfg)
@@ -401,6 +445,8 @@ class BackendTab(ctk.CTkScrollableFrame):
                                                                text_color="#e67e22" if warn else "#2ecc71"),
                                        self._log(msg)))
                 self.after(0, self._refresh_groups)
+            except (ExecutorBanned, OperatorDisabled) as e:
+                self.after(0, lambda e=e: self._mark_banned(e))
             except Exception as e:  # noqa: BLE001 — 插件/网络等一切失败都回显
                 self.after(0, lambda: (self.lbl_sync.configure(text=f"同步失败：{e}", text_color="#e74c3c"),
                                        self._log(f"同步失败：{e}")))
@@ -409,18 +455,11 @@ class BackendTab(ctk.CTkScrollableFrame):
 
         threading.Thread(target=work, daemon=True).start()
 
-    # ================= QQ 号管理 =================
-
-    def _qq_type_changed(self) -> None:
-        self._refresh_qqs()
-
-    def _current_type(self) -> str:
-        return "admin_qq" if self.var_qq_type.get() == "管理员QQ" else "qq"
+    # ================= 操作员QQ =================
 
     def _fill_qqs(self, rows: list[dict]) -> None:
         self._qq_rows = rows
-        lines = [f"{r.get('qq')}  {r.get('nickname') or '（无昵称）'}  {_TYPE_LABELS.get(str(r.get('type')), r.get('type'))}  {r.get('remark') or ''}"
-                 for r in rows]
+        lines = [_qq_row_line(r) for r in rows]
         self.txt_qqs.configure(state="normal")
         self.txt_qqs.delete("1.0", "end")
         self.txt_qqs.insert("1.0", "\n".join(lines) if lines else "（空）")
@@ -431,58 +470,83 @@ class BackendTab(ctk.CTkScrollableFrame):
 
         def work() -> None:
             try:
-                rows = client.list_qq_accounts(self._current_type())
+                rows = client.list_qq_accounts()
                 self.after(0, lambda: (self._fill_qqs(rows), self._log(
-                    f"QQ 号列表已刷新：{len(rows)} 条")))
+                    f"操作员QQ 列表已刷新：{len(rows)} 条")))
             except BackendError as e:
-                self.after(0, lambda: self._log(f"刷新 QQ 号失败：{e}"))
+                self.after(0, lambda: self._log(f"刷新操作员QQ 失败：{e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _upload_self_qq(self) -> None:
-        from integration.auth import register_self_admin_qq
-
-        def info_provider() -> dict:
+    def _login_info(self) -> dict | None:
+        """取本机登录QQ信息（含 qq/uin/nickname/nick 冗余键，60s 缓存）。
+        来源：NapCat WebUI get_login_info；取不到回退插件状态 self_uin；再取不到返回 None。"""
+        now = time.time()
+        if self._login_cache and now - self._login_cache[0] < 60:
+            return self._login_cache[1]
+        info = {}
+        try:
             from .napcat_paths import find_napcat_dir
             from .napcat_webui import NapCatWebUI
 
             napcat = find_napcat_dir(self.cfg)
-            if not napcat:
-                raise RuntimeError("未找到 NapCat 目录")
-            webui = NapCatWebUI.from_napcat_dir(self.cfg.napcat_base, napcat)
-            if not webui.ping():
-                raise RuntimeError("NapCat 未就绪")
-            return webui.get_login_info() or {}
+            if napcat:
+                webui = NapCatWebUI.from_napcat_dir(self.cfg.napcat_base, napcat)
+                if webui.ping():
+                    info = webui.get_login_info() or {}
+        except Exception:  # noqa: BLE001 — 找不到目录/未登录等静默降级
+            info = {}
+        if not info:
+            try:
+                st = self.client.get_status()
+                uin = getattr(st, "self_uin", None)
+                if uin is None and isinstance(st, dict):
+                    uin = st.get("self_uin")
+                if uin:
+                    info = {"uin": uin}
+            except Exception:  # noqa: BLE001
+                pass
+        qq = str(info.get("uin") or info.get("user_id") or "").strip()
+        result = None
+        if qq.isdigit():
+            nick = str(info.get("nick") or info.get("nickname") or "").strip()
+            result = {"qq": qq, "uin": qq, "nickname": nick, "nick": nick}
+        self._login_cache = (now, result)
+        return result
+
+    def _admin_qq_provider(self) -> dict | None:
+        """SyncWorker 心跳用的本机管理员QQ（worker 线程调用，失败静默返回 None）。"""
+        return self._login_info()
+
+    def _upload_self_qq(self) -> None:
+        from integration.auth import register_self_admin_qq
 
         def work() -> None:
             try:
-                r = register_self_admin_qq(self._backend_client(), info_provider)
+                r = register_self_admin_qq(self._backend_client(), self._login_info)
                 self.after(0, lambda: (self._log(
-                    f"本机登录 QQ {r.get('qq')} 已登记为管理员（新增={r.get('created')}）"),
+                    f"本机登录 QQ {r.get('qq')} 已登记为操作员（新增={r.get('created')}）"),
                     self._refresh_qqs()))
             except Exception as e:  # noqa: BLE001 — 找不到目录/未登录等都回显
-                self.after(0, lambda: self._log(f"上报本机 QQ 失败：{e}"))
+                self.after(0, lambda: self._log(f"上报本机登录QQ失败：{e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _add_qq(self) -> None:
         qq = self.var_new_qq.get().strip()
         if not qq:
-            self._log("请填写要新增的 QQ 号")
+            self._log("请填写要新增的操作员QQ号")
             return
-        qq_type = self._current_type()
         client = self._backend_client()
 
         def work() -> None:
             try:
-                r = client.upsert_qq_account(qq, qq_type=qq_type,
-                                             nickname=self.var_new_nick.get().strip(),
+                r = client.upsert_qq_account(qq, nickname=self.var_new_nick.get().strip(),
                                              remark="agent管理")
                 self.after(0, lambda: (self._log(
-                    f"QQ {qq} 已登记（{_TYPE_LABELS.get(qq_type, qq_type)}，新增={r.get('created')}）"),
-                    self._refresh_qqs()))
+                    f"操作员QQ {qq} 已登记（新增={r.get('created')}）"), self._refresh_qqs()))
             except BackendError as e:
-                self.after(0, lambda: self._log(f"新增 QQ 失败：{e}"))
+                self.after(0, lambda: self._log(f"新增操作员QQ失败：{e}"))
 
         threading.Thread(target=work, daemon=True).start()
 

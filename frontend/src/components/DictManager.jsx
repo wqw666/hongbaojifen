@@ -1,7 +1,8 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { Card, Table, Input, Button, Space, Modal, Form, message, Popconfirm } from 'antd'
+import { Card, Input, Button, Space, Modal, Form, message, Popconfirm } from 'antd'
 import { PlusOutlined, SearchOutlined, ReloadOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons'
 import api from '../api'
+import ResizableTable from './ResizableTable'
 
 export default function DictManager() {
   const [list, setList] = useState([])
@@ -61,20 +62,20 @@ export default function DictManager() {
   ]
 
   return (
-    <Card title="字典管理">
+    <Card title="配置管理">
       <Space style={{ marginBottom: 16 }}>
         <Input placeholder="Key 模糊搜索" allowClear style={{ width: 200 }} value={key}
                onChange={e => setKey(e.target.value)} onPressEnter={load} />
         <Button type="primary" icon={<SearchOutlined />} onClick={load}>查询</Button>
         <Button icon={<ReloadOutlined />} onClick={() => { setKey(''); load() }}>重置</Button>
         <Button type="primary" icon={<PlusOutlined />}
-                onClick={() => { setEditRow(null); form.resetFields(); setEditOpen(true) }}>新增字典</Button>
+                onClick={() => { setEditRow(null); form.resetFields(); setEditOpen(true) }}>新增配置</Button>
       </Space>
 
-      <Table rowKey="id" size="middle" columns={columns} dataSource={list} loading={loading}
+      <ResizableTable rowKey="id" size="middle" columns={columns} dataSource={list} loading={loading}
              pagination={{ pageSize: 20, showTotal: t => `共 ${t} 条` }} />
 
-      <Modal title={editRow ? '编辑字典' : '新增字典'} open={editOpen} onCancel={() => setEditOpen(false)}
+      <Modal title={editRow ? '编辑配置' : '新增配置'} open={editOpen} onCancel={() => setEditOpen(false)}
              onOk={() => form.submit()} destroyOnClose>
         <Form form={form} onFinish={submit} layout="vertical">
           <Form.Item name="key" label="Key" rules={[{ required: true, message: '请输入Key' }]}>

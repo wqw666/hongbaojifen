@@ -1,9 +1,10 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { Card, Table, Input, Select, Button, Space, Modal, Form, InputNumber, message,
+import { Card, Input, Select, Button, Space, Modal, Form, InputNumber, message,
          Popconfirm, Tag, Drawer, Row, Col, Statistic } from 'antd'
 import { PlusOutlined, SearchOutlined, ReloadOutlined, RiseOutlined, FallOutlined,
          HistoryOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons'
 import api from '../api'
+import ResizableTable from './ResizableTable'
 
 export default function MemberManager() {
   const [list, setList] = useState([])
@@ -98,7 +99,8 @@ export default function MemberManager() {
     { title: '当前积分', dataIndex: 'points', width: 90, sorter: (a, b) => a.points - b.points },
     { title: '累计上分', dataIndex: 'total_income', width: 90 },
     { title: '累计下分', dataIndex: 'total_outcome', width: 90 },
-    { title: '来源群', dataIndex: 'group_id', width: 100 },
+    { title: '来源群', dataIndex: 'group_id', width: 100, render: v => v || '—' },
+    { title: '注册人QQ', dataIndex: 'registrar_qq', width: 100, render: v => v || '—' },
     { title: '状态', dataIndex: 'status', width: 80, render: v =>
         <Tag color={v === 'active' ? 'green' : 'default'}>{v === 'active' ? '正常' : '停用'}</Tag> },
     { title: '备注', dataIndex: 'note', ellipsis: true },
@@ -138,7 +140,7 @@ export default function MemberManager() {
           <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditRow(null); setEditOpen(true) }}>新增会员</Button>
         </Space>
 
-        <Table rowKey="id" columns={columns} dataSource={list} loading={loading}
+        <ResizableTable rowKey="id" columns={columns} dataSource={list} loading={loading}
                size="middle" scroll={{ x: 1100 }} pagination={{ pageSize: 20 }} />
       </Card>
 
@@ -176,7 +178,7 @@ export default function MemberManager() {
 
       {/* 流水抽屉 */}
       <Drawer title={`积分流水 — ${recordQq}`} width={680} open={recordOpen} onClose={() => setRecordOpen(false)}>
-        <Table rowKey="id" size="small" loading={recordLoading} dataSource={records}
+        <ResizableTable rowKey="id" size="small" loading={recordLoading} dataSource={records}
                pagination={{ current: recordPage, total: recordTotal, pageSize: 20, showTotal: t => `共 ${t} 条`,
                  onChange: loadRecords }}
                columns={[

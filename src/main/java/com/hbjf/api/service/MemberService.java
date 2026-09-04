@@ -35,7 +35,7 @@ public class MemberService {
     /** 列表（QQ/昵称模糊 + 状态过滤） */
     public List<Map<String, Object>> list(String keyword, String status) {
         StringBuilder sql = new StringBuilder(
-                "SELECT id, qq, nickname, points, total_income, total_outcome, group_id, status, note, created_at, updated_at FROM members WHERE 1=1");
+                "SELECT id, qq, nickname, points, total_income, total_outcome, group_id, status, note, registrar_qq, created_at, updated_at FROM members WHERE 1=1");
         List<Object> args = new java.util.ArrayList<>();
         if (keyword != null && !keyword.isEmpty()) {
             sql.append(" AND (qq LIKE ? OR nickname LIKE ?)");
@@ -63,7 +63,7 @@ public class MemberService {
     private Map<String, Object> findOne(String whereSql, Object arg) {
         try {
             return jdbc.queryForObject(
-                    "SELECT id, qq, nickname, points, total_income, total_outcome, group_id, status, note, created_at, updated_at FROM members"
+                    "SELECT id, qq, nickname, points, total_income, total_outcome, group_id, status, note, registrar_qq, created_at, updated_at FROM members"
                             + whereSql,
                     new RowMapMapper(), arg);
         } catch (org.springframework.dao.EmptyResultDataAccessException e) {

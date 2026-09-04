@@ -65,15 +65,16 @@ public class OpenMemberService {
 
     /**
      * 批量注册会员（幂等）
-     * 入参：members = [{qq, nickname?, group_id?}]
-     * 已存在：existed+1；nickname/group_id 非空才覆盖（防空串冲库）
+     * 入参：members = [{qq, nickname?, group_id?}]；registrarQq = 注册人（管理员QQ，记录建档来源）
+     * 已存在：existed+1；nickname/group_id 非空才覆盖（防空串冲库）；已存在行的注册人不覆盖
      * 非法 qq：skipped+1，不中断整批
      */
-    public Map<String, Object> registerBatch(List<Map<String, Object>> members) {
+    public Map<String, Object> registerBatch(List<Map<String, Object>> members, String registrarQq) {
         if (members == null || members.isEmpty()) throw new ApiException(ErrorCode.PARAM_INVALID, "members不能为空");
         if (members.size() > REGISTER_BATCH_MAX) throw new ApiException(ErrorCode.PARAM_INVALID, "一次最多注册 " + REGISTER_BATCH_MAX + " 个会员");
 
         String now = LocalDateTime.now().format(FMT);
+        String registrar = registrarQq == null ? "" : registrarQq.trim();
         int added = 0, existed = 0, skipped = 0;
         for (Map<String, Object> m : members) {
             String qq = m.get("qq") == null ? "" : String.valueOf(m.get("qq")).trim();
@@ -84,8 +85,9 @@ public class OpenMemberService {
                 continue;
             }
             try {
-                jdbc.update("INSERT INTO members (qq, nickname, group_id, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-                        qq, nickname, groupId, "active", now, now);
+                jdbc.update("INSERT INTO members (qq, nickname, group_id, status, registrar_qq, created_at, updated_at)"
+                                + " VALUES (?,?,?,?,?,?,?)",
+                        qq, nickname, groupId, "active", registrar, now, now);
                 added++;
             } catch (org.springframework.dao.DuplicateKeyException e) {
                 existed++;

@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react'
 import { Layout, Menu, Dropdown, Avatar, message } from 'antd'
 import {
-  UserOutlined, HistoryOutlined, QqOutlined, TeamOutlined, CrownOutlined,
-  BookOutlined, ThunderboltOutlined, GiftOutlined, LogoutOutlined
+  UserOutlined, HistoryOutlined, TeamOutlined, CrownOutlined,
+  BookOutlined, ThunderboltOutlined, GiftOutlined, PlayCircleOutlined, LogoutOutlined
 } from '@ant-design/icons'
 import { Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-dom'
 import api from './api'
@@ -14,18 +14,19 @@ import QqGroupManager from './components/QqGroupManager'
 import DictManager from './components/DictManager'
 import ExecutorManager from './components/ExecutorManager'
 import PlayRuleManager from './components/PlayRuleManager'
+import GameRecords from './components/GameRecords'
 
 const { Sider, Header, Content } = Layout
 
 const MENU = [
   { key: '/members', icon: <UserOutlined />, label: '会员管理' },
-  { key: '/logs', icon: <HistoryOutlined />, label: '页面操作记录管理' },
-  { key: '/qq-accounts', icon: <QqOutlined />, label: 'QQ号管理' },
   { key: '/qq-groups', icon: <TeamOutlined />, label: 'QQ群管理' },
-  { key: '/admin-qq-accounts', icon: <CrownOutlined />, label: '管理员QQ号管理' },
-  { key: '/dicts', icon: <BookOutlined />, label: '字典' },
+  { key: '/operators', icon: <CrownOutlined />, label: '操作员管理' },
+  { key: '/dicts', icon: <BookOutlined />, label: '配置管理' },
   { key: '/executors', icon: <ThunderboltOutlined />, label: '执行器管理' },
   { key: '/rules', icon: <GiftOutlined />, label: '会员玩法管理' },
+  { key: '/game-records', icon: <PlayCircleOutlined />, label: '游戏记录' },
+  { key: '/logs', icon: <HistoryOutlined />, label: '操作记录' },
 ]
 
 function App() {
@@ -82,12 +83,12 @@ function App() {
             <Route path="/" element={<Navigate to="/members" replace />} />
             <Route path="/members" element={<MemberManager />} />
             <Route path="/logs" element={<OperationLogs />} />
-            <Route path="/qq-accounts" element={<QqAccountManager type="qq" />} />
-            <Route path="/admin-qq-accounts" element={<QqAccountManager type="admin_qq" />} />
+            <Route path="/operators" element={<QqAccountManager />} />
             <Route path="/qq-groups" element={<QqGroupManager />} />
             <Route path="/dicts" element={<DictManager />} />
             <Route path="/executors" element={<ExecutorManager />} />
             <Route path="/rules" element={<PlayRuleManager />} />
+            <Route path="/game-records" element={<GameRecords />} />
             <Route path="*" element={<Navigate to="/members" replace />} />
           </Routes>
         </Content>

@@ -7,3 +7,6 @@ data/
 *.iml
 .vscode/
 .DS_Store
+
+# 迁移包 redbag（NapCat+Python 老实现，不入库）
+redbag/

@@ -1494,6 +1494,8 @@ export function registerRoutes(ctx: NapCatPluginContext) {
       ok(res, {
         group_id: groupId,
         group_name: String(group.group_name || group.groupName || ''),
+        // NapCat get_group_info 可能带群创建时间（unix 秒），透传给 agent 上报总后台展示
+        group_create_time: Number(group.group_create_time || group.groupCreateTime || 0) || 0,
         member_count: Number(group.member_count || group.memberCount || members.length || 0),
         max_member_count: Number(group.max_member_count || group.maxMemberCount || 0),
         members,

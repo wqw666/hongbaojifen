@@ -15,6 +15,7 @@ import customtkinter as ctk
 from .api_client import ApiError, PluginClient
 from .backend_tab import BackendTab
 from .config_manager import AppConfig, find_napcat_launcher, load_config, save_config
+from .play_tab import PlayTab
 from .napcat_paths import find_napcat_dir, qrcode_png_path
 from .napcat_webui import NapCatWebUI
 from .plugin_deploy import deploy_plugin
@@ -152,6 +153,7 @@ class MainWindow(ctk.CTk):
         self.tab_query = self.tabs.add("历史查询")
         self.tab_settings = self.tabs.add("设置")
         self.tab_backend = self.tabs.add("总后台对接")
+        self.tab_play = self.tabs.add("游戏玩法")
         self.tab_help = self.tabs.add("使用说明")
 
         self._build_login_tab()
@@ -160,6 +162,7 @@ class MainWindow(ctk.CTk):
         self._build_query_tab()
         self._build_settings_tab()
         self._build_backend_tab()
+        self._build_play_tab()
         self._build_help_tab()
 
     def _build_login_tab(self) -> None:
@@ -1338,6 +1341,17 @@ class MainWindow(ctk.CTk):
         )
         self.backend_tab.pack(fill="both", expand=True)
 
+    def _build_play_tab(self) -> None:
+        """游戏玩法（群聊自动回复引擎）：独立模块挂载，见 play_tab.PlayTab。"""
+        self.play_tab = PlayTab(
+            self.tab_play,
+            cfg=self.cfg,
+            client=self.client,
+            save_config=save_config,
+            app_version=APP_VERSION,
+        )
+        self.play_tab.pack(fill="both", expand=True)
+
     def _on_close(self) -> None:
         self._polling = False
         if self._login_poll_job:
@@ -1354,6 +1368,12 @@ class MainWindow(ctk.CTk):
         try:
             if getattr(self, "backend_tab", None):
                 self.backend_tab.shutdown()
+        except Exception:
+            pass
+        # 停掉玩法回调服务 + 消息 worker
+        try:
+            if getattr(self, "play_tab", None):
+                self.play_tab.shutdown()
         except Exception:
             pass
         self.destroy()
