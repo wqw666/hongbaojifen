@@ -24,6 +24,8 @@ export interface PluginConfig {
   playGroups: string[];
   /** agent 本地玩法引擎回调地址 */
   playCallback: string;
+  /** 玩法最近一次启用时间戳（ms，0=未启用）：只处理此后的红包，历史红包不推 */
+  playEnabledAt?: number;
 }
 
 export const DEFAULT_CONFIG: PluginConfig = {
@@ -39,6 +41,7 @@ export const DEFAULT_CONFIG: PluginConfig = {
   playEnabled: false,
   playGroups: [],
   playCallback: 'http://127.0.0.1:6101/play/msg',
+  playEnabledAt: 0,
 };
 
 /** 红包消息里提取到的上下文 */

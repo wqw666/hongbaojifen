@@ -37,6 +37,7 @@ import {
   sleep,
   isValidUin,
 } from './redpacket.js';
+import { isFinalPushed, notifyRedPacket } from './play.js';
 
 /** 与 redpacket 内 sanitizeAuthKey 相同：只留 32 hex */
 function sanitizeAuthKey(v: unknown): string {
@@ -1752,6 +1753,75 @@ export async function onRawRedPacketMessage(ctx: NapCatPluginContext, raw: any) 
   await handleWallet(ctx, wallet, { fromGrayTip: fromGray });
 }
 
+/** 组装红包计分玩法推送 payload（群/单号/发送者/领取明细/汇总）。 */
+function redpacketPlayPayload(ctx: NapCatPluginContext, rec: RedPacketRecord | undefined) {
+  if (!rec) return null;
+  const selfUin = String(ctx.core?.selfInfo?.uin || '');
+  const claims = (rec.claims || []).map((c) => ({
+    qq: String(c.uin || ''),
+    name: String(c.name || ''),
+    amount: Number(c.amount || 0),
+    time: Number(c.time || 0),  // unix 秒：领取时间（回放用）
+  }));
+  const s = rec.summary || {};
+  return {
+    kind: 'redpacket',
+    group_id: String(rec.groupId || ''),
+    bill_no: String(rec.billNo || ''),
+    sender_uin: String(rec.senderUin || ''),
+    sender_name: String(rec.senderName || ''),
+    total_num: Number((s as any).totalNum || 0),
+    recv_num: Number((s as any).recvNum || 0),
+    total_amount: Number((s as any).totalAmount || 0),
+    msg_time: Number(rec.msgTime || 0),
+    self_uin: selfUin,
+    claims,
+  };
+}
+
+/** 玩法红包轮询：普通红包无逐人领取灰条，定时重拉未领完红包的详情，
+ *  发现领取变化（人数/份数）即推送 agent；已领完补一次最终推送。 */
+export async function sweepRedPacketPlay(ctx: NapCatPluginContext) {
+  if (!config.playEnabled) return;
+  const now = Date.now();
+  let done = 0;
+  for (const rec of records.values()) {
+    if (done >= 3) break;  // 每轮最多刷 3 个包，避免拉详情风暴
+    const gid = String(rec.groupId ?? '');
+    if (!gid) continue;
+    if (config.playGroups.length && !config.playGroups.includes(gid)) continue;
+    // 开启玩法之前的红包不轮询（历史数据不回复）
+    const enabledAt = Number(config.playEnabledAt || 0);
+    if (enabledAt && rec.msgTime * 1000 < enabledAt) continue;
+    const s = rec.summary || parseSendOrderSummary(rec.rawDetail);
+    if (!s || !s.totalNum) continue;                    // 无汇总信息：无法判定未领完
+    const doneAlready = s.recvNum >= s.totalNum;
+    if (doneAlready && isFinalPushed(rec.billNo)) continue;  // 已领完且推送过最终状态
+    if (!doneAlready && now - (rec.updatedAt || 0) < 20_000) continue;  // 20 秒内刚刷过
+    done += 1;
+    try {
+      const before = (rec.claims || []).length;
+      await refreshRecordDetail(ctx, rec);
+      const after = getRecord(rec.billNo);
+      if (!after) continue;
+      const afterS = after.summary || parseSendOrderSummary(after.rawDetail);
+      const changed = (after.claims || []).length !== before
+        || (afterS && s && afterS.recvNum !== s.recvNum);
+      const doneNow = afterS && afterS.totalNum && afterS.recvNum >= afterS.totalNum;
+      if (changed || doneNow) {
+        const payload = redpacketPlayPayload(ctx, after);
+        if (payload) notifyRedPacket(ctx, payload);
+        if (changed) {
+          ctx.logger?.info?.(`[红包监控] 玩法轮询 发现领取变化 bill=${rec.billNo.slice(-10)} ` +
+            `claims=${before}->${(after.claims || []).length} recv=${afterS?.recvNum}/${afterS?.totalNum}`);
+        }
+      }
+    } catch (e) {
+      ctx.logger?.warn?.('[红包监控] 玩法轮询刷新失败', e);
+    }
+  }
+}
+
 async function handleWallet(
   ctx: NapCatPluginContext,
   wallet: WalletContext,
@@ -1811,12 +1881,14 @@ async function handleWallet(
 
       if (config.enabled && config.autoPullDetail && (wallet.pcBody || existing?.pcBody)) {
         try {
-          await sleep(600);
+          await sleep(100);
           await refreshRecordDetail(ctx, getRecord(wallet.billNo)!);
         } catch (e) {
           ctx.logger?.warn?.('[红包监控] 灰条后 pullDetail 失败', e);
         }
       }
+      const rpPayload = redpacketPlayPayload(ctx, getRecord(wallet.billNo));
+      if (rpPayload) notifyRedPacket(ctx, rpPayload);
     } catch (e) {
       ctx.logger?.warn?.('[红包监控] 灰条处理失败', e);
     }
@@ -1905,7 +1977,7 @@ async function handleWallet(
 
     if (config.autoPullDetail && (wallet.pcBody || existing?.pcBody)) {
       try {
-        await sleep(isSelf || opts.fromGrayTip ? 1500 : 1000);
+        await sleep(isSelf ? 500 : 300);
         const detail = await pullDetail(ctx, {
           ...wallet,
           pcBody: wallet.pcBody || existing?.pcBody,
@@ -1930,6 +2002,8 @@ async function handleWallet(
         ctx.logger?.warn?.('[红包监控] pullDetail 失败（可稍后 /query refresh）', e);
       }
     }
+    const rpPayload2 = redpacketPlayPayload(ctx, getRecord(wallet.billNo));
+    if (rpPayload2) notifyRedPacket(ctx, rpPayload2);
   } finally {
     // 稍后再放开，避免短时间重复触发
     setTimeout(() => processingBills.delete(wallet.billNo), 8000);

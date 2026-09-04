@@ -82,12 +82,13 @@ CREATE TABLE IF NOT EXISTS game_records (
     group_id VARCHAR(32) DEFAULT '', executor_id BIGINT DEFAULT 0,
     executor_name VARCHAR(64) DEFAULT '', operator_qq VARCHAR(32) DEFAULT '',
     member_count INT DEFAULT 0, total_delta BIGINT DEFAULT 0, event_count INT DEFAULT 0,
-    warning VARCHAR(512) DEFAULT '', created_at VARCHAR(19) DEFAULT ''
+    warning VARCHAR(512) DEFAULT '', warning_count INT DEFAULT 0, warning_detail CLOB DEFAULT '',
+    created_at VARCHAR(19) DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS game_record_events (
     id BIGINT AUTO_INCREMENT PRIMARY KEY, record_id BIGINT NOT NULL,
     qq VARCHAR(32) DEFAULT '', nickname VARCHAR(64) DEFAULT '',
     msg VARCHAR(512) DEFAULT '', reply VARCHAR(512) DEFAULT '',
-    delta BIGINT DEFAULT 0, created_at VARCHAR(19) DEFAULT ''
+    delta BIGINT DEFAULT 0, ev_time VARCHAR(19) DEFAULT '', created_at VARCHAR(19) DEFAULT ''
 );
 

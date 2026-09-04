@@ -863,6 +863,8 @@ export async function refreshWalletFromMessage(
 ): Promise<Partial<WalletContext> & { billNo: string }> {
   const groupId = String(wallet.groupId || wallet.peerUin || wallet.peerUid || '');
   if (!groupId) return wallet;
+  // 已有完整领取参数时直接复用：跳过历史消息扫描（省 5~8 秒，领取回复更快）
+  if (wallet.pcBody && wallet.stringIndex) return wallet;
 
   const meta = await scanWalletMetaFromHistory(ctx, {
     billNo: wallet.billNo,

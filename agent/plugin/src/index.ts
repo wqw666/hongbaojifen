@@ -2,10 +2,12 @@ import type { PluginModule } from './napcat-shim.js';
 import { config, initStore, saveConfig } from './store.js';
 import { onGrabRedBagNotify, onRawRedPacketMessage, onRedPacketMessage, registerRoutes } from './api.js';
 import { attachGrabRedBagListener, attachKernelMsgListener, hookPullDetailForDebug, setPullDetailCaptureDir } from './redpacket.js';
+import { sweepRedPacketPlay } from './api.js';
 import { handlePlayMessage, registerPlayRoutes } from './play.js';
 
 let detachKernel: (() => void) | null = null;
 let detachGrab: (() => void) | null = null;
+let sweepTimer: ReturnType<typeof setInterval> | null = null;
 
 export const plugin_init: PluginModule['plugin_init'] = async (ctx) => {
   initStore(ctx.dataPath, ctx.configPath);
@@ -15,6 +17,10 @@ export const plugin_init: PluginModule['plugin_init'] = async (ctx) => {
 
   detachKernel = attachKernelMsgListener(ctx, (raw) => onRawRedPacketMessage(ctx, raw));
   detachGrab = attachGrabRedBagListener(ctx, (info) => onGrabRedBagNotify(ctx, info));
+  // 玩法红包轮询：普通红包无领取灰条，定时刷新未领完红包并推送领取变化
+  sweepTimer = setInterval(() => {
+    sweepRedPacketPlay(ctx).catch(() => {});
+  }, 25000);
   try {
     hookPullDetailForDebug(ctx);
   } catch {
@@ -43,11 +49,13 @@ export const plugin_cleanup: PluginModule['plugin_cleanup'] = async (ctx) => {
   try {
     detachKernel?.();
     detachGrab?.();
+    if (sweepTimer) clearInterval(sweepTimer);
   } catch {
     /* ignore */
   }
   detachKernel = null;
   detachGrab = null;
+  sweepTimer = null;
   ctx.logger?.info?.('[红包监控] 已卸载');
 };
 

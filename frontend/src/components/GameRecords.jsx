@@ -68,9 +68,9 @@ export default function GameRecords() {
     },
     { title: '事件数', dataIndex: 'event_count', width: 80 },
     {
-      title: '异常', dataIndex: 'warning', width: 100,
-      render: v => v
-        ? <Tooltip title={v}><Tag color="red">有异常({v.split('; ').filter(Boolean).length})</Tag></Tooltip>
+      title: '异常', dataIndex: 'warning_count', width: 90,
+      render: (v, row) => (v > 0 || row.warning)
+        ? <Tooltip title={row.warning || ''}><Tag color="red">异常({v || (row.warning || '').split('; ').filter(Boolean).length})</Tag></Tooltip>
         : <Tag color="green">无</Tag>,
     },
     { title: '上报时间', dataIndex: 'created_at', width: 165 },
@@ -94,7 +94,7 @@ export default function GameRecords() {
                onChange={e => setPlayName(e.target.value)} onPressEnter={() => load(1)} />
         <Button type="primary" icon={<SearchOutlined />} onClick={() => load(1)}>查询</Button>
         <Button icon={<ReloadOutlined />} onClick={() => { setGroupId(''); setPlayName(''); load(1) }}>重置</Button>
-        <Text type="secondary" style={{ fontSize: 12 }}>agent 每局游戏结算后自动上报，默认保留 30 天（可在配置管理调 retention 天数）</Text>
+        <Text type="secondary" style={{ fontSize: 12 }}>agent 每局游戏结算后自动上报，默认保留 30 天（可在「字典」调整 game_record_retention_days）</Text>
       </Space>
 
       <ResizableTable rowKey="id" size="middle" columns={columns} dataSource={list} loading={loading}
@@ -104,7 +104,7 @@ export default function GameRecords() {
                onChange: p => load(p),
              }} />
 
-      <Drawer title="对局回放" width={760} open={replayOpen} onClose={() => setReplayOpen(false)} loading={replayLoading}>
+      <Drawer title="对局回放" width={988} open={replayOpen} onClose={() => setReplayOpen(false)} loading={replayLoading}>
         {rec && (
           <>
             <Card size="small" style={{ marginBottom: 16 }}>
@@ -121,7 +121,10 @@ export default function GameRecords() {
               </Space>
               {rec.warning && (
                 <Alert style={{ marginTop: 12 }} type="warning" showIcon
-                       message="本局部分事件未入账" description={rec.warning} />
+                       message={`本局异常 ${rec.warning_count || 0} 条（部分事件未入账）`}
+                       description={<div style={{ whiteSpace: 'pre-wrap', maxHeight: 220, overflow: 'auto' }}>
+                         {rec.warning_detail || rec.warning}
+                       </div>} />
               )}
             </Card>
             {eventRows.length === 0 && <Text type="secondary">无事件明细</Text>}
@@ -141,7 +144,9 @@ export default function GameRecords() {
                         </Space>
                         {e.msg && <div style={{ color: '#555', marginTop: 2 }}>{e.msg}</div>}
                         {e.reply && <div style={{ color: '#8a5a00', marginTop: 2 }}>→ {e.reply}</div>}
-                        <Text type="secondary" style={{ fontSize: 12 }}>{e.created_at}</Text>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          {e.ev_time || e.created_at}
+                        </Text>
                       </div>
                     ),
                   }))}

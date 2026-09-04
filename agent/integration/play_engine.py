@@ -180,6 +180,56 @@ class RuleEngine:
             return None, 0
         return str(raw), 0
 
+    # ---------- 红包领取处理（可选协议，玩法文件可定义 handle_redpacket） ----------
+
+    def has_redpacket_handler(self) -> bool:
+        """当前激活玩法是否定义了 handle_redpacket（决定红包计分玩法是否启用）。"""
+        with self._lock:
+            if self.active_rule_id is None:
+                return False
+            m = self._modules.get(self.active_rule_id)
+            return bool(m and callable(getattr(m, "handle_redpacket", None)))
+
+    def handle_redpacket(self, group_id: int | str, qq: int | str, nickname: str,
+                         amount: float) -> tuple[str | None, int]:
+        """按激活玩法处理一条红包领取事件。返回 (回复文本|None, 积分变动)。
+        玩法文件可选定义 handle_redpacket(group_id, qq, nickname, amount)，返回协议同
+        handle_message（None / str / dict / tuple）；未定义或未激活返回 (None, 0)。
+        不做同 qq 去重（红包去重由 RedPacketGame 按单号+QQ 幂等处理）。"""
+        self.last_delta = 0
+        with self._lock:
+            if self.active_rule_id is None:
+                return None, 0
+            rid = self.active_rule_id
+            module = self._modules.get(rid)
+            path = self._paths.get(rid)
+            if module is None or path is None:
+                return None, 0
+            # 热重载：文件变了就重新加载（与 handle_message 一致）
+            mtime = self._file_mtime(path)
+            if mtime != self._mtimes.get(rid):
+                try:
+                    module = self._import_module(rid, path)
+                    self._modules[rid] = module
+                    self._mtimes[rid] = mtime
+                    self.last_error = ""
+                except Exception as e:  # noqa: BLE001
+                    self.last_error = f"玩法热重载失败（沿用旧版）: {e}"
+        fn = getattr(module, "handle_redpacket", None)
+        if not callable(fn):
+            return None, 0
+        try:
+            raw = fn(int(group_id), int(qq), str(nickname), float(amount or 0))
+            reply, delta = self._parse_result(raw)
+            self.last_delta = delta
+            if reply is None:
+                return None, delta
+            reply = reply.strip()
+            return reply or None, delta
+        except Exception as e:  # noqa: BLE001 — 玩法 bug 不影响引擎
+            self.last_error = f"玩法红包处理异常: {e.__class__.__name__}: {e}"
+            return None, 0
+
 
 def _to_int(value) -> int:
     """宽松整型转换（int / 数字串 / float），失败回 0。积分变动给非法值当 0 处理。"""
@@ -231,7 +281,7 @@ class RoundSession:
             r["events"].append({"qq": str(qq), "nickname": str(nickname or ""),
                                 "msg": str(msg or ""), "reply": str(reply or ""),
                                 "delta": _to_int(delta),
-                                "ts": datetime.now().strftime("%H:%M:%S")})
+                                "ts": datetime.now().strftime("%m-%d %H:%M:%S")})
             return self._info(r)
 
     def _open(self, group_id: str) -> dict:
@@ -275,7 +325,8 @@ class RoundSession:
                 return {"group_id": gid, "busy": True}
             self._inflight.add(gid)
             snapshot = [{"qq": e["qq"], "nickname": e["nickname"], "msg": e["msg"],
-                         "reply": e["reply"], "delta": e["delta"]} for e in r["events"]]
+                         "reply": e["reply"], "delta": e["delta"], "ts": e.get("ts", "")}
+                        for e in r["events"]]
             round_id, label, started_at = r["round_id"], r["label"], r["started_at"]
         try:
             data = self.client.report_game_round(
@@ -467,6 +518,23 @@ def _selftest() -> int:
     step("v1 玩法 last_delta 恒 0", err is None
          and eng2.handle_message(10001, 8001, "老张", "1") == "11"
          and eng2.last_delta == 0, err or "")
+
+    # ---- 红包玩法协议：handle_redpacket ----
+    rp_src = samples / "rule_redpacket.py"
+    if rp_src.is_file():
+        rp_dst = tmp / "rule_redpacket.py"
+        rp_dst.write_text(rp_src.read_text(encoding="utf-8"), encoding="utf-8")
+        err = eng2.activate(3, "rule_redpacket@1.0", rp_dst)
+        step("红包玩法激活", err is None, err or "")
+        step("has_redpacket_handler=True", eng2.has_redpacket_handler())
+        r, d = eng2.handle_redpacket(10001, 1, "甲", 1.11)
+        step("红包 1.11 → 回复+3分", r == "领取1.11元，获得3积分" and d == 3, f"{r!r},{d}")
+        r, d = eng2.handle_redpacket(10001, 2, "乙", 0.15)
+        step("红包 0.15 → 6分", d == 6, str(d))
+        r, d = eng2.handle_redpacket(10001, 3, "丙", 0)
+        step("金额0 → 不计", r is None and d == 0)
+        err = eng2.activate(7, "v2demo@1.0", v2)
+        step("切回无红包协议的玩法", err is None and not eng2.has_redpacket_handler())
 
     # ---- RoundSession：多群分局 / 结算上报 / 失败保留 ----
     fake = _FakeBackend()

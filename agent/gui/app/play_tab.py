@@ -32,6 +32,25 @@ import requests
 from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
 from integration.member_sync import group_create_time_str, run_member_sync
 from integration.play_engine import FLUSH_LIMIT, HARD_LIMIT, RoundSession, RuleEngine
+from integration.redpacket_game import RedPacketGame
+
+import os as _os
+import datetime as _dt
+from pathlib import Path as _Path
+
+_PLAY_LOG_PATH = _Path(_os.environ.get("APPDATA") or _Path.home()) / "QQHongbaoMonitor" / "logs" / "play.log"
+
+
+def _flog(text: str) -> None:
+    """玩法运行日志落盘（排查红包玩法链路用；线程安全追加，超 2MB 截断）。"""
+    try:
+        _PLAY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _PLAY_LOG_PATH.exists() and _PLAY_LOG_PATH.stat().st_size > 2 * 1024 * 1024:
+            _PLAY_LOG_PATH.unlink()
+        with _PLAY_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"[{_dt.datetime.now().strftime('%m-%d %H:%M:%S')}] {text}\n")
+    except Exception:
+        pass
 
 if False:  # pragma: no cover — 仅类型注释用
     from .config_manager import AppConfig
@@ -48,6 +67,8 @@ class PlayTab(ctk.CTkScrollableFrame):
 
         self.engine = RuleEngine(rules_dir=cfg.plays_dir())
         self.session: RoundSession | None = None  # 启用玩法后存在；停止后清空
+        self.rp_game: RedPacketGame | None = None  # 红包计分玩法（勾选开关后启用）
+        self._admin_cache: dict[str, tuple[float, set[str]]] = {}
         self._active_groups: set[str] = set()     # 已启用转发的游戏群
         self._msg_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
@@ -59,6 +80,8 @@ class PlayTab(ctk.CTkScrollableFrame):
         self._selected_rule_id: int | None = None
         self._busy = False
         self._banned_reason: str = ""               # 非空=玩法已停摆（红字展示）
+        self._continuous = False                    # 连续开局模式：每局结束后 60 秒自动开下一局
+        self._cont_next_at: float | None = None     # 下一局自动开始时间戳
         self._last_settle: dict[str, dict] = {}     # gid -> {ok, error, time}
         self._payload_cache: dict[str, tuple[float, dict]] = {}  # 群成员 payload 30s 缓存
 
@@ -113,6 +136,10 @@ class PlayTab(ctk.CTkScrollableFrame):
         row.pack(fill="x", padx=10, pady=(2, 8))
         ctk.CTkButton(row, text="启用玩法", width=100, command=self._enable_play).pack(side="left", padx=(0, 6))
         ctk.CTkButton(row, text="停止玩法（先结算）", width=140, command=self._stop_play).pack(side="left", padx=6)
+        ctk.CTkButton(row, text="开始本局", width=90, command=self._start_round).pack(side="left", padx=6)
+        ctk.CTkButton(row, text="结束本局", width=90, command=self._end_round).pack(side="left", padx=6)
+        self.btn_cont = ctk.CTkButton(row, text="连续开局", width=90, command=self._toggle_continuous)
+        self.btn_cont.pack(side="left", padx=6)
         ctk.CTkButton(row, text="结算并上报", width=110, command=lambda: self._settle_groups(failed_only=False)).pack(side="left", padx=6)
         ctk.CTkButton(row, text="重试未上报", width=110, command=lambda: self._settle_groups(failed_only=True)).pack(side="left", padx=6)
         ctk.CTkLabel(row, text="玩法=Python 文件：handle_message(群号,QQ,昵称,发言) → 回复文本 / None，"
@@ -146,14 +173,18 @@ class PlayTab(ctk.CTkScrollableFrame):
             def do_POST(self) -> None:  # noqa: N802
                 app = self.server.app  # type: ignore[attr-defined]
                 try:
-                    if self.path.rstrip("/") != "/play/msg":
+                    path = self.path.rstrip("/")
+                    if path not in ("/play/msg", "/play/redpacket"):
                         self.send_response(404)
                         self.end_headers()
                         return
                     length = int(self.headers.get("content-length") or 0)
                     raw = self.rfile.read(length) if length else b""
                     data = json.loads(raw.decode("utf-8", errors="replace") or "{}")
-                    app._on_callback_message(data)
+                    if path == "/play/redpacket":
+                        app._on_callback_redpacket(data)
+                    else:
+                        app._on_callback_message(data)
                     self.send_response(200)
                     self.send_header("content-type", "application/json")
                     self.end_headers()
@@ -193,17 +224,241 @@ class PlayTab(ctk.CTkScrollableFrame):
         self._msg_queue.put({"group_id": group_id, "qq": qq,
                              "nickname": str(data.get("nickname") or ""), "text": text})
 
+    def _on_callback_redpacket(self, data: dict) -> None:
+        """HTTP 线程：红包领取事件入队（红包计分玩法）。"""
+        group_id = str(data.get("group_id") or "")
+        bill_no = str(data.get("bill_no") or "")
+        _flog(f"收到红包事件 group={group_id} bill={bill_no} sender={data.get('sender_uin')} "
+              f"total={data.get('total_num')} recv={data.get('recv_num')} "
+              f"claims={len(data.get('claims') or [])}")
+        if not group_id or not bill_no:
+            return
+        self._msg_queue.put({"kind": "redpacket", "payload": data})
+
     def _worker_loop(self) -> None:
         """消息 worker：过玩法引擎 → 入局记回放 → 需要回复时发回群里；事件满 soft 上限自动结算。"""
         while not self._stop.is_set():
             try:
                 item = self._msg_queue.get(timeout=0.5)
             except queue.Empty:
+                self._maybe_retry_rp_pending()
                 continue
             try:
-                self._handle_one(item)
+                if item.get("kind") == "redpacket":
+                    self._handle_redpacket(item.get("payload") or {})
+                else:
+                    self._handle_one(item)
             except Exception as e:  # noqa: BLE001 — 引擎链路任何异常都不能停 worker
                 self.after(0, self._log, f"✗ 消息处理异常: {e}")
+
+    # ================= 红包计分玩法 =================
+
+    def _maybe_retry_rp_pending(self) -> None:
+        """每 30 秒：有未结算的红包局自动重试（token 修复/网络恢复后自动补结算）。"""
+        game = self.rp_game
+        if game is None:
+            return
+        try:
+            game.poll_auto_end()
+        except (ExecutorBanned, OperatorDisabled) as e:
+            self._mark_banned(e)
+            return
+        except Exception:
+            pass
+        self._check_continuous()
+        if not game.pending:
+            return
+        now = time.time()
+        if now - getattr(self, "_last_rp_retry", 0.0) < 30:
+            return
+        self._last_rp_retry = now
+        try:
+            game.retry_pending()
+        except (ExecutorBanned, OperatorDisabled) as e:
+            self._mark_banned(e)
+        except Exception as e:  # noqa: BLE001
+            self.after(0, self._log, f"✗ 红包局重试异常: {e}")
+
+    # ================= 开始本局 / 结束本局 =================
+
+    def _toggle_continuous(self) -> None:
+        """连续开局开关：开启→循环自动开局；终止→作废局内数据并停止循环。"""
+        if self._continuous:
+            self._continuous = False
+            self._cont_next_at = None
+            self._log_sep()
+            self._log("连续开局已终止")
+            if self.rp_game is not None:
+                n = self.rp_game.cancel_rounds()
+                if n:
+                    self._log(f"已作废 {n} 个进行中的本局（数据不上报）")
+            self.btn_cont.configure(text="连续开局", fg_color="#3B8ED0", hover_color="#36719F")
+            self._rounds_refresh()
+        else:
+            if not self.engine.is_active():
+                self._log("✗ 请先启用玩法再连续开局")
+                return
+            self._continuous = True
+            self._cont_next_at = None
+            self._log_sep()
+            self._log("连续开局模式已开启：每局结束并播报统计后，60 秒自动开下一局")
+            self.btn_cont.configure(text="终止连续", fg_color="#c0392b", hover_color="#a93226")
+            active = (self.rp_game is not None and
+                      any(self.rp_game.has_active_round(g) for g in self._active_groups))
+            if active:
+                self._log("检测到进行中的本局，先继续当前局")
+            else:
+                self._start_round()
+
+    def _check_continuous(self) -> None:
+        """worker 定时调用：连续模式下，局结束 60 秒后自动开下一局。"""
+        if not self._continuous:
+            return
+        if self._cont_next_at is None:
+            active = (self.rp_game is not None and
+                      any(self.rp_game.has_active_round(g) for g in self._active_groups))
+            if not active:
+                self._cont_next_at = time.time() + 60
+                self.after(0, self._log, "本局已结束，60 秒后自动开启下一局…")
+            return
+        if time.time() >= self._cont_next_at:
+            self._cont_next_at = None
+            self.after(0, self._start_round)
+
+    def _start_round(self) -> None:
+        """「开始本局」：为每个已勾选游戏群生成局号 → @全体公告 → 进入本局记录模式。"""
+        if not self.engine.is_active():
+            self._log("✗ 请先启用玩法再开始本局")
+            return
+        self._cont_next_at = None  # 手动开始：取消挂起的自动开局
+        self._log_sep()
+        rule = self._selected_rule() or {}
+        intro = str(rule.get("description") or "").strip()
+        name = self.cfg.play_rule_name or "玩法"
+        seq = int(getattr(self.cfg, "game_round_seq", 0) or 0)
+        started = []
+        for gid in sorted(self._active_groups):
+            seq += 1
+            round_id = f"hongbaojifen_{seq:08d}"
+            if self.rp_game is not None:
+                self.rp_game.start_round(gid, round_id, name)
+            text = (f"游戏开始，游戏名称为{name}，"
+                    f"游戏介绍为{intro or '无'}"
+                    f"，游戏对局id为：{round_id}")
+            self._rp_send_announce(gid, text)
+            started.append(f"群{gid} 局号 {round_id}")
+            self._log(f"群{gid} 开始本局 {round_id}")
+        if not started:
+            self._log("✗ 没有已勾选的游戏群")
+            return
+        self.cfg.game_round_seq = seq
+        self.save_config(self.cfg)
+        self._log("本局开始公告已发送：" + "；".join(started))
+
+    def _end_round(self) -> None:
+        """「结束本局」：逐群统计（领取人数/总积分/事件数）→ 上报总后台 → @全体总结。"""
+        if not self.engine.is_active() or self.rp_game is None:
+            self._log("✗ 请先启用含红包协议的玩法")
+            return
+        groups = [g for g in sorted(self._active_groups) if self.rp_game.has_active_round(g)]
+        if not groups:
+            self._log("没有进行中的本局（请先点「开始本局」）")
+            return
+        self._log_sep()
+        for gid in groups:
+            try:
+                self.rp_game.end_round(gid)
+            except (ExecutorBanned, OperatorDisabled) as e:
+                self._mark_banned(e)
+                return
+            except BackendError as e:
+                self._log(f"✗ 群{gid} 结束本局结算失败（事件保留可重试）: {e}")
+        self._rounds_refresh()
+
+    def _handle_redpacket(self, payload: dict) -> None:
+        """红包领取事件 → 红包计分玩法（worker 线程）。"""
+        game = self.rp_game
+        if game is None or not self.engine.is_active():
+            _flog(f"忽略红包事件（玩法未启用或无红包协议）group={payload.get('group_id')}")
+            return
+        gid = str(payload.get("group_id") or "")
+        if gid not in self._active_groups:
+            _flog(f"忽略红包事件（群不在玩法名单）group={gid} active={sorted(self._active_groups)}")
+            return
+        try:
+            data = self._fetch_payload(gid) or {}
+            payload["member_count"] = int(data.get("member_count") or 0)
+        except Exception:
+            payload["member_count"] = 0
+        try:
+            game.retry_pending()
+            game.handle_claim(payload)
+        except (ExecutorBanned, OperatorDisabled) as e:
+            self._mark_banned(e)
+        except Exception as e:  # noqa: BLE001 — 单包事件异常不影响后续
+            self.after(0, self._log, f"✗ 红包计分处理异常: {e}")
+
+    def _rp_send_reply(self, gid: str, qq: str, text: str) -> None:
+        """@领取人 回复（红包计分即时反馈）。"""
+        try:
+            requests.post(self.cfg.plugin_api("play/reply"),
+                          json={"group_id": gid, "at_qq": qq, "text": text}, timeout=5)
+        except requests.RequestException as e:
+            self.after(0, self._log, f"✗ 红包回复发送失败: {e}")
+
+    def _rp_send_announce(self, gid: str, text: str) -> None:
+        """@全体 播报红包结算结果。"""
+        try:
+            r = requests.post(self.cfg.plugin_api("play/announce"),
+                              json={"group_id": gid, "text": text}, timeout=5)
+            if r.ok:
+                self.after(0, self._log, f"✓ 已@全体播报红包结算（群 {gid}）")
+            else:
+                self.after(0, self._log, f"✗ @全体播报失败 HTTP {r.status_code}")
+        except requests.RequestException as e:
+            self.after(0, self._log, f"✗ @全体播报失败: {e}")
+
+    def _rp_settle(self, round_id: str, gid: str, events: list[dict]) -> None:
+        """红包局上报总后台（round_id=红包单号，幂等）。"""
+        res = self._client().report_game_round(
+            round_id, self.cfg.play_rule_name or "红包玩法", gid, events,
+            play_id=self.cfg.play_rule_id or 0)
+        warn = res.get("warning") or ""
+        self.after(0, self._log,
+                   f"✓ 红包局 {str(round_id)[:16]} 已上报：事件 {res.get('event_count')} ｜ "
+                   f"净积分 {res.get('total_delta')}"
+                   + (f" ｜ 注意: {warn}" if warn else "")
+                   + ("（重复上报，未重复入账）" if res.get("duplicate") else ""))
+
+    def _rp_admin_qqs(self, gid: str) -> set[str]:
+        """群主+管理员 QQ 集合（600s 缓存；随 _fetch_payload 30s 缓存兜底）。"""
+        now = time.time()
+        hit = self._admin_cache.get(gid)
+        if hit and now - hit[0] < 600:
+            return hit[1]
+        try:
+            data = self._fetch_payload(gid) or {}
+        except Exception:
+            return set()
+        admins = {str(m.get("uin") or "") for m in (data.get("members") or [])
+                  if str(m.get("role") or "") in ("owner", "admin")}
+        self._admin_cache[gid] = (now, admins)
+        return admins
+
+    def _rp_build(self, rule_id: int, rule_name: str) -> None:
+        """玩法文件定义了 handle_redpacket 时自动启用红包玩法会话。"""
+        self.rp_game = None
+        if self.engine.has_redpacket_handler():
+            self.rp_game = RedPacketGame(
+                play_name=rule_name, play_id=rule_id,
+                rule_handler=lambda g, q, n, a: self.engine.handle_redpacket(g, q, n, a),
+                send_reply=self._rp_send_reply,
+                send_announce=self._rp_send_announce,
+                settle=self._rp_settle,
+                get_admin_qqs=self._rp_admin_qqs,
+                on_log=lambda msg: self.after(0, self._log, msg),
+            )
+            self._log("玩法含 handle_redpacket：红包计分玩法已启用")
 
     def _handle_one(self, item: dict) -> None:
         group_id = item["group_id"]
@@ -218,6 +473,9 @@ class PlayTab(ctk.CTkScrollableFrame):
 
         reply = self.engine.handle_message(group_id, qq, nickname, text)
         delta = self.engine.last_delta if hasattr(self.engine, "last_delta") else 0
+        # 本局模式：把群内聊天过程记入回放（不计分）
+        if self.rp_game is not None:
+            self.rp_game.record_chat(group_id, qq, nickname, text)
         if self.engine.last_error:
             self.after(0, self._log, f"✗ {self.engine.last_error}")
         reply = reply.strip() if reply else ""
@@ -409,6 +667,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         return {str(g.get("group_id")) for g in rows if str(g.get("status")) == "banned"}
 
     def _enable_play(self) -> None:
+        self._log_sep()
         if self._busy:
             self._log("上一个操作还没完成，请稍候")
             return
@@ -478,6 +737,8 @@ class PlayTab(ctk.CTkScrollableFrame):
             # 4) 建对局会话（各群独立 round_id，结算时带 token 上报总后台）
             self.session = RoundSession(client=self._client(), play_name=rule_name, play_id=rule_id)
             self._active_groups = set(groups)
+            # 4.5) 红包计分玩法会话（勾选开关时启用）
+            self._rp_build(rule_id, rule_name)
             # 5) 记录配置（重启自动恢复）
             self.cfg.play_rule_id = rule_id
             self.cfg.play_rule_name = f"{rule_name}@{version}"
@@ -532,6 +793,7 @@ class PlayTab(ctk.CTkScrollableFrame):
             if not pending:
                 self._log("没有失败待重试的对局")
                 return
+        self._log_sep()
         self._set_busy(True)
         self._log(("结算并上报 " if not failed_only else "重试未上报 ") +
                   f"{len(pending)} 个群的对局 …")
@@ -630,7 +892,13 @@ class PlayTab(ctk.CTkScrollableFrame):
                 return
             self.engine.deactivate()
             self.session = None
+            self.rp_game = None
             self._active_groups = set()
+            self._continuous = False
+            self._cont_next_at = None
+            if hasattr(self, "btn_cont"):
+                self.btn_cont.configure(text="连续开局", fg_color="#3B8ED0", hover_color="#36719F")
+            self.cfg.game_round_seq = int(getattr(self.cfg, "game_round_seq", 0) or 0)
             self._banned_reason = ""
             self._last_settle = {}
             try:
@@ -664,6 +932,9 @@ class PlayTab(ctk.CTkScrollableFrame):
             else:
                 self.cfg.play_enabled = False
                 self.save_config(self.cfg)
+            self.rp_game = None
+            self._continuous = False
+            self._cont_next_at = None
             self._banned_reason = str(reason)
             self._active_groups = set()
             self._log(f"✗ 玩法停摆：{reason}。未上报对局已保留在本地，"
@@ -717,6 +988,7 @@ class PlayTab(ctk.CTkScrollableFrame):
                 name = str(rule_name)
                 self.session = RoundSession(client=self._client(), play_name=name, play_id=rule_id)
                 self._active_groups = set(groups)
+                self._rp_build(rule_id, name)
                 self.after(0, self._log,
                            f"✓ 已恢复：{self.cfg.play_rule_name} ｜ 游戏群 {','.join(groups)}")
                 if self.cfg.play_auto_register_members:
@@ -812,7 +1084,22 @@ class PlayTab(ctk.CTkScrollableFrame):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
 
+    def _log_sep(self) -> None:
+        """步骤分隔线：每个操作的一堆日志前加 ----------，方便观察。"""
+        _flog("----------")
+        try:
+            self.txt_log.configure(state="normal")
+            self.txt_log.insert("end", "----------\n")
+            lines = int(self.txt_log.index("end-1c").split(".")[0])
+            if lines > 500:
+                self.txt_log.delete("1.0", f"{lines - 400}.0")
+            self.txt_log.see("end")
+            self.txt_log.configure(state="disabled")
+        except Exception:
+            pass
+
     def _log(self, text: str) -> None:
+        _flog(text)
         try:
             self.txt_log.configure(state="normal")
             self.txt_log.insert("end", text + "\n")

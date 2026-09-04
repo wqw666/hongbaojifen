@@ -20,6 +20,13 @@ import { config, saveConfig } from './store.js';
 export const PLAY_CALLBACK_DEFAULT = 'http://127.0.0.1:6101/play/msg';
 const FORWARD_TIMEOUT_MS = 2000;
 
+/** 已推送过「领完」最终状态的红包单号（轮询去重用，避免重复拉详情）。 */
+const finalPushedBills = new Set<string>();
+
+export function isFinalPushed(bill: string): boolean {
+  return finalPushedBills.has(String(bill));
+}
+
 function ok(res: any, data: unknown) {
   res.json({ code: 0, message: 'ok', data });
 }
@@ -89,7 +96,14 @@ export function registerPlayRoutes(ctx: NapCatPluginContext) {
   router.postNoAuth('/play/config', async (req: any, res: any) => {
     try {
       const body = req.body || {};
-      if (typeof body.enabled === 'boolean') config.playEnabled = body.enabled;
+      if (typeof body.enabled === 'boolean') {
+        if (body.enabled && !config.playEnabled) {
+          // 重新启用：只处理此后的红包，开启前的历史红包一律不推
+          config.playEnabledAt = Date.now();
+        }
+        config.playEnabled = body.enabled;
+        if (!body.enabled) config.playEnabledAt = 0;
+      }
       if (Array.isArray(body.groups)) {
         config.playGroups = body.groups
           .map((g: unknown) => String(g).trim())
@@ -129,7 +143,8 @@ export function registerPlayRoutes(ctx: NapCatPluginContext) {
           : '';
       const message: any[] = [];
       if (atQq) message.push({ type: 'at', data: { qq: atQq } });
-      message.push({ type: 'text', data: { text } });
+      // @ 与正文之间必须有空格，否则 QQ 客户端不解析 @
+      message.push({ type: 'text', data: { text: ' ' + text } });
       await ctx.actions.call(
         'send_group_msg',
         { group_id: groupId, message },
@@ -143,5 +158,80 @@ export function registerPlayRoutes(ctx: NapCatPluginContext) {
     } catch (e) {
       fail(res, String(e), -1, 500);
     }
+  });
+
+  // agent 玩法引擎 @全体 播报（红包领完结算等）
+  router.postNoAuth('/play/announce', async (req: any, res: any) => {
+    try {
+      if (!config.playEnabled) return fail(res, '玩法已停用');
+      const body = req.body || {};
+      const groupId = String(body.group_id ?? '');
+      const text = String(body.text ?? '').trim();
+      if (!groupId || !text) return fail(res, '缺少 group_id/text');
+      if (config.playGroups.length && !config.playGroups.includes(groupId)) {
+        return fail(res, '群不在玩法名单');
+      }
+      // 优先 @全体；被内核拒绝（如频率限制/权限）时降级为普通文本发送，保证公告一定送达
+      const attempts: any[][] = [
+        [{ type: 'at', data: { qq: 'all' } }, { type: 'text', data: { text: ' ' + text } }],
+        [{ type: 'text', data: { text: '@全体成员 ' + text } }],
+      ];
+      let sent = false;
+      let lastErr = '';
+      for (const message of attempts) {
+        try {
+          await ctx.actions.call(
+            'send_group_msg',
+            { group_id: groupId, message },
+            ctx.adapterName,
+            ctx.pluginManager.config
+          );
+          sent = true;
+          break;
+        } catch (e) {
+          lastErr = String(e);
+          ctx.logger?.warn?.(`[玩法] 群 ${groupId} 发送失败（尝试下一种方式）: ${lastErr.slice(0, 160)}`);
+        }
+      }
+      if (!sent) return fail(res, lastErr, -1, 500);
+      ctx.logger?.info?.(`[玩法] 群 ${groupId} @全体: ${text.slice(0, 60)}`);
+      ok(res, { sent: true, group_id: groupId, text });
+    } catch (e) {
+      fail(res, String(e), -1, 500);
+    }
+  });
+}
+
+/** 红包领取事件 → agent 玩法引擎（红包计分玩法）。静默失败。 */
+export function notifyRedPacket(ctx: NapCatPluginContext, payload: Record<string, unknown>): void {
+  if (!config.playEnabled) return;
+  const groupId = String(payload.group_id ?? '');
+  if (!groupId) return;
+  if (config.playGroups.length && !config.playGroups.includes(groupId)) return;
+  // 开启玩法之前的红包不推（历史数据不回复）
+  const enabledAt = Number(config.playEnabledAt || 0);
+  if (enabledAt) {
+    const mt = Number(payload.msg_time || 0);
+    if (mt && mt * 1000 < enabledAt) return;
+  }
+  const base = config.playCallback || PLAY_CALLBACK_DEFAULT;
+  let url: string;
+  try {
+    url = new URL('redpacket', base).toString();
+  } catch {
+    return;
+  }
+  const total = Number(payload.total_num || 0);
+  const recv = Number(payload.recv_num || 0);
+  if (total > 0 && recv >= total) {
+    finalPushedBills.add(String(payload.bill_no || ''));
+  }
+  fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
+  }).catch(() => {
+    /* agent 未监听：丢弃 */
   });
 }

@@ -103,9 +103,9 @@ export default function MemberManager() {
     { title: '注册人QQ', dataIndex: 'registrar_qq', width: 100, render: v => v || '—' },
     { title: '状态', dataIndex: 'status', width: 80, render: v =>
         <Tag color={v === 'active' ? 'green' : 'default'}>{v === 'active' ? '正常' : '停用'}</Tag> },
-    { title: '备注', dataIndex: 'note', ellipsis: true },
+    { title: '备注', dataIndex: 'note', width: 90, ellipsis: true },
     {
-      title: '操作', width: 250, fixed: 'right',
+      title: '操作', width: 310, fixed: 'right',
       render: (_, row) => (
         <Space size={4}>
           <Button size="small" type="primary" icon={<RiseOutlined />} onClick={() => openPoint(row, 'up')}>上分</Button>

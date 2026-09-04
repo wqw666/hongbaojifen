@@ -39,6 +39,7 @@ class AppConfig:
     heartbeat_interval_sec: int = 10             # 心跳/命令轮询间隔（秒，默认 10，最小 5）
     member_group_id: str = ""                    # 会员群号（成员自动注册为该群会员）
     auto_sync_members: bool = False              # 周期任务里自动同步会员（≥5 分钟一次）
+    hidden_groups: str = ""                      # 群管理里已删除的群号（逗号分隔，刷新列表不再显示）
 
     # ---- 游戏玩法（v2：多游戏群 + 结算上报）----
     play_rule_id: int = 0                        # 启用中的玩法 id（0=未启用）
@@ -46,6 +47,7 @@ class AppConfig:
     play_group_id: str = ""                      # 游戏群号（逗号分隔多个）
     play_enabled: bool = False                   # 玩法运行开关
     play_callback_port: int = 6101               # agent 本地玩法回调端口（插件转发目标）
+    game_round_seq: int = 0                      # 游戏局号计数器（开始本局递增，生成 hongbaojifen_XXXXXXXX）
     play_auto_register_members: bool = False     # 启用玩法后自动把游戏群成员注册为会员（幂等）
 
     def plays_dir(self) -> Path:

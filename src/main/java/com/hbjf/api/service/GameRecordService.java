@@ -33,7 +33,6 @@ public class GameRecordService {
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final int MAX_EVENTS = 2000;
     private static final int MAX_WARNING_CHARS = 480;
-    private static final int MAX_SAMPLE_WARNINGS = 6;
 
     private final JdbcTemplate jdbc;
     private final ExecutorService executorService;
@@ -120,9 +119,17 @@ public class GameRecordService {
 
         for (Map<String, Object> ev : events) {
             evIndex++;
+            String evTime = cut(str(ev.get("ts")).trim(), 19);
+            if (evTime.isEmpty()) evTime = now;
             String qq = str(ev.get("qq")).trim();
             if (!qq.matches("\\d{5,12}")) {
-                addWarning(warnings, "非法QQ:" + qq + " 已跳过");
+                // 未知格式异常：一股脑记下来（时间线照记 + 完整异常进 warning）
+                addWarning(warnings, "非法QQ:" + cut(qq, 32) + " 事件未入账");
+                jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, ev_time, created_at)"
+                                + " VALUES (?,?,?,?,?,?,?,?)",
+                        recordId, cut(qq, 32), cut(str(ev.get("nickname")), 64),
+                        "原始事件:" + cut(String.valueOf(ev), 480),
+                        cut(str(ev.get("reply")), 512), 0, evTime, now);
                 continue;
             }
             String nickname = cut(str(ev.get("nickname")), 64);
@@ -132,7 +139,12 @@ public class GameRecordService {
             try {
                 delta = ev.get("delta") == null ? 0 : Long.parseLong(String.valueOf(ev.get("delta")));
             } catch (NumberFormatException e) {
-                addWarning(warnings, qq + " 积分delta非法 已跳过");
+                addWarning(warnings, qq + " 积分delta非法 事件未入账");
+                jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, ev_time, created_at)"
+                                + " VALUES (?,?,?,?,?,?,?,?)",
+                        recordId, qq, cut(str(ev.get("nickname")), 64),
+                        "原始事件:" + cut(String.valueOf(ev), 480),
+                        cut(str(ev.get("reply")), 512), 0, evTime, now);
                 continue;
             }
 
@@ -144,9 +156,9 @@ public class GameRecordService {
                 addWarning(warnings, "会员已停用:" + qq + " 未入账");
             }
             if (member == null || !"active".equals(member.get("status"))) {
-                jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, created_at)"
-                                + " VALUES (?,?,?,?,?,?,?)",
-                        recordId, qq, nickname, msg, reply, 0, now);
+                jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, ev_time, created_at)"
+                                + " VALUES (?,?,?,?,?,?,?,?)",
+                        recordId, qq, nickname, msg, reply, 0, evTime, now);
                 continue;
             }
 
@@ -174,19 +186,20 @@ public class GameRecordService {
             }
 
             // 事件时间线（完整过程日志，供回放；delta 为实际入账值）
-            jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, created_at)"
-                            + " VALUES (?,?,?,?,?,?,?)",
-                    recordId, qq, nickname, msg, reply, applied, now);
+            jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, ev_time, created_at)"
+                            + " VALUES (?,?,?,?,?,?,?,?)",
+                    recordId, qq, nickname, msg, reply, applied, evTime, now);
 
             if (settledQqs.add(qq)) memberCount++;
         }
 
+        String warningDetail = String.join("\n", warnings);
         String warningText = String.join("; ", warnings);
         if (warningText.length() > MAX_WARNING_CHARS) {
-            warningText = warningText.substring(0, MAX_WARNING_CHARS);
+            warningText = warningText.substring(0, MAX_WARNING_CHARS) + "...";
         }
-        jdbc.update("UPDATE game_records SET member_count=?, total_delta=?, warning=? WHERE id=?",
-                memberCount, totalDelta, warningText, recordId);
+        jdbc.update("UPDATE game_records SET member_count=?, total_delta=?, warning=?, warning_count=?, warning_detail=? WHERE id=?",
+                memberCount, totalDelta, warningText, warnings.size(), warningDetail, recordId);
 
         return MapBuilder.of("round_id", roundId, "duplicate", false,
                 "member_count", memberCount, "total_delta", totalDelta,
@@ -212,7 +225,7 @@ public class GameRecordService {
         int offset = Math.max(0, (page - 1) * size);
         List<Map<String, Object>> rows = jdbc.query(
                 "SELECT id, round_id, play_id, play_name, group_id, executor_id, executor_name, operator_qq,"
-                        + " member_count, total_delta, event_count, warning, created_at FROM game_records" + where
+                        + " member_count, total_delta, event_count, warning, warning_count, created_at FROM game_records" + where
                         + " ORDER BY id DESC LIMIT " + size + " OFFSET " + offset,
                 new RowMapMapper(), args.toArray());
         return MapBuilder.of("total", total, "page", page, "size", size, "list", rows);
@@ -224,13 +237,24 @@ public class GameRecordService {
         try {
             record = jdbc.queryForObject(
                     "SELECT id, round_id, play_id, play_name, group_id, executor_id, executor_name, operator_qq,"
-                            + " member_count, total_delta, event_count, warning, created_at FROM game_records WHERE id=?",
+                            + " member_count, total_delta, event_count, warning, warning_count, warning_detail,"
+                            + " created_at FROM game_records WHERE id=?",
                     new RowMapMapper(), id);
         } catch (org.springframework.dao.EmptyResultDataAccessException e) {
             throw new ApiException(ErrorCode.NOT_FOUND, "该游戏记录不存在");
         }
+        // H2 把 TEXT/CLOB 返回成 JdbcClob，Jackson 无法序列化 → 统一转 String
+        Object wd = record.get("warning_detail");
+        if (wd instanceof java.sql.Clob) {
+            try {
+                java.sql.Clob c = (java.sql.Clob) wd;
+                record.put("warning_detail", c.getSubString(1, (int) c.length()));
+            } catch (java.sql.SQLException e) {
+                record.put("warning_detail", "");
+            }
+        }
         List<Map<String, Object>> events = jdbc.query(
-                "SELECT id, qq, nickname, msg, reply, delta, created_at FROM game_record_events"
+                "SELECT id, qq, nickname, msg, reply, delta, ev_time, created_at FROM game_record_events"
                         + " WHERE record_id=? ORDER BY id ASC",
                 new RowMapMapper(), id);
         return MapBuilder.of("record", record, "events", events);
@@ -257,8 +281,7 @@ public class GameRecordService {
     }
 
     private void addWarning(List<String> warnings, String text) {
-        if (warnings.size() < MAX_SAMPLE_WARNINGS) warnings.add(text);
-        else if (warnings.size() == MAX_SAMPLE_WARNINGS) warnings.add("...(更多已省略)");
+        warnings.add(text);  // 异常全量收集：warning 列短摘要，warning_detail 列存全部
     }
 
     private String cut(String s) {

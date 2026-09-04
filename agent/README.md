@@ -121,6 +121,22 @@ GUI「游戏玩法」页操作：填总后台地址 →「刷新玩法列表」�
 - 总后台未知会员/停用/余额不足 → 该事件按 delta=0 记入时间线并随结算回报 `warning` 明细
 - 被总后台封禁（40310）/操作员停用或禁手动（40311）→ 引擎与同步全部停摆（GUI 红字），未结算事件保留，后台处理后重开/重试恢复
 
+### 红包计分玩法（玩法文件协议，与 rule_add1/2 同机制）
+
+红包玩法**也是一份玩法文件**：总后台「会员玩法管理」上传 `play_rules/rule_redpacket.py` 样本（或自定义），玩法文件里定义可选函数：
+
+```python
+def handle_redpacket(group_id, qq, nickname, amount):
+    # 返回协议同 handle_message：None / str / (reply, delta) / {"reply":…, "delta":…}
+```
+
+选中含 `handle_redpacket` 的玩法启用后**自动开启红包玩法**（无需额外开关）：**管理员/群主**在游戏群发红包 → 成员领取时插件推送领取事件给 agent（`/play/redpacket`）→ 按玩法规则计分并立即 @领取人 回复；红包领完（`recv_num>=total_num` 或领取人数达群人数）→ 自动上报总后台（`round_id`=红包单号，幂等）→ @全体 播报：用户X 领取A元 获得B积分…
+
+- 样本规则：积分 = 金额各位数之和（1.11 元=3 分、0.15=6 分），见 `play_rules/rule_redpacket.py`
+- 机器人自己领取的份额不计分；同人同包幂等去重；结算失败事件保留自动重试；上报成功后才 @全体 播报
+- **开始本局/结束本局**：玩法页「开始本局」→ 为每个游戏群生成局号 `hongbaojifen_XXXXXXXX`（持久递增）→ @全体公告（游戏名称/介绍/对局id）→ 本局期间红包领取与全部群聊天都记入回放（含时间）→「结束本局」→ 统计（领取人数/总积分/事件数）→ 上报总后台（round_id=局号）→ @全体总结语。不点开始则保持原「领完自动结算」模式（round_id=红包单号）
+- 实现：`integration/redpacket_game.py`（编排，`python -m integration.redpacket_game` 自测）+ `play_engine.RuleEngine.handle_redpacket` + 插件 play.ts 推送
+
 ### 玩法文件协议（总后台玩法页上传的 .py 必须遵守）
 
 ```python

@@ -32,10 +32,11 @@ public class PlayRuleService {
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final Logger log = LoggerFactory.getLogger(PlayRuleService.class);
-    /** 随 jar 内置的默认玩法（classpath:seed_rules/；迁移 V1.0.2 已插对应元数据行） */
+    /** 随 jar 内置的默认玩法（classpath:seed_rules/；迁移 V1.0.2/V1.0.3 已插对应元数据行） */
     private static final String[][] SEED_RULES = {
             {"seed_rules/rule_add1.py", "seed_rule_add1.py"},
             {"seed_rules/rule_add2.py", "seed_rule_add2.py"},
+            {"seed_rules/rule_redpacket.py", "seed_rule_redpacket.py"},
     };
 
     private final JdbcTemplate jdbc;

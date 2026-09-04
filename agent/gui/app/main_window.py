@@ -39,6 +39,7 @@ HELP_TEXT = """【开箱步骤】
 【游戏玩法】
 • 「游戏玩法」页：勾选要参与的群 → 选中玩法 → 「启用玩法」
 • 群成员发言自动按玩法回复并计分；「结算并上报」把积分报给总后台
+• 红包玩法：总后台选择含 handle_redpacket 的玩法文件（如 rule_redpacket）即自动启用——管理员发红包、成员领取自动计分，领完自动@全体结算
 
 【总后台对接】
 • 填总后台地址 / 对接密钥 / 执行器 token → 「启动对接」（由管理员配置）
@@ -654,6 +655,8 @@ class MainWindow(ctk.CTk):
         ctk.CTkButton(row, text="关闭监控", width=84, command=lambda: self._groups_set_watch(False)).pack(side="left", padx=4)
         ctk.CTkButton(row, text="同步会员", width=84, command=self._groups_sync_members).pack(side="left", padx=4)
         ctk.CTkButton(row, text="上报群信息", width=92, command=self._groups_report).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="删除", width=64, fg_color="#c0392b", hover_color="#a93226",
+                      command=self._groups_delete).pack(side="left", padx=4)
         self.lbl_groups_info = ctk.CTkLabel(row, text="", text_color="gray")
         self.lbl_groups_info.pack(side="left", padx=10)
 
@@ -698,8 +701,11 @@ class MainWindow(ctk.CTk):
             return
 
         def work():
+            hidden = set(self._hidden_groups())
             rows: dict[str, dict] = {}
             for gid in self._parse_watch_groups():
+                if gid in hidden:
+                    continue
                 rows[gid] = {"group_id": gid, "group_name": "", "member_count": "",
                              "create_time": "", "status": ""}
             client = self._backend_client()
@@ -707,7 +713,7 @@ class MainWindow(ctk.CTk):
                 try:
                     for g in client.list_groups():
                         gid = str(g.get("group_id") or "")
-                        if not gid:
+                        if not gid or gid in hidden:
                             continue
                         prev = rows.get(gid, {})
                         rows[gid] = {
@@ -726,6 +732,8 @@ class MainWindow(ctk.CTk):
         threading.Thread(target=work, daemon=True).start()
 
     def _groups_fill(self, rows: list[dict]) -> None:
+        hidden = set(self._hidden_groups())
+        rows = [r for r in rows if str(r.get("group_id") or "") not in hidden]
         watch = set(self._parse_watch_groups())
         for iid in self.tree_groups.get_children():
             self.tree_groups.delete(iid)
@@ -748,6 +756,33 @@ class MainWindow(ctk.CTk):
         if not hasattr(self, "tree_groups"):
             return []
         return [str(iid) for iid in self.tree_groups.selection()]
+
+    def _hidden_groups(self) -> list[str]:
+        return [x.strip() for x in self.cfg.hidden_groups.replace("，", ",").split(",") if x.strip()]
+
+    def _groups_delete(self) -> None:
+        """删除选中群：从本机列表移除（不再展示、退出监控与玩法；总后台记录保留）。"""
+        sels = self._groups_selected()
+        if not sels:
+            self.lbl_groups_info.configure(text="请先在表格里选中群（可多选）", text_color="#e67e22")
+            return
+        hidden = set(self._hidden_groups()) | set(sels)
+        self.cfg.hidden_groups = ",".join(sorted(hidden))
+        self.cfg.watch_groups = ",".join(g for g in self._parse_watch_groups() if g not in sels)
+        self.cfg.play_group_id = ",".join(g for g in self.cfg.play_group_list() if g not in sels)
+        save_config(self.cfg)
+        self.client = PluginClient(self.cfg)
+        self._groups_rows = [r for r in self._groups_rows if str(r.get("group_id")) not in sels]
+        self._groups_fill(self._groups_rows)
+        self._members_refresh_groups()
+        try:
+            if hasattr(self, "play_tab"):
+                self.play_tab._refresh_group_checkboxes()
+        except Exception:
+            pass
+        threading.Thread(target=lambda: self.client.sync_plugin_config(), daemon=True).start()
+        self.lbl_groups_info.configure(text=f"已删除 {len(sels)} 个群（监控与玩法勾选已同步移除）",
+                                       text_color="#2ecc71")
 
     def _groups_add(self) -> None:
         gid = self.entry_add_group.get().strip().replace("，", ",")
@@ -937,9 +972,11 @@ class MainWindow(ctk.CTk):
         self.after(500, self._members_refresh_groups)
 
     def _members_groups(self) -> list[str]:
-        groups = [str(r.get("group_id")) for r in getattr(self, "_groups_rows", [])]
+        hidden = set(self._hidden_groups())
+        groups = [str(r.get("group_id")) for r in getattr(self, "_groups_rows", [])
+                  if str(r.get("group_id")) not in hidden]
         for g in self._parse_watch_groups():
-            if g not in groups:
+            if g not in groups and g not in hidden:
                 groups.append(g)
         return groups
 
