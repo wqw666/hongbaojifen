@@ -39,9 +39,9 @@ def _is_unreachable(err: Exception) -> bool:
 def _friendly_error(err: Exception) -> str:
     if _is_unreachable(err):
         return (
-            "NapCat 未运行（6099 端口无法连接）。"
-            "请先双击项目目录里的「启动.vbs」或「一键启动.bat」，"
-            "等 QQ 登录后再点「刷新连接」。"
+            "服务未运行（端口无法连接）。"
+            "软件会自动启动环境，请稍候片刻；"
+            "仍未恢复时请点击右上角「刷新」。"
         )
     msg = str(err)
     low = msg.lower()

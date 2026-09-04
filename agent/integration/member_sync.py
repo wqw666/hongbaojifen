@@ -39,24 +39,31 @@ def _member_nick(m: dict) -> str:
     return str(m.get("nickname") or m.get("card") or "").strip()
 
 
+def _ts_to_str(ts: float) -> str:
+    """unix 时间戳 → yyyy-MM-dd HH:mm:ss（本机时区）；兼容毫秒；非法返回 ''。"""
+    if ts > 1e12:
+        ts /= 1000  # 毫秒
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, OSError):
+        return ""
+
+
 def group_create_time_str(group: dict | None) -> str:
     """从群信息 payload 提取创建时间并格式化为 yyyy-MM-dd HH:mm:ss（本机时区）。
-    支持 unix 秒（插件 get_group_info 透传）或已是该格式的字符串；取不到返回 ''。"""
+    支持 unix 秒/毫秒（插件 /members 透传）或已是该格式的字符串；取不到返回 ''。"""
     if not group:
         return ""
     v = group.get("group_create_time") or group.get("create_time") or ""
     if not v:
         return ""
     if isinstance(v, (int, float)):
-        try:
-            return datetime.fromtimestamp(float(v)).strftime("%Y-%m-%d %H:%M:%S")
-        except (ValueError, OSError):
-            return ""
+        return _ts_to_str(float(v))
     s = str(v).strip()
     if len(s) == 19:
         return s
     try:
-        return datetime.fromtimestamp(float(s)).strftime("%Y-%m-%d %H:%M:%S")
+        return _ts_to_str(float(s))
     except ValueError:
         return ""
 

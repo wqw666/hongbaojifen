@@ -94,18 +94,20 @@ class PlayTab(ctk.CTkScrollableFrame):
         self.lbl_rules = ctk.CTkLabel(row, text="未连接", text_color="gray")
         self.lbl_rules.pack(side="left", padx=8)
 
-        # ---- 启动/结算 ----
+        # ---- 游戏群勾选（多群，运行中可随时增删）----
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=2)
-        ctk.CTkLabel(row, text="游戏群号", width=76, anchor="w").pack(side="left")
-        self.var_group = ctk.StringVar(value=self.cfg.play_group_id)
-        ctk.CTkEntry(row, textvariable=self.var_group, width=200,
-                     placeholder_text="逗号分隔多个 QQ 群").pack(side="left", padx=4)
+        ctk.CTkLabel(row, text="游戏群（勾选参与玩法的群，可多选）", width=230, anchor="w").pack(side="left")
+        ctk.CTkButton(row, text="刷新群列表", width=100, command=self._refresh_group_checkboxes).pack(side="left", padx=4)
         self.var_auto_members = ctk.BooleanVar(value=self.cfg.play_auto_register_members)
-        ctk.CTkCheckBox(row, text="启用时自动注册群成员为会员", variable=self.var_auto_members).pack(
-            side="left", padx=8)
-        ctk.CTkLabel(row, text="（每群成员自动建档/查积分，重复执行幂等）",
+        ctk.CTkCheckBox(row, text="启用时自动注册群成员为会员", variable=self.var_auto_members).pack(side="left", padx=8)
+        ctk.CTkLabel(row, text="（群号在「群管理」页维护，运行中勾选/取消即时生效）",
                      text_color="gray", font=ctk.CTkFont(size=11)).pack(side="left")
+
+        self.frame_group_list = ctk.CTkScrollableFrame(card, height=120)
+        self.frame_group_list.pack(fill="x", padx=10, pady=(4, 2))
+        self._group_vars: dict[str, ctk.BooleanVar] = {}
+        self._group_labels: dict[str, ctk.CTkLabel] = {}
 
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=(2, 8))
@@ -130,6 +132,9 @@ class PlayTab(ctk.CTkScrollableFrame):
                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=10, pady=(6, 2))
         self.txt_log = ctk.CTkTextbox(card, height=170, state="disabled", font=ctk.CTkFont(size=11))
         self.txt_log.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        # 所有控件就绪后再重建群勾选列表（内部会刷新各群状态标签）
+        self._refresh_group_checkboxes()
 
     # ================= 回调服务（插件 → 本页） =================
 
@@ -273,17 +278,78 @@ class PlayTab(ctk.CTkScrollableFrame):
         return HbjfClient(self.cfg.backend_base, self.cfg.backend_api_key,
                           token=self.cfg.executor_token)
 
-    def _parse_groups(self, raw: str) -> list[str]:
-        """把输入解析成游戏群号列表（容忍中文逗号；非法项提示并剔除）。"""
-        parts = [x.strip() for x in raw.replace("，", ",").replace("\n", ",").split(",") if x.strip()]
-        groups = []
-        for p in parts:
-            if p.isdigit():
-                if p not in groups:
-                    groups.append(p)
-            else:
-                self._log(f"⚠ 忽略非法群号: {p}")
-        return groups
+    def _refresh_group_checkboxes(self) -> None:
+        """重建群勾选列表（来源：本机监控群 ∪ 上次玩法群；上次玩法群默认勾选）。"""
+        for w in self.frame_group_list.winfo_children():
+            w.destroy()
+        self._group_vars = {}
+        self._group_labels = {}
+        groups: list[str] = []
+        for g in self.cfg.watch_group_list():
+            if g not in groups:
+                groups.append(g)
+        for g in self.cfg.play_group_list():
+            if g not in groups:
+                groups.append(g)
+        checked = set(self.cfg.play_group_list()) or set(self.cfg.watch_group_list())
+        for g in groups:
+            var = ctk.BooleanVar(value=g in checked)
+            row = ctk.CTkFrame(self.frame_group_list, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            ctk.CTkCheckBox(row, text=g, width=130, variable=var,
+                            command=lambda g=g: self._on_group_toggled(g)).pack(side="left")
+            self._group_vars[g] = var
+            lbl = ctk.CTkLabel(row, text="", text_color="gray", anchor="w", font=ctk.CTkFont(size=11))
+            lbl.pack(side="left", padx=8)
+            self._group_labels[g] = lbl
+        if not groups:
+            ctk.CTkLabel(self.frame_group_list,
+                         text="（暂无群：请到「群管理」页添加，或到「实时监控」填写监控群）",
+                         text_color="gray").pack(anchor="w", padx=4, pady=4)
+        self._rounds_refresh()
+
+    def _checked_groups(self) -> list[str]:
+        return [g for g, v in self._group_vars.items() if v.get()]
+
+    def _push_play_groups(self) -> None:
+        """把当前激活的游戏群全量推给插件转发（运行中增减群后调用）。"""
+        try:
+            callback = f"http://127.0.0.1:{int(self.cfg.play_callback_port or 6101)}/play/msg"
+            requests.post(self.cfg.plugin_api("play/config"),
+                          json={"enabled": True, "groups": sorted(self._active_groups),
+                                "callback": callback}, timeout=5)
+        except requests.RequestException:
+            pass
+
+    def _on_group_toggled(self, gid: str) -> None:
+        """勾选/取消（运行中即时生效：加群或先结算再退群）。"""
+        var = self._group_vars.get(gid)
+        if var is None:
+            return
+        if not self.engine.is_active():
+            return
+        if var.get():
+            self._active_groups.add(gid)
+            self._push_play_groups()
+            self._log(f"已加入游戏群 {gid}")
+        else:
+            # 退群前先结算该群未上报对局；失败则恢复勾选并提示
+            if self.session and gid in self.session.pending_groups():
+                try:
+                    self.session.settle(gid)
+                except (ExecutorBanned, OperatorDisabled) as e:
+                    var.set(True)
+                    self._mark_banned(e)
+                    return
+                except BackendError as e:
+                    var.set(True)
+                    self._log(f"⚠ 群{gid} 有未结算对局且结算失败（已保留勾选）: {e}")
+                    return
+            self._active_groups.discard(gid)
+            self._push_play_groups()
+            self._log(f"已退出游戏群 {gid}")
+        self._apply_state()
+        self._rounds_refresh()
 
     def _refresh_rules(self) -> None:
         self.after(0, self._set_busy, True)
@@ -350,9 +416,9 @@ class PlayTab(ctk.CTkScrollableFrame):
         if rule is None:
             self._log("✗ 请先「刷新玩法列表」并选中一个玩法")
             return
-        groups = self._parse_groups(self.var_group.get())
+        groups = self._checked_groups()
         if not groups:
-            self._log("✗ 请填写正确的游戏群号（纯数字，可逗号分隔多个）")
+            self._log("✗ 请先勾选游戏群（群号在「群管理」页维护）")
             return
         if self.engine.is_active():
             self._log("✗ 已有玩法在运行：请先「停止玩法（先结算）」")
@@ -657,6 +723,7 @@ class PlayTab(ctk.CTkScrollableFrame):
                     for gid in groups:
                         if not self._sync_members_quiet(client, gid):
                             break
+            self.after(0, self._refresh_group_checkboxes)
             self.after(0, self._apply_state)
             self.after(0, self._rounds_refresh)
 
@@ -685,6 +752,8 @@ class PlayTab(ctk.CTkScrollableFrame):
 
     def _rounds_refresh(self) -> None:
         """各游戏群当前局状态行（UI 线程；有局更新/结算后调用）。"""
+        if not hasattr(self, "lbl_rounds"):
+            return  # 控件尚未构建完成时忽略
         lines = []
         if self.session and self.engine.is_active():
             for info in self.session.all_rounds():
@@ -705,6 +774,22 @@ class PlayTab(ctk.CTkScrollableFrame):
         else:
             self.lbl_rounds.configure(text="", text_color="gray")
 
+        # 每行勾选框旁的状态文字（局/事件/净积分）
+        for g, lbl in getattr(self, "_group_labels", {}).items():
+            info = None
+            if self.session and self.engine.is_active():
+                info = self.session.round_info(g)
+            if self.engine.is_active() and g in self._active_groups:
+                if info:
+                    lbl.configure(text=f"局 {info['label']}｜事件 {info['event_count']}｜净积分 {info['total_delta']:+d}",
+                                  text_color="#2ecc71")
+                else:
+                    lbl.configure(text="待开局", text_color="gray")
+            elif self.engine.is_active():
+                lbl.configure(text="未参与", text_color="gray")
+            else:
+                lbl.configure(text="", text_color="gray")
+
     def _apply_state(self) -> None:
         if self._server_error:
             self.lbl_state.configure(text=f"回调服务异常：{self._server_error}", text_color="red")
@@ -719,13 +804,10 @@ class PlayTab(ctk.CTkScrollableFrame):
             groups = ",".join(sorted(self._active_groups)) or str(self.cfg.play_group_id or "")
             self.lbl_state.configure(
                 text=(f"运行中 ｜ 玩法 {self.engine.rule_summary()} ｜ 游戏群 {groups}"
-                      f" ｜ 本地回调 http://127.0.0.1:{port}/play/msg"
                       f"（结算=「结算并上报」，幂等可重复）"),
                 text_color="green")
         else:
-            self.lbl_state.configure(
-                text=f"未启用玩法 ｜ 本地回调 http://127.0.0.1:{port}/play/msg（常驻，插件转发已关）",
-                text_color="gray")
+            self.lbl_state.configure(text="未启用玩法（勾选游戏群后点「启用玩法」）", text_color="gray")
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy

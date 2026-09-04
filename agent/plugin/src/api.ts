@@ -85,6 +85,31 @@ function roleLabel(role: unknown): string {
   return '成员';
 }
 
+/** 从群信息对象里挑创建时间（unix 秒）。兼容秒/毫秒/多键名；找不到返回 0。 */
+function pickGroupCreateTime(info: Record<string, unknown>): number {
+  const keys = [
+    'group_create_time', 'groupCreateTime', 'create_time', 'createTime',
+    'createTimeLong', 'groupCreateTimeLong',
+  ];
+  for (const k of keys) {
+    const v = (info as any)[k];
+    if (v === undefined || v === null || v === '') continue;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    if (n > 1e12) return Math.floor(n / 1000); // 毫秒
+    if (n > 1e8) return Math.floor(n);         // 秒
+  }
+  // NT 有时包在嵌套对象里，兜底搜一层
+  for (const nest of ['groupDetail', 'detail', 'groupExtInfo', 'extInfo', 'groupExt']) {
+    const sub = (info as any)[nest];
+    if (sub && typeof sub === 'object') {
+      const r = pickGroupCreateTime(sub as Record<string, unknown>);
+      if (r) return r;
+    }
+  }
+  return 0;
+}
+
 function normalizeMember(m: any) {
   const uin = String(m?.user_id ?? m?.uin ?? m?.qq ?? '');
   const nick = String(m?.nickname ?? m?.nick ?? '');
@@ -1462,8 +1487,10 @@ export function registerRoutes(ctx: NapCatPluginContext) {
       const groupId = String(req.query?.group_id || req.query?.groupId || '').trim();
       if (!groupId) return fail(res, '缺少 group_id（请填写要核查的群号）');
       const noCache = String(req.query?.no_cache ?? 'true') !== 'false';
+      const debug = String(req.query?.debug || '') === '1';
 
       let group: Record<string, unknown> = { group_id: groupId };
+      const infoErrors: string[] = [];
       try {
         const infoRaw = await ctx.actions.call(
           'get_group_info',
@@ -1474,7 +1501,34 @@ export function registerRoutes(ctx: NapCatPluginContext) {
         const info = unwrapActionData(infoRaw) as Record<string, unknown> | null;
         if (info && typeof info === 'object') group = { ...group, ...info };
       } catch (e) {
-        group.info_error = String(e);
+        infoErrors.push('get_group_info: ' + String(e));
+      }
+
+      // 群创建时间：get_group_info 通常不含；get_group_detail_info 会把 NT 原始字段透传出来
+      try {
+        const detailRaw = await ctx.actions.call(
+          'get_group_detail_info',
+          { group_id: groupId },
+          ctx.adapterName,
+          ctx.pluginManager.config
+        );
+        const detail = unwrapActionData(detailRaw) as Record<string, unknown> | null;
+        if (detail && typeof detail === 'object') {
+          if (debug) {
+            (group as any).detail_keys = Object.keys(detail).slice(0, 80);
+            (group as any).detail_values = Object.fromEntries(
+              Object.entries(detail)
+                .filter(([k]) => /time|create|createTime/i.test(k))
+                .slice(0, 20)
+            );
+          }
+          group = { ...group, ...detail };
+        }
+      } catch (e) {
+        infoErrors.push('get_group_detail_info: ' + String(e));
+      }
+      if (infoErrors.length && debug) {
+        (group as any).info_errors = infoErrors;
       }
 
       const listRaw = await ctx.actions.call(
@@ -1494,10 +1548,11 @@ export function registerRoutes(ctx: NapCatPluginContext) {
       ok(res, {
         group_id: groupId,
         group_name: String(group.group_name || group.groupName || ''),
-        // NapCat get_group_info 可能带群创建时间（unix 秒），透传给 agent 上报总后台展示
-        group_create_time: Number(group.group_create_time || group.groupCreateTime || 0) || 0,
+        // 群创建时间（unix 秒）：get_group_info / get_group_detail_info 多键名提取，0=未知
+        group_create_time: pickGroupCreateTime(group),
         member_count: Number(group.member_count || group.memberCount || members.length || 0),
         max_member_count: Number(group.max_member_count || group.maxMemberCount || 0),
+        ...(debug ? { debug: { detail_keys: (group as any).detail_keys || [], detail_values: (group as any).detail_values || {}, info_errors: (group as any).info_errors || [] } } : {}),
         members,
       });
     } catch (e) {

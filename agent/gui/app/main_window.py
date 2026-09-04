@@ -22,7 +22,33 @@ from .plugin_deploy import deploy_plugin
 from .qr_image import load_qrcode_image, pil_to_ctk
 from .query_export import write_query_csv
 
+from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
+from integration.member_sync import group_create_time_str, run_member_sync
+
 APP_VERSION = "2026.08.31-8"
+
+HELP_TEXT = """【开箱步骤】
+1. 双击「agent.exe」，软件自动准备环境（约半分钟）
+2. 用手机 QQ 扫描二维码登录（本机登录过的账号可点快捷登录）
+3. 登录成功后自动进入主界面
+
+【群管理】
+• 「群管理」页：点「＋ 添加群」输入群号；选中群后可开启/关闭监控、同步会员
+• 「会员」页：选择群 → 「全部同步」，把群成员登记为会员并拉取积分
+
+【游戏玩法】
+• 「游戏玩法」页：勾选要参与的群 → 选中玩法 → 「启用玩法」
+• 群成员发言自动按玩法回复并计分；「结算并上报」把积分报给总后台
+
+【总后台对接】
+• 填总后台地址 / 对接密钥 / 执行器 token → 「启动对接」（由管理员配置）
+
+【注意】
+• 仅 QQ 钱包红包有效
+• 本软件不会关闭您已打开的 QQ；监控账号需在软件内单独扫码登录
+• 同一账号可同时管理多个群，无需多开窗口
+• 自动化有封号风险，请合规使用
+"""
 
 
 def _is_startup_noise(err: Exception | str) -> bool:
@@ -64,16 +90,16 @@ class MainWindow(ctk.CTk):
         self._selected_bill = ""
         self._filling_packets = False
         self._user_gen = 0
+        self._main_built = False
+        self._login_setup_done = False
+        self._env_started = False
 
         self._build_ui()
-        self._setup_tree_styles()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        if not self.cfg.first_run_done:
-            self.after(300, self._show_welcome)
-
-        # 先探测连接；就绪后再开监控轮询，避免启动期 503/404 刷屏
-        self.after(500, self.refresh_status)
+        # 打开即自动准备环境（检测 → 未就绪自动拉起），全程只显示扫码页
+        self.after(200, self._auto_env_start)
+        self._schedule_login_poll()
 
     # ---------- UI ----------
 
@@ -124,12 +150,27 @@ class MainWindow(ctk.CTk):
         self.tree_packets.configure(style="Monitor.Treeview")
         self.tree_claims.configure(style="Detail.Treeview")
         self.tree_members.configure(style="Detail.Treeview")
+        if hasattr(self, "tree_groups"):
+            self.tree_groups.configure(style="Monitor.Treeview")
+        if hasattr(self, "tree_members_tab"):
+            self.tree_members_tab.configure(style="Detail.Treeview")
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        header = ctk.CTkFrame(self, fg_color="transparent")
+        # ---- 登录视图（未登录时只显示这一页）----
+        self.view_login = ctk.CTkFrame(self)
+        self.view_login.grid_columnconfigure(0, weight=1)
+        self.view_login.grid_rowconfigure(1, weight=1)
+        self._build_login_view()
+
+        # ---- 主视图（登录成功后懒构建）----
+        self.view_main = ctk.CTkFrame(self)
+        self.view_main.grid_columnconfigure(0, weight=1)
+        self.view_main.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(self.view_main, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 0))
         header.grid_columnconfigure(1, weight=1)
 
@@ -138,42 +179,58 @@ class MainWindow(ctk.CTk):
         )
         self.lbl_conn = ctk.CTkLabel(header, text="连接: 检测中…", text_color="gray")
         self.lbl_conn.grid(row=0, column=1, sticky="e", padx=8)
-        ctk.CTkButton(header, text="启动 NapCat", width=100, command=self.launch_napcat).grid(
-            row=0, column=2, sticky="e", padx=(0, 4)
-        )
-        ctk.CTkButton(header, text="刷新连接", width=100, command=self.refresh_status).grid(
-            row=0, column=3, sticky="e"
+        ctk.CTkButton(header, text="刷新", width=100, command=self.refresh_status).grid(
+            row=0, column=2, sticky="e"
         )
 
-        self.tabs = ctk.CTkTabview(self)
+        self.tabs = ctk.CTkTabview(self.view_main)
         self.tabs.grid(row=1, column=0, sticky="nsew", padx=16, pady=12)
-        self.tab_login = self.tabs.add("QQ 扫码登录")
-        self.tab_status = self.tabs.add("状态")
-        self.tab_monitor = self.tabs.add("实时监控")
-        self.tab_query = self.tabs.add("历史查询")
-        self.tab_settings = self.tabs.add("设置")
-        self.tab_backend = self.tabs.add("总后台对接")
+        self.tab_groups = self.tabs.add("群管理")
+        self.tab_members = self.tabs.add("会员")
         self.tab_play = self.tabs.add("游戏玩法")
-        self.tab_help = self.tabs.add("使用说明")
+        self.tab_monitor = self.tabs.add("实时监控")
+        self.tab_backend = self.tabs.add("总后台对接")
+        self.tab_more = self.tabs.add("更多")
 
-        self._build_login_tab()
-        self._build_status_tab()
-        self._build_monitor_tab()
-        self._build_query_tab()
-        self._build_settings_tab()
-        self._build_backend_tab()
+        self._show_login_view()
+
+    # ---------- 视图切换 ----------
+
+    def _show_login_view(self) -> None:
+        """切到扫码页（未登录/掉线时）。"""
+        self.view_main.grid_remove()
+        self.view_login.grid(row=0, column=0, sticky="nsew")
+        self._login_setup_done = False
+
+    def _show_main_view(self) -> None:
+        """切到主界面（首次会构建全部页面）。"""
+        self._ensure_main_view()
+        self.view_login.grid_remove()
+        self.view_main.grid(row=0, column=0, sticky="nsew")
+
+    def _ensure_main_view(self) -> None:
+        """登录成功后懒构建主界面各页面（只执行一次）。"""
+        if self._main_built:
+            return
+        self._main_built = True
+        self._build_groups_tab()
+        self._build_members_tab()
         self._build_play_tab()
-        self._build_help_tab()
+        self._build_monitor_tab()
+        self._build_backend_tab()
+        self._build_more_tab()
+        self._setup_tree_styles()
+        self.tabs.set("群管理")
 
-    def _build_login_tab(self) -> None:
-        f = self.tab_login
+    def _build_login_view(self) -> None:
+        f = self.view_login
         f.grid_columnconfigure(0, weight=1)
         f.grid_columnconfigure(1, weight=1)
         f.grid_rowconfigure(1, weight=1)
 
         tip = ctk.CTkLabel(
             f,
-            text="首次使用：1) 点「启动 NapCat」  2) 用手机 QQ 扫下方二维码  3) 登录成功后自动跳转",
+            text="首次使用：软件会自动准备环境，就绪后用手机 QQ 扫码，登录成功后自动进入主界面",
             text_color="gray",
             wraplength=900,
             justify="left",
@@ -185,10 +242,7 @@ class MainWindow(ctk.CTk):
         ctk.CTkLabel(left, text="登录二维码", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(12, 8))
         self.lbl_qr = ctk.CTkLabel(left, text="等待二维码…", width=280, height=280)
         self.lbl_qr.pack(padx=16, pady=8)
-        qr_btns = ctk.CTkFrame(left, fg_color="transparent")
-        qr_btns.pack(pady=8)
-        ctk.CTkButton(qr_btns, text="刷新二维码", command=self.refresh_login_qrcode).pack(pady=4)
-        ctk.CTkButton(qr_btns, text="启动 NapCat", command=self.launch_napcat).pack(pady=4)
+        ctk.CTkButton(left, text="刷新二维码", command=self.refresh_login_qrcode).pack(pady=(0, 12))
 
         right = ctk.CTkFrame(f)
         right.grid(row=1, column=1, sticky="nsew", padx=(8, 16), pady=8)
@@ -197,7 +251,7 @@ class MainWindow(ctk.CTk):
             row=0, column=0, sticky="w", padx=16, pady=(12, 8)
         )
         self.lbl_login_status = ctk.CTkLabel(
-            right, text="未检测", text_color="#e67e22", wraplength=360, justify="left"
+            right, text="环境启动中…", text_color="#e67e22", wraplength=360, justify="left"
         )
         self.lbl_login_status.grid(row=1, column=0, sticky="w", padx=16, pady=4)
         self.lbl_login_uin = ctk.CTkLabel(right, text="", wraplength=360, justify="left")
@@ -210,8 +264,10 @@ class MainWindow(ctk.CTk):
         self.frame_quick_login.grid(row=4, column=0, sticky="nsew", padx=12, pady=4)
         right.grid_rowconfigure(4, weight=1)
 
-        ctk.CTkButton(
-            right, text="登录成功后：部署插件并进入监控", command=self._after_login_setup
+        ctk.CTkLabel(
+            right,
+            text="登录成功后自动进入主界面（无需其他操作）",
+            text_color="gray",
         ).grid(row=5, column=0, sticky="w", padx=16, pady=16)
 
     def _napcat_vbs_path(self):
@@ -227,6 +283,46 @@ class MainWindow(ctk.CTk):
                     return vbs
         return None
 
+    def _auto_env_start(self) -> None:
+        """打开软件即自动准备环境：检测服务 → 未就绪自动拉起 → 就绪后提示扫码。
+        全程只更新扫码页的状态文字，不弹技术名词。"""
+        if self._env_started:
+            return
+        self._env_started = True
+        self.lbl_login_status.configure(text="环境启动中…", text_color="#e67e22")
+
+        def work():
+            import time
+
+            napcat = find_napcat_dir(self.cfg)
+            if not napcat:
+                self.after(0, lambda: self.lbl_login_status.configure(
+                    text="未找到服务组件，请确认安装包完整（缺少 tools 目录）", text_color="#e74c3c"))
+                return
+            webui = NapCatWebUI.from_napcat_dir(self.cfg.napcat_base, napcat)
+            for _ in range(4):
+                if webui.ping():
+                    break
+                time.sleep(1.5)
+            if webui.ping():
+                self.after(0, lambda: self.lbl_login_status.configure(
+                    text="已就绪，请用手机 QQ 扫码", text_color="#e67e22"))
+                self.after(0, lambda: self.refresh_login_qrcode(silent=True))
+                return
+            # 未就绪 → 自动拉起（复用 launch_napcat 的拉起逻辑）
+            self.after(0, self.launch_napcat)
+            for _ in range(60):  # 最多约 90 秒
+                time.sleep(1.5)
+                if webui.ping():
+                    self.after(0, lambda: self.lbl_login_status.configure(
+                        text="已就绪，请用手机 QQ 扫码", text_color="#e67e22"))
+                    self.after(0, lambda: self.refresh_login_qrcode(silent=True))
+                    return
+            self.after(0, lambda: self.lbl_login_status.configure(
+                text="环境启动超时，请重启软件重试", text_color="#e74c3c"))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def launch_napcat(self, quick_uin: str = "") -> None:
         vbs = self._napcat_vbs_path()
         if not vbs:
@@ -235,13 +331,14 @@ class MainWindow(ctk.CTk):
                 try:
                     os.startfile(str(launcher))
                     self._log_status(f"正在启动（{launcher.name}）…")
-                    self.lbl_conn.configure(text="正在启动 NapCat…", text_color="#e67e22")
+                    if hasattr(self, "lbl_conn"):
+                        self.lbl_conn.configure(text="环境启动中…", text_color="#e67e22")
                     self._schedule_login_poll()
                     return
                 except OSError as e:
                     messagebox.showerror("启动失败", str(e))
                     return
-            messagebox.showerror("未找到 NapCat", "请确认安装包内包含 tools\\NapCat 目录")
+            messagebox.showerror("缺少服务组件", "请确认安装包完整（缺少 tools 目录）")
             return
         try:
             cmd = ["wscript", "//nologo", str(vbs)]
@@ -257,10 +354,10 @@ class MainWindow(ctk.CTk):
                     pass
                 self._poll_job = None
             subprocess.Popen(cmd, cwd=str(vbs.parent))
-            self._log_status("正在后台启动 NapCat（不会关闭您已打开的 QQ）…")
-            self.lbl_conn.configure(text="正在启动 NapCat…", text_color="#e67e22")
-            self.lbl_login_status.configure(text="正在启动 NapCat，约 15~60 秒后可扫码", text_color="#e67e22")
-            self.tabs.set("QQ 扫码登录")
+            self._log_status("正在准备环境（不影响您已打开的 QQ）…")
+            if hasattr(self, "lbl_conn"):
+                self.lbl_conn.configure(text="环境启动中…", text_color="#e67e22")
+            self.lbl_login_status.configure(text="环境启动中，约 15~60 秒后可扫码", text_color="#e67e22")
             self._schedule_login_poll()
             self.after(8000, self.refresh_login_qrcode)
             self.after(20000, self.refresh_login_qrcode)
@@ -285,16 +382,18 @@ class MainWindow(ctk.CTk):
                     self.after(
                         0,
                         lambda: self.lbl_login_status.configure(
-                            text="未找到 NapCat 目录，请确认 tools\\NapCat 存在", text_color="#e74c3c"
+                            text="未找到服务组件，请确认安装包完整（缺少 tools 目录）", text_color="#e74c3c"
                         ),
                     )
                     return
                 webui = NapCatWebUI.from_napcat_dir(self.cfg.napcat_base, napcat)
                 if not webui.ping():
+                    if not getattr(self, "_env_started", False):
+                        self.after(0, self._auto_env_start)
                     self.after(
                         0,
                         lambda: self.lbl_login_status.configure(
-                            text="NapCat 未就绪，请点击「启动 NapCat」", text_color="#e67e22"
+                            text="环境启动中，请稍候…", text_color="#e67e22"
                         ),
                     )
                     return
@@ -329,23 +428,27 @@ class MainWindow(ctk.CTk):
             self._qr_ctk_image = pil_to_ctk(pil)
             self.lbl_qr.configure(image=self._qr_ctk_image, text="")
         elif not st.is_login:
-            self.lbl_qr.configure(image=None, text="等待二维码\n请先启动 NapCat")
+            self.lbl_qr.configure(image=None, text="等待二维码\n环境就绪后自动显示")
 
         if st.is_login:
             nick = info.get("nick") or ""
             uin = info.get("uin") or ""
-            self.lbl_login_status.configure(text="已登录 QQ", text_color="#2ecc71")
+            self.lbl_login_status.configure(text="已登录，正在进入…", text_color="#2ecc71")
             self.lbl_login_uin.configure(text=f"{nick} ({uin})" if nick else str(uin))
-            self.lbl_conn.configure(text=f"已连接 QQ {uin}", text_color="#2ecc71")
+            if hasattr(self, "lbl_conn"):
+                self.lbl_conn.configure(text=f"已连接 QQ {uin}", text_color="#2ecc71")
             if self._login_poll_job:
                 self.after_cancel(self._login_poll_job)
                 self._login_poll_job = None
-            self.refresh_status()
+            # 登录成功：自动部署服务 → 进入主界面（后台执行，无需用户操作）
+            self._after_login_auto()
         else:
             err = st.login_error or "请使用手机 QQ 扫描二维码"
             self.lbl_login_status.configure(text=err, text_color="#e67e22")
             self.lbl_login_uin.configure(text=st.qrcode_url[:80] + "…" if len(st.qrcode_url) > 80 else st.qrcode_url)
             self._fill_quick_login_buttons()
+            if getattr(self, "_main_built", False) and self.view_main.winfo_ismapped():
+                self._show_login_view()
 
     def _fill_quick_login_buttons(self) -> None:
         for w in self.frame_quick_login.winfo_children():
@@ -382,27 +485,61 @@ class MainWindow(ctk.CTk):
                 command=lambda u=uin: self.launch_napcat(u),
             ).pack(fill="x", padx=4, pady=2)
 
-    def _after_login_setup(self) -> None:
-        ok, msg = deploy_plugin(self.cfg)
-        if ok:
-            self.sync_settings()
-            messagebox.showinfo("完成", msg + "\n\n即将进入实时监控。")
-            self.tabs.set("实时监控")
-            self.refresh_status()
-            self.refresh_monitor()
-        else:
-            messagebox.showerror("部署失败", msg)
+    def _after_login_auto(self) -> None:
+        """登录成功后的自动配置：部署服务 → 重载 → 同步设置 → 切主界面。只执行一次。"""
+        if self._login_setup_done:
+            return
+        self._login_setup_done = True
 
-    def _build_status_tab(self) -> None:
-        f = self.tab_status
-        f.grid_columnconfigure(0, weight=1)
+        def work():
+            try:
+                ok, msg = deploy_plugin(self.cfg)
+                if not ok:
+                    raise RuntimeError(msg)
+                napcat = find_napcat_dir(self.cfg)
+                if napcat:
+                    try:
+                        webui = NapCatWebUI.from_napcat_dir(self.cfg.napcat_base, napcat)
+                        if webui.ping():
+                            webui.reload_plugin(self.cfg.plugin_id or "napcat-plugin-cleaner")
+                    except Exception:
+                        pass  # 重载失败不阻断：下次重启服务自动生效
+                try:
+                    self.client.sync_plugin_config()
+                except Exception:
+                    pass
+                self.after(0, self._enter_main_after_login)
+            except Exception as e:
+                def fail(err=e):
+                    self._login_setup_done = False
+                    self.lbl_login_status.configure(
+                        text=f"进入失败（点「刷新二维码」重试）: {err}", text_color="#e74c3c")
+                self.after(0, fail)
 
-        box = ctk.CTkFrame(f)
-        box.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        box.grid_columnconfigure(1, weight=1)
+        threading.Thread(target=work, daemon=True).start()
 
+    def _enter_main_after_login(self) -> None:
+        self.lbl_login_status.configure(text="已登录", text_color="#2ecc71")
+        self._show_main_view()
+        self.refresh_status()
+        self.refresh_monitor()
+
+    def _build_more_tab(self) -> None:
+        """「更多」页（放最后）：服务状态 + 设置 + 使用说明，合并不常用菜单。"""
+        wrap = ctk.CTkScrollableFrame(self.tab_more)
+        wrap.pack(fill="both", expand=True)
+        wrap.grid_columnconfigure(0, weight=1)
+
+        # ---- ① 服务状态 ----
+        card = ctk.CTkFrame(wrap)
+        card.grid(row=0, column=0, sticky="ew", padx=4, pady=(2, 6))
+        ctk.CTkLabel(card, text="服务状态", font=ctk.CTkFont(size=15, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+
+        grid = ctk.CTkFrame(card, fg_color="transparent")
+        grid.grid(row=1, column=0, sticky="ew", padx=10, pady=2)
         rows = [
-            ("NapCat 地址", "napcat_base"),
+            ("服务地址", "napcat_base"),
             ("当前 QQ", "self_uin"),
             ("缓存红包数", "record_count"),
             ("自动收红包", "auto_grab"),
@@ -410,30 +547,511 @@ class MainWindow(ctk.CTk):
         ]
         self.status_vars: dict[str, ctk.StringVar] = {}
         for i, (label, key) in enumerate(rows):
-            ctk.CTkLabel(box, text=label + "：").grid(row=i, column=0, sticky="w", padx=12, pady=8)
+            r, c = divmod(i, 2)
+            ctk.CTkLabel(grid, text=label + "：").grid(row=r, column=c * 2, sticky="w", padx=(0, 6), pady=4)
             var = ctk.StringVar(value="-")
             self.status_vars[key] = var
-            ctk.CTkLabel(box, textvariable=var, anchor="w").grid(row=i, column=1, sticky="w", padx=8, pady=8)
+            ctk.CTkLabel(grid, textvariable=var, anchor="w").grid(
+                row=r, column=c * 2 + 1, sticky="w", padx=(0, 18), pady=4)
 
-        btn_row = ctk.CTkFrame(f, fg_color="transparent")
-        btn_row.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
-        ctk.CTkButton(btn_row, text="同步设置到插件", command=self.sync_settings).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="一键部署插件", command=self.deploy_plugin_action).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="打开监控页", command=lambda: self.tabs.set("实时监控")).pack(
-            side="left", padx=4
-        )
-        ctk.CTkButton(btn_row, text="清空运行日志", command=self.clear_status_log).pack(side="left", padx=4)
+        btn_row = ctk.CTkFrame(card, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(2, 8))
+        ctk.CTkButton(btn_row, text="同步设置到服务", command=self.sync_settings).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="重新部署服务", command=self.deploy_plugin_action).pack(side="left", padx=6)
+        ctk.CTkButton(btn_row, text="清空运行日志", command=self.clear_status_log).pack(side="left", padx=6)
 
-        self.log_status = ctk.CTkTextbox(f, height=220)
-        self.log_status.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
+        self.log_status = ctk.CTkTextbox(card, height=110)
+        self.log_status.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
+        self._log_status("欢迎使用。登录后自动同步服务，页面全程自动运行。")
+
+        # ---- ② 设置（一般无需修改）----
+        card = ctk.CTkFrame(wrap)
+        card.grid(row=1, column=0, sticky="ew", padx=4, pady=6)
+        ctk.CTkLabel(card, text="设置（一般无需修改）", font=ctk.CTkFont(size=15, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+
+        grid = ctk.CTkFrame(card, fg_color="transparent")
+        grid.grid(row=1, column=0, sticky="ew", padx=10, pady=2)
+        grid.grid_columnconfigure(1, weight=1)
+        fields: list[tuple[str, str, str]] = [
+            ("服务地址", "napcat_base", "http://127.0.0.1:6099（勿改）"),
+            ("监听群号（逗号分隔）", "watch_groups", "留空=全部群"),
+            ("服务插件目录", "napcat_plugins_dir", "留空则自动猜测"),
+        ]
+        self.setting_entries: dict[str, ctk.CTkEntry] = {}
+        for i, (label, key, ph) in enumerate(fields):
+            ctk.CTkLabel(grid, text=label).grid(row=i, column=0, padx=(0, 8), pady=6, sticky="w")
+            e = ctk.CTkEntry(grid, placeholder_text=ph)
+            e.grid(row=i, column=1, padx=8, pady=6, sticky="ew")
+            val = getattr(self.cfg, key, "")
+            if val:
+                e.insert(0, str(val))
+            self.setting_entries[key] = e
+            if key == "napcat_plugins_dir":
+                ctk.CTkButton(grid, text="浏览…", width=70, command=self._browse_plugins_dir).grid(
+                    row=i, column=2, padx=4)
+
+        row = len(fields)
+        self.sw_auto_grab = ctk.CTkSwitch(grid, text="自动收红包")
+        self.sw_auto_grab.grid(row=row, column=1, sticky="w", padx=8, pady=4)
+        if self.cfg.auto_grab:
+            self.sw_auto_grab.select()
+
+        self.sw_grab_self = ctk.CTkSwitch(grid, text="允许领取自己发的包（拼手气）")
+        self.sw_grab_self.grid(row=row + 1, column=1, sticky="w", padx=8, pady=4)
+        if self.cfg.grab_self:
+            self.sw_grab_self.select()
+
+        self.sw_auto_detail = ctk.CTkSwitch(grid, text="自动查领取详情")
+        self.sw_auto_detail.grid(row=row + 2, column=1, sticky="w", padx=8, pady=4)
+        if self.cfg.auto_pull_detail:
+            self.sw_auto_detail.select()
+
+        self.sw_password = ctk.CTkSwitch(grid, text="自动发口令（口令红包）")
+        self.sw_password.grid(row=row + 3, column=1, sticky="w", padx=8, pady=4)
+        if self.cfg.handle_password:
+            self.sw_password.select()
+
+        ctk.CTkLabel(grid, text="领取延迟(ms)").grid(row=row + 4, column=0, padx=(0, 8), pady=6, sticky="w")
+        delay_frame = ctk.CTkFrame(grid, fg_color="transparent")
+        delay_frame.grid(row=row + 4, column=1, sticky="w", padx=8)
+        self.entry_delay_min = ctk.CTkEntry(delay_frame, width=70)
+        self.entry_delay_min.insert(0, str(self.cfg.delay_min_ms))
+        self.entry_delay_min.pack(side="left")
+        ctk.CTkLabel(delay_frame, text=" ~ ").pack(side="left")
+        self.entry_delay_max = ctk.CTkEntry(delay_frame, width=70)
+        self.entry_delay_max.insert(0, str(self.cfg.delay_max_ms))
+        self.entry_delay_max.pack(side="left")
+
+        ctk.CTkButton(grid, text="保存设置", command=self.save_settings).grid(
+            row=row + 5, column=1, sticky="w", padx=8, pady=12)
+
+        # ---- ③ 使用说明 ----
+        card = ctk.CTkFrame(wrap)
+        card.grid(row=2, column=0, sticky="ew", padx=4, pady=6)
+        ctk.CTkLabel(card, text="使用说明", font=ctk.CTkFont(size=15, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        text = ctk.CTkTextbox(card, height=320)
+        text.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        text.insert("1.0", HELP_TEXT)
+        text.configure(state="disabled")
+
+    # ---------- 群管理（表格） ----------
+
+    def _build_groups_tab(self) -> None:
+        f = self.tab_groups
+        f.grid_columnconfigure(0, weight=1)
         f.grid_rowconfigure(2, weight=1)
-        self._log_status("欢迎使用。请先确保 QQ 电脑版 + NapCat 已登录，并部署插件。")
+
+        row = ctk.CTkFrame(f, fg_color="transparent")
+        row.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
+        self.entry_add_group = ctk.CTkEntry(row, width=150, placeholder_text="输入群号")
+        self.entry_add_group.pack(side="left")
+        self.entry_add_group.bind("<Return>", lambda _e: self._groups_add())
+        ctk.CTkButton(row, text="＋ 添加群", width=80, command=self._groups_add).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="刷新", width=64, command=self._groups_refresh).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="开启监控", width=84, command=lambda: self._groups_set_watch(True)).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="关闭监控", width=84, command=lambda: self._groups_set_watch(False)).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="同步会员", width=84, command=self._groups_sync_members).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="上报群信息", width=92, command=self._groups_report).pack(side="left", padx=4)
+        self.lbl_groups_info = ctk.CTkLabel(row, text="", text_color="gray")
+        self.lbl_groups_info.pack(side="left", padx=10)
+
+        tip = ctk.CTkLabel(
+            f,
+            text="可多选（Ctrl/Shift 点击）。群号只需在这里维护一次：监控、会员、游戏玩法都从这里选。",
+            text_color="gray", font=ctk.CTkFont(size=11),
+        )
+        tip.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 2))
+
+        frame = tk.Frame(f, highlightthickness=1, highlightbackground="#CBD5E1")
+        frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        cols = ("gid", "name", "count", "watch", "ctime")
+        self.tree_groups = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
+        for c, w, t in [
+            ("gid", 120, "群号"),
+            ("name", 180, "群名"),
+            ("count", 70, "人数"),
+            ("watch", 80, "监控"),
+            ("ctime", 150, "创建时间"),
+        ]:
+            self.tree_groups.heading(c, text=t)
+            self.tree_groups.column(c, width=w)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree_groups.yview)
+        self.tree_groups.configure(yscrollcommand=sb.set)
+        self.tree_groups.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree_groups.tag_configure("watched", foreground="#2563EB")
+        self.tree_groups.tag_configure("banned", foreground="#e74c3c")
+        self._groups_rows: list[dict] = []
+        self.after(200, self._groups_refresh)
+
+    def _backend_client(self) -> "HbjfClient | None":
+        """总后台客户端；未配置地址/密钥时返回 None（提示未对接）。"""
+        if not (self.cfg.backend_base and self.cfg.backend_api_key):
+            return None
+        return HbjfClient(self.cfg.backend_base, self.cfg.backend_api_key,
+                          token=self.cfg.executor_token)
+
+    def _groups_refresh(self) -> None:
+        if not hasattr(self, "tree_groups"):
+            return
+
+        def work():
+            rows: dict[str, dict] = {}
+            for gid in self._parse_watch_groups():
+                rows[gid] = {"group_id": gid, "group_name": "", "member_count": "",
+                             "create_time": "", "status": ""}
+            client = self._backend_client()
+            if client:
+                try:
+                    for g in client.list_groups():
+                        gid = str(g.get("group_id") or "")
+                        if not gid:
+                            continue
+                        prev = rows.get(gid, {})
+                        rows[gid] = {
+                            "group_id": gid,
+                            "group_name": g.get("group_name") or prev.get("group_name") or "",
+                            "member_count": g.get("member_count") or "",
+                            "create_time": g.get("create_time") or "",
+                            "status": g.get("status") or "",
+                        }
+                except BackendError as e:
+                    self.after(0, lambda e=e: self.lbl_groups_info.configure(
+                        text=f"总后台群列表拉取失败（不影响本机群）: {e}", text_color="#e67e22"))
+            ordered = sorted(rows.values(), key=lambda r: r["group_id"])
+            self.after(0, lambda: self._groups_fill(ordered))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _groups_fill(self, rows: list[dict]) -> None:
+        watch = set(self._parse_watch_groups())
+        for iid in self.tree_groups.get_children():
+            self.tree_groups.delete(iid)
+        self._groups_rows = rows
+        for r in rows:
+            gid = str(r.get("group_id") or "")
+            tags = ["watched"] if gid in watch else []
+            if str(r.get("status") or "") == "banned":
+                tags.append("banned")
+            self.tree_groups.insert("", "end", iid=gid, values=(
+                gid,
+                r.get("group_name") or "（未上报）",
+                r.get("member_count") or "",
+                "● 监控中" if gid in watch else "—",
+                r.get("create_time") or "",
+            ), tags=tags)
+        self.lbl_groups_info.configure(text=f"共 {len(rows)} 个群（蓝色=监控中，红色=已被总后台封禁）")
+
+    def _groups_selected(self) -> list[str]:
+        if not hasattr(self, "tree_groups"):
+            return []
+        return [str(iid) for iid in self.tree_groups.selection()]
+
+    def _groups_add(self) -> None:
+        gid = self.entry_add_group.get().strip().replace("，", ",")
+        parts = [g.strip() for g in gid.split(",") if g.strip().isdigit()]
+        if not parts:
+            self.lbl_groups_info.configure(text="请先输入群号再添加", text_color="#e67e22")
+            return
+        known = {str(r.get("group_id")) for r in self._groups_rows}
+        for g in parts:
+            if g not in known:
+                self._groups_rows.append({"group_id": g, "group_name": "", "member_count": "",
+                                          "create_time": "", "status": ""})
+        self.entry_add_group.delete(0, "end")
+        self._groups_fill(self._groups_rows)
+        for g in parts:
+            self._groups_fetch_meta(g)
+        self._members_refresh_groups()
+
+    def _groups_fetch_meta(self, gid: str) -> None:
+        """后台拉群名/人数/创建时间回填表格，并顺带上报总后台群信息。"""
+        def work():
+            try:
+                data = self.client.get_group_members(gid, no_cache=True) or {}
+            except Exception:
+                return
+            if data:
+                self.after(0, lambda: self._groups_apply_meta(gid, data))
+            client = self._backend_client()
+            if client and data:
+                try:
+                    client.upsert_group(gid, group_name=str(data.get("group_name") or ""),
+                                        member_count=str(data.get("member_count") or ""),
+                                        create_time=group_create_time_str(data))
+                except BackendError:
+                    pass  # 上报失败不打断
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _groups_apply_meta(self, gid: str, data: dict) -> None:
+        ctime = group_create_time_str(data)
+        for r in self._groups_rows:
+            if str(r.get("group_id")) == gid:
+                if data.get("group_name"):
+                    r["group_name"] = data.get("group_name")
+                if data.get("member_count"):
+                    r["member_count"] = data.get("member_count")
+                if ctime:
+                    r["create_time"] = ctime
+        self._groups_fill(self._groups_rows)
+
+    def _groups_set_watch(self, on: bool) -> None:
+        sels = self._groups_selected()
+        if not sels:
+            self.lbl_groups_info.configure(text="请先在表格里选中群（可多选）", text_color="#e67e22")
+            return
+        watch = set(self._parse_watch_groups())
+        for g in sels:
+            if on:
+                watch.add(g)
+            else:
+                watch.discard(g)
+        self.cfg.watch_groups = ",".join(sorted(watch))
+        save_config(self.cfg)
+        if "watch_groups" in getattr(self, "setting_entries", {}):
+            e = self.setting_entries["watch_groups"]
+            e.delete(0, "end")
+            e.insert(0, self.cfg.watch_groups)
+        if hasattr(self, "entry_monitor_group"):
+            self.entry_monitor_group.delete(0, "end")
+            self.entry_monitor_group.insert(0, self.cfg.watch_groups)
+        self.client = PluginClient(self.cfg)
+        self._groups_fill(self._groups_rows)
+
+        def work():
+            try:
+                self.client.sync_plugin_config()
+                self.after(0, lambda: self.lbl_groups_info.configure(
+                    text=f"已{'开启' if on else '关闭'} {len(sels)} 个群的监控", text_color="#2ecc71"))
+            except Exception as e:
+                self.after(0, lambda e=e: self.lbl_groups_info.configure(
+                    text=f"同步监控失败: {e}", text_color="#e74c3c"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _groups_sync_members(self) -> None:
+        sels = self._groups_selected()
+        if not sels:
+            self.lbl_groups_info.configure(text="请先在表格里选中群（可多选）", text_color="#e67e22")
+            return
+        client = self._backend_client()
+        if not client:
+            self.lbl_groups_info.configure(text="未配置总后台（「总后台对接」页填写后即可同步）", text_color="#e67e22")
+            return
+        self.lbl_groups_info.configure(text=f"正在同步 {len(sels)} 个群的会员…", text_color="#3498db")
+
+        def work():
+            total_added = 0
+            for gid in sels:
+                try:
+                    res = run_member_sync(
+                        client, gid,
+                        lambda g: (self.client.get_group_members(g, no_cache=True) or {}).get("members") or [],
+                        lambda g: self.client.get_group_members(g, no_cache=True) or {},
+                    )
+                    total_added += int(res.get("added") or 0)
+                    warn = res.get("warning") or ""
+                    self.after(0, lambda g=gid, r=res, w=warn: self._log_status(
+                        f"群 {g} 会员同步：成员 {r.get('total')}，新增 {r.get('added')}"
+                        + (f"；注意：{w}" if w else "")))
+                except (ExecutorBanned, OperatorDisabled) as e:
+                    self.after(0, lambda e=e: self.lbl_groups_info.configure(
+                        text=f"同步停摆：{e}", text_color="#e74c3c"))
+                    return
+                except BackendError as e:
+                    self.after(0, lambda g=gid, e=e: self._log_status(f"群 {g} 同步失败: {e}"))
+            self.after(0, lambda: self.lbl_groups_info.configure(
+                text=f"同步完成，共新增会员 {total_added}", text_color="#2ecc71"))
+            self.after(0, self._groups_refresh)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _groups_report(self) -> None:
+        sels = self._groups_selected()
+        if not sels:
+            self.lbl_groups_info.configure(text="请先在表格里选中群（可多选）", text_color="#e67e22")
+            return
+        client = self._backend_client()
+        if not client:
+            self.lbl_groups_info.configure(text="未配置总后台（「总后台对接」页填写后即可上报）", text_color="#e67e22")
+            return
+
+        def work():
+            ok = 0
+            for gid in sels:
+                try:
+                    data = self.client.get_group_members(gid, no_cache=True) or {}
+                    if not data:
+                        continue
+                    client.upsert_group(gid, group_name=str(data.get("group_name") or ""),
+                                        member_count=str(data.get("member_count") or ""),
+                                        create_time=group_create_time_str(data))
+                    ok += 1
+                except BackendError as e:
+                    self.after(0, lambda g=gid, e=e: self._log_status(f"上报群 {g} 失败: {e}"))
+                except Exception:
+                    pass
+            self.after(0, lambda: self.lbl_groups_info.configure(
+                text=f"已上报 {ok}/{len(sels)} 个群的群信息（含创建时间）", text_color="#2ecc71"))
+            self.after(0, self._groups_refresh)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- 会员（表格） ----------
+
+    def _build_members_tab(self) -> None:
+        f = self.tab_members
+        f.grid_columnconfigure(0, weight=1)
+        f.grid_rowconfigure(2, weight=1)
+
+        row = ctk.CTkFrame(f, fg_color="transparent")
+        row.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
+        ctk.CTkLabel(row, text="群：").pack(side="left")
+        self.combo_members_tab_group = ctk.CTkComboBox(row, values=["（先去群管理添加群）"], width=200)
+        self.combo_members_tab_group.pack(side="left", padx=4)
+        ctk.CTkButton(row, text="加载成员", width=88, command=self._members_load).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="全部同步", width=88, command=self._members_sync_all).pack(side="left", padx=4)
+        self.lbl_members_tab_info = ctk.CTkLabel(row, text="", text_color="gray")
+        self.lbl_members_tab_info.pack(side="left", padx=10)
+
+        frame = tk.Frame(f, highlightthickness=1, highlightbackground="#CBD5E1")
+        frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        cols = ("uin", "name", "role", "points")
+        self.tree_members_tab = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
+        for c, w, t in [
+            ("uin", 120, "QQ"),
+            ("name", 180, "昵称"),
+            ("role", 90, "身份"),
+            ("points", 100, "积分"),
+        ]:
+            self.tree_members_tab.heading(c, text=t)
+            self.tree_members_tab.column(c, width=w)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree_members_tab.yview)
+        self.tree_members_tab.configure(yscrollcommand=sb.set)
+        self.tree_members_tab.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self._members_rows: list[dict] = []
+        self.after(500, self._members_refresh_groups)
+
+    def _members_groups(self) -> list[str]:
+        groups = [str(r.get("group_id")) for r in getattr(self, "_groups_rows", [])]
+        for g in self._parse_watch_groups():
+            if g not in groups:
+                groups.append(g)
+        return groups
+
+    def _members_refresh_groups(self) -> None:
+        if not hasattr(self, "combo_members_tab_group"):
+            return
+        groups = self._members_groups()
+        self.combo_members_tab_group.configure(values=groups or ["（先去群管理添加群）"])
+        if groups:
+            cur = self.combo_members_tab_group.get()
+            if cur not in groups:
+                self.combo_members_tab_group.set(groups[0])
+
+    def _members_group(self) -> str:
+        if not hasattr(self, "combo_members_tab_group"):
+            return ""
+        g = (self.combo_members_tab_group.get() or "").strip()
+        return g if g.isdigit() else ""
+
+    def _members_load(self) -> None:
+        gid = self._members_group()
+        if not gid:
+            self.lbl_members_tab_info.configure(text="请先在「群管理」添加群并选择", text_color="#e67e22")
+            return
+        self.lbl_members_tab_info.configure(text=f"正在加载群 {gid} 成员…", text_color="gray")
+
+        def work():
+            try:
+                data = self.client.get_group_members(gid, no_cache=True) or {}
+                members = data.get("members") or []
+            except Exception as e:
+                self.after(0, lambda e=e: self.lbl_members_tab_info.configure(
+                    text=f"加载失败: {e}", text_color="#e74c3c"))
+                return
+            points: dict[str, dict] = {}
+            client = self._backend_client()
+            if client:
+                qqs = [str(m.get("uin") or "") for m in members if str(m.get("uin") or "").isdigit()]
+                for i in range(0, len(qqs), 500):
+                    try:
+                        for r in client.query_points_batch(qqs[i:i + 500]):
+                            points[str(r.get("qq"))] = r
+                    except BackendError:
+                        break
+            self.after(0, lambda: self._members_fill(gid, data, members, points))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _members_fill(self, gid: str, data: dict, members: list[dict], points: dict[str, dict]) -> None:
+        for iid in self.tree_members_tab.get_children():
+            self.tree_members_tab.delete(iid)
+        self._members_rows = members
+        for m in members:
+            uin = str(m.get("uin") or "")
+            p = points.get(uin) or {}
+            pts = ""
+            if p.get("exists"):
+                pts = str(p.get("points") if p.get("points") is not None else 0)
+            elif p:
+                pts = "未建档"
+            self.tree_members_tab.insert("", "end", values=(
+                uin,
+                m.get("nickname") or m.get("card") or "",
+                m.get("role_text") or m.get("role") or "",
+                pts,
+            ))
+        gname = data.get("group_name") or ""
+        title = f"群 {gid}" + (f" · {gname}" if gname else "") + f" · 共 {len(members)} 人"
+        if gname and not points:
+            title += "（未配置总后台，不显示积分）"
+        self.lbl_members_tab_info.configure(text=title, text_color="#2ecc71")
+
+    def _members_sync_all(self) -> None:
+        gid = self._members_group()
+        if not gid:
+            self.lbl_members_tab_info.configure(text="请先选择群", text_color="#e67e22")
+            return
+        client = self._backend_client()
+        if not client:
+            self.lbl_members_tab_info.configure(text="未配置总后台（「总后台对接」页填写后即可同步）", text_color="#e67e22")
+            return
+        self.lbl_members_tab_info.configure(text=f"正在同步群 {gid} 会员…", text_color="#3498db")
+
+        def work():
+            try:
+                res = run_member_sync(
+                    client, gid,
+                    lambda g: (self.client.get_group_members(g, no_cache=True) or {}).get("members") or [],
+                    lambda g: self.client.get_group_members(g, no_cache=True) or {},
+                )
+                warn = res.get("warning") or ""
+                self.after(0, lambda r=res, w=warn: self.lbl_members_tab_info.configure(
+                    text=f"同步完成：成员 {r.get('total')}，新增 {r.get('added')}"
+                         + (f"；注意：{w}" if w else ""),
+                    text_color="#e67e22" if warn else "#2ecc71"))
+            except (ExecutorBanned, OperatorDisabled) as e:
+                self.after(0, lambda e=e: self.lbl_members_tab_info.configure(
+                    text=f"同步停摆：{e}", text_color="#e74c3c"))
+            except BackendError as e:
+                self.after(0, lambda e=e: self.lbl_members_tab_info.configure(
+                    text=f"同步失败: {e}", text_color="#e74c3c"))
+            self.after(0, self._members_load)
+
+        threading.Thread(target=work, daemon=True).start()
+
 
     def _build_monitor_tab(self) -> None:
         f = self.tab_monitor
         f.grid_columnconfigure(0, weight=1)
         f.grid_rowconfigure(1, weight=2)
         f.grid_rowconfigure(2, weight=1)
+        f.grid_rowconfigure(3, weight=1)
 
         top = ctk.CTkFrame(f, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=8, pady=4)
@@ -605,173 +1223,60 @@ class MainWindow(ctk.CTk):
         self.tree_members.pack(side="left", fill="both", expand=True)
         sb3.pack(side="right", fill="y")
 
-    def _build_query_tab(self) -> None:
-        f = self.tab_query
-        f.grid_columnconfigure(0, weight=1)
-        f.grid_rowconfigure(2, weight=1)
-
-        form = ctk.CTkFrame(f)
-        form.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
-        form.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(form, text="群号").grid(row=0, column=0, padx=8, pady=6, sticky="w")
-        self.entry_q_group = ctk.CTkEntry(form, placeholder_text="必填")
-        self.entry_q_group.grid(row=0, column=1, padx=8, pady=6, sticky="ew")
-
-        now = datetime.now()
-        start = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-        end = now.strftime("%Y-%m-%d %H:%M:%S")
-
-        ctk.CTkLabel(form, text="开始时间").grid(row=1, column=0, padx=8, pady=6, sticky="w")
-        self.entry_q_start = ctk.CTkEntry(form)
-        self.entry_q_start.insert(0, start)
-        self.entry_q_start.grid(row=1, column=1, padx=8, pady=6, sticky="ew")
-
-        ctk.CTkLabel(form, text="结束时间").grid(row=2, column=0, padx=8, pady=6, sticky="w")
-        self.entry_q_end = ctk.CTkEntry(form)
-        self.entry_q_end.insert(0, end)
-        self.entry_q_end.grid(row=2, column=1, padx=8, pady=6, sticky="ew")
-
-        self.chk_refresh = ctk.CTkCheckBox(form, text="查询时向 QQ 服务器重新拉取详情（可能较慢）")
-        # 默认不勾：先用本地缓存，避免 pullDetail 穷举导致「查询卡住/失败」
+        # 历史查询（并入本页底部，不再单独成页）
+        query_box = ctk.CTkFrame(f)
+        query_box.grid(row=3, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        qrow = ctk.CTkFrame(query_box, fg_color="transparent")
+        qrow.grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 0))
+        ctk.CTkLabel(qrow, text="历史查询：").pack(side="left")
+        ctk.CTkLabel(qrow, text="群号").pack(side="left", padx=(12, 4))
+        self.entry_q_group = ctk.CTkEntry(qrow, width=120, placeholder_text="必填")
+        self.entry_q_group.pack(side="left", padx=4)
+        ctk.CTkLabel(qrow, text="开始").pack(side="left", padx=(8, 4))
+        self.entry_q_start = ctk.CTkEntry(qrow, width=150)
+        self.entry_q_start.insert(0, (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"))
+        self.entry_q_start.pack(side="left", padx=4)
+        ctk.CTkLabel(qrow, text="结束").pack(side="left", padx=(8, 4))
+        self.entry_q_end = ctk.CTkEntry(qrow, width=150)
+        self.entry_q_end.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.entry_q_end.pack(side="left", padx=4)
+        self.chk_refresh = ctk.CTkCheckBox(qrow, text="重新拉取详情")
         self.chk_refresh.deselect()
-        self.chk_refresh.grid(row=3, column=1, padx=8, pady=6, sticky="w")
-
-        ctk.CTkButton(form, text="查询", command=self.run_query).grid(row=0, column=2, rowspan=4, padx=12)
-        ctk.CTkButton(form, text="导出表格", command=self.export_query_csv).grid(
-            row=4, column=2, padx=12, pady=6, sticky="n"
-        )
-        ctk.CTkLabel(form, text="查询完成后可导出 CSV（Excel 可直接打开）", text_color="gray").grid(
-            row=4, column=0, columnspan=2, padx=8, pady=4, sticky="w"
-        )
-
-        self.txt_query_result = ctk.CTkTextbox(f)
-        self.txt_query_result.grid(row=2, column=0, sticky="nsew", padx=8, pady=8)
-
-    def _build_settings_tab(self) -> None:
-        f = self.tab_settings
-        f.grid_columnconfigure(1, weight=1)
-
-        fields: list[tuple[str, str, str]] = [
-            ("NapCat WebUI 地址", "napcat_base", "http://127.0.0.1:6099"),
-            ("插件目录 ID", "plugin_id", "napcat-plugin-cleaner（勿改）"),
-            ("监听群号（逗号分隔）", "watch_groups", ""),
-            ("NapCat plugins 目录", "napcat_plugins_dir", "留空则自动猜测"),
-        ]
-        self.setting_entries: dict[str, ctk.CTkEntry] = {}
-        for i, (label, key, ph) in enumerate(fields):
-            ctk.CTkLabel(f, text=label).grid(row=i, column=0, padx=12, pady=8, sticky="w")
-            e = ctk.CTkEntry(f, placeholder_text=ph)
-            e.grid(row=i, column=1, padx=8, pady=8, sticky="ew")
-            val = getattr(self.cfg, key, "")
-            if val:
-                e.insert(0, str(val))
-            self.setting_entries[key] = e
-            if key == "napcat_plugins_dir":
-                ctk.CTkButton(f, text="浏览…", width=70, command=self._browse_plugins_dir).grid(
-                    row=i, column=2, padx=4
-                )
-
-        row = len(fields)
-        self.sw_auto_grab = ctk.CTkSwitch(f, text="自动收红包")
-        self.sw_auto_grab.grid(row=row, column=1, sticky="w", padx=8, pady=4)
-        if self.cfg.auto_grab:
-            self.sw_auto_grab.select()
-
-        self.sw_grab_self = ctk.CTkSwitch(f, text="允许领取自己发的包（拼手气）")
-        self.sw_grab_self.grid(row=row + 1, column=1, sticky="w", padx=8, pady=4)
-        if self.cfg.grab_self:
-            self.sw_grab_self.select()
-
-        self.sw_auto_detail = ctk.CTkSwitch(f, text="自动查领取详情")
-        self.sw_auto_detail.grid(row=row + 2, column=1, sticky="w", padx=8, pady=4)
-        if self.cfg.auto_pull_detail:
-            self.sw_auto_detail.select()
-
-        self.sw_password = ctk.CTkSwitch(f, text="自动发口令（口令红包）")
-        self.sw_password.grid(row=row + 3, column=1, sticky="w", padx=8, pady=4)
-        if self.cfg.handle_password:
-            self.sw_password.select()
-
-        ctk.CTkLabel(f, text="领取延迟(ms)").grid(row=row + 4, column=0, padx=12, pady=8, sticky="w")
-        delay_frame = ctk.CTkFrame(f, fg_color="transparent")
-        delay_frame.grid(row=row + 4, column=1, sticky="w", padx=8)
-        self.entry_delay_min = ctk.CTkEntry(delay_frame, width=70)
-        self.entry_delay_min.insert(0, str(self.cfg.delay_min_ms))
-        self.entry_delay_min.pack(side="left")
-        ctk.CTkLabel(delay_frame, text=" ~ ").pack(side="left")
-        self.entry_delay_max = ctk.CTkEntry(delay_frame, width=70)
-        self.entry_delay_max.insert(0, str(self.cfg.delay_max_ms))
-        self.entry_delay_max.pack(side="left")
-
-        ctk.CTkButton(f, text="保存设置", command=self.save_settings).grid(
-            row=row + 5, column=1, sticky="w", padx=8, pady=16
-        )
-
-    def _build_help_tab(self) -> None:
-        text = ctk.CTkTextbox(self.tab_help)
-        text.pack(fill="both", expand=True, padx=8, pady=8)
-        text.insert(
-            "1.0",
-            """【客户使用 — 开箱步骤】
-
-1. 电脑先安装 QQ 电脑版（NT 版）
-   https://im.qq.com/
-
-2. 双击「agent.exe」
-
-3. 打开「QQ 扫码登录」页 → 点「启动 NapCat」→ 用手机 QQ 扫二维码
-
-4. 登录成功后点「登录成功后：部署插件并进入监控」
-
-5. 在「实时监控」填写抢包群号（多个群用英文逗号分隔），点「应用多群抢包」
-   例：1108441408,666590652
-   或「设置」里同样填写后点「同步设置到插件」
-
-6. 「实时监控」查看红包；「历史查询」可导出 CSV 表格
-
-【说明】
-• 安装包需包含 tools\\NapCat 目录（与 exe 同级）
-• 无需打开黑色命令行窗口，均在软件内操作
-• 发红包请在 QQ 客户端手动发送
-• 同一账号多群：只开一个软件窗口，群号逗号分隔即可同时抢
-• 不要多开两个软件窗口分别填不同群（无效，仍共用一个插件）
-
-【三个功能】
-• 收红包：插件自动 grabRedBag（所有监听群都会抢）
-• 查红包：展示领取人、时间、金额，可导出表格
-• 监控群：填写群号后自动刷新
-
-【注意】
-• 仅 QQ 钱包红包有效
-• 启动 NapCat 不会关闭您已打开的 QQ 电脑版；监控账号需在软件内单独登录
-• 本软件一次只能监控一个 QQ 账号（但该账号可同时监听多个群）
-• 自动化有封号风险，请合规使用
-""",
-        )
-        text.configure(state="disabled")
-
-    # ---------- actions ----------
+        self.chk_refresh.pack(side="left", padx=8)
+        ctk.CTkButton(qrow, text="查询", width=64, command=self.run_query).pack(side="left", padx=4)
+        ctk.CTkButton(qrow, text="导出表格", width=80, command=self.export_query_csv).pack(side="left", padx=4)
+        self.txt_query_result = ctk.CTkTextbox(query_box, height=110)
+        self.txt_query_result.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
 
     def _log_status(self, msg: str) -> None:
+        if not hasattr(self, "log_status"):
+            return
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_status.insert("end", f"[{ts}] {msg}\n")
         self.log_status.see("end")
 
     def _apply_cfg_from_settings_ui(self) -> None:
-        self.cfg.napcat_base = self.setting_entries["napcat_base"].get().strip()
-        self.cfg.plugin_id = self.setting_entries["plugin_id"].get().strip() or self.cfg.plugin_id
-        self.cfg.watch_groups = self.setting_entries["watch_groups"].get().strip()
-        self.cfg.napcat_plugins_dir = self.setting_entries["napcat_plugins_dir"].get().strip()
-        self.cfg.auto_grab = bool(self.sw_auto_grab.get())
-        self.cfg.grab_self = bool(self.sw_grab_self.get())
-        self.cfg.auto_pull_detail = bool(self.sw_auto_detail.get())
-        self.cfg.handle_password = bool(self.sw_password.get())
-        try:
-            self.cfg.delay_min_ms = int(self.entry_delay_min.get())
-            self.cfg.delay_max_ms = int(self.entry_delay_max.get())
-        except ValueError:
-            pass
+        if not hasattr(self, "setting_entries"):
+            return
+        e = self.setting_entries.get("napcat_base")
+        if e is not None and e.get().strip():
+            self.cfg.napcat_base = e.get().strip()
+        e = self.setting_entries.get("watch_groups")
+        if e is not None:
+            self.cfg.watch_groups = e.get().strip()
+        e = self.setting_entries.get("napcat_plugins_dir")
+        if e is not None:
+            self.cfg.napcat_plugins_dir = e.get().strip()
+        if hasattr(self, "sw_auto_grab"):
+            self.cfg.auto_grab = bool(self.sw_auto_grab.get())
+            self.cfg.grab_self = bool(self.sw_grab_self.get())
+            self.cfg.auto_pull_detail = bool(self.sw_auto_detail.get())
+            self.cfg.handle_password = bool(self.sw_password.get())
+            try:
+                self.cfg.delay_min_ms = int(self.entry_delay_min.get())
+                self.cfg.delay_max_ms = int(self.entry_delay_max.get())
+            except ValueError:
+                pass
         save_config(self.cfg)
         self.client = PluginClient(self.cfg)
 
@@ -788,7 +1293,7 @@ class MainWindow(ctk.CTk):
         def work():
             try:
                 self.client.sync_plugin_config()
-                self.after(0, lambda: self._log_status("已同步设置到 NapCat 插件"))
+                self.after(0, lambda: self._log_status("已同步设置到服务"))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror("同步失败", str(e)))
 
@@ -822,12 +1327,14 @@ class MainWindow(ctk.CTk):
         if st.connected:
             was_ready = self._napcat_ready
             self._napcat_ready = True
-            self.lbl_conn.configure(text=f"已连接 QQ {st.self_uin or '?'}", text_color="#2ecc71")
-            self.status_vars["napcat_base"].set(self.cfg.napcat_base)
-            self.status_vars["self_uin"].set(st.self_uin or "-")
-            self.status_vars["record_count"].set(str(st.record_count))
-            self.status_vars["auto_grab"].set("是" if st.auto_grab else "否")
-            self.status_vars["auto_pull"].set("是" if st.auto_pull_detail else "否")
+            if hasattr(self, "lbl_conn"):
+                self.lbl_conn.configure(text=f"已连接 QQ {st.self_uin or '?'}", text_color="#2ecc71")
+            if hasattr(self, "status_vars"):
+                self.status_vars["napcat_base"].set(self.cfg.napcat_base)
+                self.status_vars["self_uin"].set(st.self_uin or "-")
+                self.status_vars["record_count"].set(str(st.record_count))
+                self.status_vars["auto_grab"].set("是" if st.auto_grab else "否")
+                self.status_vars["auto_pull"].set("是" if st.auto_pull_detail else "否")
             self._log_status(f"连接正常，缓存 {st.record_count} 条红包")
             if self._login_poll_job:
                 self.after_cancel(self._login_poll_job)
@@ -836,20 +1343,19 @@ class MainWindow(ctk.CTk):
                 self._start_poll()
         else:
             self._napcat_ready = False
-            self.lbl_conn.configure(text="未连接 NapCat/插件", text_color="#e74c3c")
+            if hasattr(self, "lbl_conn"):
+                self.lbl_conn.configure(text="未连接服务", text_color="#e74c3c")
             err = st.raw.get("error", "")
             if _is_startup_noise(err):
-                err = "请打开「QQ 扫码登录」页，点「启动 NapCat」后扫码（启动约需 15~60 秒）"
+                err = "环境准备中，请稍候（可点击右上角「刷新」）"
             self._log_status(f"连接失败: {err}")
-            try:
-                self.tabs.set("QQ 扫码登录")
-            except Exception:
-                pass
             self._schedule_login_poll()
             self.refresh_login_qrcode(silent=True)
 
     def _parse_watch_groups(self, raw: str | None = None) -> list[str]:
-        text = raw if raw is not None else self.entry_monitor_group.get()
+        if raw is None:
+            raw = self.entry_monitor_group.get() if hasattr(self, "entry_monitor_group") else self.cfg.watch_groups
+        text = raw
         text = (text or "").replace("，", ",")
         return [x.strip() for x in text.split(",") if x.strip()]
 
@@ -908,8 +1414,10 @@ class MainWindow(ctk.CTk):
 
     def refresh_monitor(self) -> None:
         if not self._napcat_ready:
-            self._log_wait_throttled("等待 NapCat / QQ 登录就绪后再刷新监控…")
+            self._log_wait_throttled("等待服务就绪…")
             return
+        if not hasattr(self, "tree_packets"):
+            return  # 主界面尚未构建
 
         groups = self._parse_watch_groups()
         # 输入框改了群号但未点「应用」时，刷新也顺带同步，避免漏抢
@@ -936,7 +1444,7 @@ class MainWindow(ctk.CTk):
                     self.after(
                         0,
                         lambda: self._log_wait_throttled(
-                            "NapCat/插件尚未就绪，请稍候或到「QQ 扫码登录」页确认已登录"
+                            "服务尚未就绪，请稍候（可点击右上角「刷新」）"
                         ),
                     )
                     self.after(0, self.refresh_status)
@@ -1306,18 +1814,10 @@ class MainWindow(ctk.CTk):
             messagebox.showerror("导出失败", str(e))
 
     def _browse_plugins_dir(self) -> None:
-        d = filedialog.askdirectory(title="选择 NapCat 的 plugins 目录")
+        d = filedialog.askdirectory(title="选择服务插件目录")
         if d:
             self.setting_entries["napcat_plugins_dir"].delete(0, "end")
             self.setting_entries["napcat_plugins_dir"].insert(0, d)
-
-    def _show_welcome(self) -> None:
-        messagebox.showinfo(
-            "首次使用",
-            "请先安装 QQ 电脑版 + NapCat 并登录。\n\n"
-            "然后在「设置」中配置地址，点击「一键部署插件」。\n"
-            "详细步骤见「使用说明」页。",
-        )
 
     def _start_poll(self) -> None:
         self._polling = True
