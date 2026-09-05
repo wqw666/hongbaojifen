@@ -75,7 +75,7 @@ class HbjfClient:
     # ---------- 执行器心跳 ----------
 
     def heartbeat(self, host: str = "", version: str = "", admin_qq: str = "",
-                  admin_nickname: str = "") -> dict:
+                  admin_nickname: str = "", game_fee_rate: int | None = None) -> dict:
         """注册/续活执行器；顺带上报本机登录的管理员QQ（admin_qq 非空时总后台自动注册为操作员）。
         token 错或不存在抛 BackendError；已封禁抛 ExecutorBanned。返回 {name, server_time, online, admin_qq}。"""
         body = {"token": self.token, "host": host or "", "version": version or ""}
@@ -83,6 +83,8 @@ class HbjfClient:
             body["admin_qq"] = str(admin_qq).strip()
             if admin_nickname:
                 body["admin_nickname"] = str(admin_nickname).strip()
+        if game_fee_rate is not None:
+            body["game_fee_rate"] = str(game_fee_rate)
         return self._post("/api/open/executor/heartbeat", body)
 
     # ---------- 命令通道 ----------
@@ -153,6 +155,22 @@ class HbjfClient:
         """批量查积分（≤500/次）。返回与传入顺序一致，元素 {qq, points, exists, ...}。"""
         data = self._get("/api/open/points/batch", params={"qqs": ",".join(qqs)})
         return data.get("list") or []
+
+    def up_points(self, qq: str, points: int, reason: str = "", biz_no: str = "") -> dict:
+        """上分（积分审批通过）。biz_no 幂等：同单号重复提交不会重复加。"""
+        body = {"qq": str(qq), "points": int(points), "reason": reason or "",
+                "executor_token": self.token}
+        if biz_no:
+            body["bizNo"] = biz_no
+        return self._post("/api/open/points/up", body)
+
+    def down_points(self, qq: str, points: int, reason: str = "", biz_no: str = "") -> dict:
+        """下分（积分审批通过；余额不足会拒绝）。"""
+        body = {"qq": str(qq), "points": int(points), "reason": reason or "",
+                "executor_token": self.token}
+        if biz_no:
+            body["bizNo"] = biz_no
+        return self._post("/api/open/points/down", body)
 
     # ---------- 游戏对局上报 ----------
 

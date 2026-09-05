@@ -190,6 +190,48 @@ class RuleEngine:
             m = self._modules.get(self.active_rule_id)
             return bool(m and callable(getattr(m, "handle_redpacket", None)))
 
+    def handle_redpacket_batch(self, group_id: int | str,
+                                claims: list[dict], rate_permille: int = 20) -> dict | None:
+        """红包领完时的批量结算（玩法4 大吃小等复杂玩法用）。
+        玩法文件可定义 settle_redpacket(group_id, claims, rate_permille=20)，返回
+        {"events": [{qq, nickname, reply, delta}...], "announce": str} 或 None。
+        claims 元素: {qq, nickname, amount}（含红包领取明细，金额为元）。"""
+        with self._lock:
+            if self.active_rule_id is None:
+                return None
+            rid = self.active_rule_id
+            module = self._modules.get(rid)
+            path = self._paths.get(rid)
+            if module is None or path is None:
+                return None
+            mtime = self._file_mtime(path)
+            if mtime != self._mtimes.get(rid):
+                try:
+                    module = self._import_module(rid, path)
+                    self._modules[rid] = module
+                    self._mtimes[rid] = mtime
+                    self.last_error = ""
+                except Exception as e:  # noqa: BLE001
+                    self.last_error = f"玩法热重载失败（沿用旧版）: {e}"
+        fn = getattr(module, "settle_redpacket", None)
+        if not callable(fn):
+            return None
+        try:
+            import inspect as _inspect
+            params = _inspect.signature(fn).parameters
+            if len(params) >= 3:
+                raw = fn(int(group_id), list(claims or []), int(rate_permille or 20))
+            elif len(params) == 2:
+                raw = fn(int(group_id), list(claims or []))
+            else:
+                raw = fn(int(group_id), list(claims or []), int(rate_permille or 20))
+            if isinstance(raw, dict):
+                return raw
+            return None
+        except Exception as e:  # noqa: BLE001
+            self.last_error = f"玩法红包结算异常: {e.__class__.__name__}: {e}"
+            return None
+
     def handle_redpacket(self, group_id: int | str, qq: int | str, nickname: str,
                          amount: float) -> tuple[str | None, int]:
         """按激活玩法处理一条红包领取事件。返回 (回复文本|None, 积分变动)。

@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS executors (
     note VARCHAR(255) DEFAULT '', banned_at VARCHAR(19) DEFAULT '',
     ban_reason VARCHAR(255) DEFAULT '',
     last_heartbeat VARCHAR(19) DEFAULT '', last_ip VARCHAR(64) DEFAULT '',
+    game_fee_rate INT DEFAULT 20,
     created_at VARCHAR(19) DEFAULT '', updated_at VARCHAR(19) DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS play_rule_files (

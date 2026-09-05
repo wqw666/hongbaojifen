@@ -16,6 +16,7 @@ from .api_client import ApiError, PluginClient
 from .backend_tab import BackendTab
 from .config_manager import AppConfig, find_napcat_launcher, load_config, save_config
 from .play_tab import PlayTab
+from .approve_tab import ApprovalTab
 from .napcat_paths import find_napcat_dir, qrcode_png_path
 from .napcat_webui import NapCatWebUI
 from .plugin_deploy import deploy_plugin
@@ -189,6 +190,7 @@ class MainWindow(ctk.CTk):
         self.tab_groups = self.tabs.add("群管理")
         self.tab_members = self.tabs.add("会员")
         self.tab_play = self.tabs.add("游戏玩法")
+        self.tab_approve = self.tabs.add("积分审批")
         self.tab_monitor = self.tabs.add("实时监控")
         self.tab_backend = self.tabs.add("总后台对接")
         self.tab_more = self.tabs.add("更多")
@@ -217,6 +219,7 @@ class MainWindow(ctk.CTk):
         self._build_groups_tab()
         self._build_members_tab()
         self._build_play_tab()
+        self._build_approve_tab()
         self._build_monitor_tab()
         self._build_backend_tab()
         self._build_more_tab()
@@ -657,6 +660,7 @@ class MainWindow(ctk.CTk):
         ctk.CTkButton(row, text="上报群信息", width=92, command=self._groups_report).pack(side="left", padx=4)
         ctk.CTkButton(row, text="删除", width=64, fg_color="#c0392b", hover_color="#a93226",
                       command=self._groups_delete).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="导入我的群", width=92, command=self._groups_import).pack(side="left", padx=4)
         self.lbl_groups_info = ctk.CTkLabel(row, text="", text_color="gray")
         self.lbl_groups_info.pack(side="left", padx=10)
 
@@ -783,6 +787,41 @@ class MainWindow(ctk.CTk):
         threading.Thread(target=lambda: self.client.sync_plugin_config(), daemon=True).start()
         self.lbl_groups_info.configure(text=f"已删除 {len(sels)} 个群（监控与玩法勾选已同步移除）",
                                        text_color="#2ecc71")
+
+    def _groups_import(self) -> None:
+        """一键导入当前登录 QQ 的全部群（免输群号，选中后即可开启监控）。"""
+        if not hasattr(self, "tree_groups"):
+            return
+
+        def work():
+            try:
+                groups = self.client.get_group_list()
+            except Exception as e:
+                self.after(0, lambda e=e: self.lbl_groups_info.configure(
+                    text=f"拉取群列表失败: {e}", text_color="#e74c3c"))
+                return
+            known = {str(r.get("group_id")) for r in self._groups_rows}
+            hidden = set(self._hidden_groups())
+            added = 0
+            for g in groups:
+                gid = str(g.get("group_id") or "")
+                if not gid or gid in known or gid in hidden:
+                    continue
+                self._groups_rows.append({
+                    "group_id": gid,
+                    "group_name": g.get("group_name") or "",
+                    "member_count": g.get("member_count") or "",
+                    "create_time": "",
+                    "status": "",
+                })
+                added += 1
+            self.after(0, lambda: self._groups_fill(self._groups_rows))
+            self.after(0, lambda a=added: self.lbl_groups_info.configure(
+                text=f"已导入 {a} 个新群（登录 QQ 的全部群，共 {len(groups)} 个），选中后点「开启监控」",
+                text_color="#2ecc71"))
+            self.after(0, self._members_refresh_groups)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _groups_add(self) -> None:
         gid = self.entry_add_group.get().strip().replace("，", ",")
@@ -952,6 +991,23 @@ class MainWindow(ctk.CTk):
         self.lbl_members_tab_info = ctk.CTkLabel(row, text="", text_color="gray")
         self.lbl_members_tab_info.pack(side="left", padx=10)
 
+        row2 = ctk.CTkFrame(f, fg_color="transparent")
+        row2.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 2))
+        self.entry_manual_points = ctk.CTkEntry(row2, width=90, placeholder_text="金额")
+        self.entry_manual_points.pack(side="left")
+        ctk.CTkButton(row2, text="上分", width=70, fg_color="#27ae60", hover_color="#1e8449",
+                      command=lambda: self._members_manual("up")).pack(side="left", padx=4)
+        ctk.CTkButton(row2, text="下分", width=70, fg_color="#c0392b", hover_color="#a93226",
+                      command=lambda: self._members_manual("down")).pack(side="left", padx=4)
+        ctk.CTkLabel(row2, text="选中会员后操作，积分自动同步到总后台",
+                     text_color="gray", font=ctk.CTkFont(size=11)).pack(side="left", padx=8)
+        self.entry_ban_minutes = ctk.CTkEntry(row2, width=70, placeholder_text="禁言分钟")
+        self.entry_ban_minutes.insert(0, "10")
+        self.entry_ban_minutes.pack(side="left", padx=(12, 0))
+        ctk.CTkButton(row2, text="禁言", width=64, command=self._members_ban).pack(side="left", padx=4)
+        ctk.CTkButton(row2, text="踢出群聊", width=84, fg_color="#c0392b", hover_color="#a93226",
+                      command=self._members_kick).pack(side="left", padx=4)
+
         frame = tk.Frame(f, highlightthickness=1, highlightbackground="#CBD5E1")
         frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         cols = ("uin", "name", "role", "points")
@@ -1049,6 +1105,113 @@ class MainWindow(ctk.CTk):
             title += "（未配置总后台，不显示积分）"
         self.lbl_members_tab_info.configure(text=title, text_color="#2ecc71")
 
+    def _members_selected_qqs(self) -> list[str]:
+        """会员表格选中的 QQ 列表。"""
+        if not hasattr(self, "tree_members_tab"):
+            return []
+        return [str(self.tree_members_tab.item(i, "values")[0])
+                for i in self.tree_members_tab.selection()]
+
+    def _members_kick(self) -> None:
+        """踢出群聊（登录 QQ 须为群主/管理员；操作前确认）。"""
+        gid = self._members_group()
+        qqs = self._members_selected_qqs()
+        if not gid or not qqs:
+            self.lbl_members_tab_info.configure(text="请先选择群并选中成员", text_color="#e67e22")
+            return
+        if not messagebox.askyesno("确认踢出", f"确定把选中的 {len(qqs)} 个成员踢出群 {gid}？"):
+            return
+        self.lbl_members_tab_info.configure(text=f"正在踢出 {len(qqs)} 个成员…", text_color="#3498db")
+
+        def work():
+            ok = 0
+            for qq in qqs:
+                try:
+                    self.client.group_kick(gid, qq)
+                    ok += 1
+                except Exception as e:
+                    self.after(0, lambda q=qq, e=e: self._log_status(f"踢出 {q} 失败: {e}"))
+            self.after(0, lambda: self.lbl_members_tab_info.configure(
+                text=f"已踢出 {ok}/{len(qqs)} 个成员", text_color="#2ecc71"))
+            self.after(0, self._members_load)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _members_ban(self) -> None:
+        """禁言（分钟，默认 10；0=解除禁言）。"""
+        gid = self._members_group()
+        qqs = self._members_selected_qqs()
+        if not gid or not qqs:
+            self.lbl_members_tab_info.configure(text="请先选择群并选中成员", text_color="#e67e22")
+            return
+        try:
+            minutes = int(self.entry_ban_minutes.get().strip())
+            if minutes < 0:
+                raise ValueError
+        except ValueError:
+            self.lbl_members_tab_info.configure(text="禁言分钟需为非负整数", text_color="#e67e22")
+            return
+        if not messagebox.askyesno("确认禁言", f"确定禁言选中的 {len(qqs)} 个成员 {minutes} 分钟？"):
+            return
+        self.lbl_members_tab_info.configure(text=f"正在禁言 {len(qqs)} 个成员 {minutes} 分钟…",
+                                            text_color="#3498db")
+
+        def work():
+            ok = 0
+            for qq in qqs:
+                try:
+                    self.client.group_ban(gid, qq, minutes * 60)
+                    ok += 1
+                except Exception as e:
+                    self.after(0, lambda q=qq, e=e: self._log_status(f"禁言 {q} 失败: {e}"))
+            self.after(0, lambda: self.lbl_members_tab_info.configure(
+                text=f"已禁言 {ok}/{len(qqs)} 个成员（{minutes} 分钟）", text_color="#2ecc71"))
+            self.after(0, self._members_load)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _members_manual(self, action: str) -> None:
+        """会员页手动上分/下分 → 同步总后台（可多选会员）。"""
+        if not hasattr(self, "tree_members_tab"):
+            return
+        sels = self.tree_members_tab.selection()
+        if not sels:
+            self.lbl_members_tab_info.configure(text="请先在表格里选中会员（可多选）", text_color="#e67e22")
+            return
+        try:
+            amount = int(self.entry_manual_points.get().strip())
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            self.lbl_members_tab_info.configure(text="请填写正整数的金额", text_color="#e67e22")
+            return
+        client = self._backend_client()
+        if not client:
+            self.lbl_members_tab_info.configure(text="未配置总后台（「总后台对接」页填写后即可操作）", text_color="#e67e22")
+            return
+        qqs = [str(self.tree_members_tab.item(i, "values")[0]) for i in sels]
+        label = "上分" if action == "up" else "下分"
+        self.lbl_members_tab_info.configure(text=f"正在{label} {len(qqs)} 个会员 {amount} 积分…", text_color="#3498db")
+
+        def work():
+            ok = 0
+            for qq in qqs:
+                try:
+                    fn = client.up_points if action == "up" else client.down_points
+                    fn(qq, amount, reason=f"agent会员页手动{label}")
+                    ok += 1
+                except (ExecutorBanned, OperatorDisabled) as e:
+                    self.after(0, lambda e=e: self.lbl_members_tab_info.configure(
+                        text=f"操作停摆：{e}", text_color="#e74c3c"))
+                    return
+                except BackendError as e:
+                    self.after(0, lambda q=qq, e=e: self._log_status(f"会员 {q} {label}失败: {e}"))
+            self.after(0, lambda: self.lbl_members_tab_info.configure(
+                text=f"已{label} {ok}/{len(qqs)} 个会员各 {amount} 积分", text_color="#2ecc71"))
+            self.after(0, self._members_load)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _members_sync_all(self) -> None:
         gid = self._members_group()
         if not gid:
@@ -1082,6 +1245,14 @@ class MainWindow(ctk.CTk):
 
         threading.Thread(target=work, daemon=True).start()
 
+
+    def _build_approve_tab(self) -> None:
+        """积分审批：群内上分/下分申请 → 审批 → 同步总后台。"""
+        self.approve_tab = ApprovalTab(
+            self.tab_approve, cfg=self.cfg, client_factory=self._backend_client)
+        self.approve_tab.pack(fill="both", expand=True)
+        # 玩法回调服务把 /play/approve 事件转给审批页
+        self.play_tab.on_approve = self.approve_tab.push
 
     def _build_monitor_tab(self) -> None:
         f = self.tab_monitor
@@ -1911,6 +2082,12 @@ class MainWindow(ctk.CTk):
         try:
             if getattr(self, "play_tab", None):
                 self.play_tab.shutdown()
+        except Exception:
+            pass
+        # 停掉审批 worker
+        try:
+            if getattr(self, "approve_tab", None):
+                self.approve_tab.shutdown()
         except Exception:
             pass
         self.destroy()

@@ -52,7 +52,6 @@ export async function handlePlayMessage(ctx: NapCatPluginContext, event: any): P
   // 只转发别人发的群消息；message_sent（自己发）不转发，防回环
   if (event?.post_type !== 'message') return false;
   if (event?.message_type !== 'group') return false;
-  if (!config.playEnabled) return false;
 
   const groupId = String(event?.group_id ?? '');
   const qq = String(event?.user_id ?? event?.userId ?? '');
@@ -62,7 +61,11 @@ export async function handlePlayMessage(ctx: NapCatPluginContext, event: any): P
 
   const text = extractPlainText(event);
   if (!text) return false;
-  if (config.playGroups.length && !config.playGroups.includes(groupId)) return false;
+  // 放行条件：玩法开启且群在玩法名单；或群在监控名单（基础玩法常驻：上分/下分/无效指令/局外下注提示）
+  const playOk = config.playEnabled
+    && (!config.playGroups.length || config.playGroups.includes(groupId));
+  const watchOk = (config.watchGroups || []).includes(groupId);
+  if (!playOk && !watchOk) return false;
 
   const url = config.playCallback || PLAY_CALLBACK_DEFAULT;
   const nickname = String(event?.sender?.nickname ?? event?.nickname ?? '');
@@ -76,6 +79,41 @@ export async function handlePlayMessage(ctx: NapCatPluginContext, event: any): P
   } catch {
     /* agent 未监听/玩法未启用：丢弃即可 */
   }
+  return true;
+}
+
+/** 上分/下分申请：独立于玩法总开关，总是转发到 agent 审批页（/play/approve）。 */
+export function handleApproveMessage(ctx: NapCatPluginContext, event: any): boolean {
+  if (event?.post_type !== 'message') return false;
+  if (event?.message_type !== 'group') return false;
+  const groupId = String(event?.group_id ?? '');
+  const qq = String(event?.user_id ?? event?.userId ?? '');
+  if (!groupId || !qq) return false;
+  if (qq === String(event?.self_id ?? '')) return false;
+  const text = extractPlainText(event);
+  const m = /^(上分|下分)\s*(\d+)$/.exec(text);
+  if (!m) return false;
+  // 群过滤：玩法群优先，否则监控群，都没有则全部
+  const allow = config.playGroups.length ? config.playGroups : (config.watchGroups || []);
+  if (allow.length && !allow.includes(groupId)) return false;
+  const base = config.playCallback || PLAY_CALLBACK_DEFAULT;
+  let url: string;
+  try {
+    url = new URL('approve', base).toString();
+  } catch {
+    return false;
+  }
+  fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      kind: 'approve', group_id: groupId, qq,
+      nickname: String(event?.sender?.nickname ?? event?.nickname ?? ''),
+      action: m[1] === '上分' ? 'up' : 'down',
+      amount: Number(m[2]),
+    }),
+    signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
+  }).catch(() => {});
   return true;
 }
 
@@ -129,13 +167,16 @@ export function registerPlayRoutes(ctx: NapCatPluginContext) {
   // agent 玩法引擎回填回复：send_group_msg，自动 @ at_qq
   router.postNoAuth('/play/reply', async (req: any, res: any) => {
     try {
-      if (!config.playEnabled) return fail(res, '玩法已停用');
       const body = req.body || {};
       const groupId = String(body.group_id ?? '');
       const text = String(body.text ?? '').trim();
       if (!groupId || !text) return fail(res, '缺少 group_id/text');
-      if (config.playGroups.length && !config.playGroups.includes(groupId)) {
-        return fail(res, '群不在玩法名单');
+      // 放行：玩法开启且群在玩法名单；或群在监控名单（基础玩法回复）
+      const playOk = config.playEnabled
+        && (!config.playGroups.length || config.playGroups.includes(groupId));
+      const watchOk = (config.watchGroups || []).includes(groupId);
+      if (!playOk && !watchOk) {
+        return fail(res, '群不在玩法/监控名单');
       }
       const atQq =
         body.at_qq !== undefined && body.at_qq !== null && String(body.at_qq) !== ''

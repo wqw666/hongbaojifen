@@ -1482,6 +1482,70 @@ export function registerRoutes(ctx: NapCatPluginContext) {
     );
   });
 
+  /** 当前登录 QQ 的全部群列表（群管理一键导入用） */
+  router.getNoAuth('/groups', async (_req: any, res: any) => {
+    try {
+      const raw = await ctx.actions.call(
+        'get_group_list',
+        {},
+        ctx.adapterName,
+        ctx.pluginManager.config
+      );
+      const list = unwrapActionList(raw);
+      ok(res, {
+        groups: list
+          .map((g: any) => ({
+            group_id: String(g.group_id ?? g.groupId ?? ''),
+            group_name: String(g.group_name ?? g.groupName ?? ''),
+            member_count: Number(g.member_count ?? g.memberCount ?? 0),
+            max_member_count: Number(g.max_member_count ?? g.maxMemberCount ?? 0),
+          }))
+          .filter((g: any) => g.group_id),
+      });
+    } catch (e) {
+      fail(res, String(e), -1, 500);
+    }
+  });
+
+  /** 群管理：踢出群聊 */
+  router.postNoAuth('/group/kick', async (req: any, res: any) => {
+    try {
+      const body = req.body || {};
+      const groupId = String(body.group_id ?? '');
+      const userId = String(body.user_id ?? '');
+      if (!groupId || !userId) return fail(res, '缺少 group_id/user_id');
+      await ctx.actions.call(
+        'set_group_kick',
+        { group_id: groupId, user_id: userId, reject_add_request: false },
+        ctx.adapterName,
+        ctx.pluginManager.config
+      );
+      ok(res, { kicked: true, group_id: groupId, user_id: userId });
+    } catch (e) {
+      fail(res, String(e), -1, 500);
+    }
+  });
+
+  /** 群管理：禁言（duration 秒） */
+  router.postNoAuth('/group/ban', async (req: any, res: any) => {
+    try {
+      const body = req.body || {};
+      const groupId = String(body.group_id ?? '');
+      const userId = String(body.user_id ?? '');
+      const duration = Math.max(0, Number(body.duration ?? 600));
+      if (!groupId || !userId) return fail(res, '缺少 group_id/user_id');
+      await ctx.actions.call(
+        'set_group_ban',
+        { group_id: groupId, user_id: userId, duration },
+        ctx.adapterName,
+        ctx.pluginManager.config
+      );
+      ok(res, { banned: true, group_id: groupId, user_id: userId, duration });
+    } catch (e) {
+      fail(res, String(e), -1, 500);
+    }
+  });
+
   /** 核查群：群资料 + 成员名单 */
   router.getNoAuth('/members', async (req: any, res: any) => {
     try {

@@ -3,7 +3,7 @@ import { config, initStore, saveConfig } from './store.js';
 import { onGrabRedBagNotify, onRawRedPacketMessage, onRedPacketMessage, registerRoutes } from './api.js';
 import { attachGrabRedBagListener, attachKernelMsgListener, hookPullDetailForDebug, setPullDetailCaptureDir } from './redpacket.js';
 import { sweepRedPacketPlay } from './api.js';
-import { handlePlayMessage, registerPlayRoutes } from './play.js';
+import { handleApproveMessage, handlePlayMessage, registerPlayRoutes } from './play.js';
 
 let detachKernel: (() => void) | null = null;
 let detachGrab: (() => void) | null = null;
@@ -40,6 +40,7 @@ export const plugin_onmessage: PluginModule['plugin_onmessage'] = async (ctx, ev
   try {
     await onRedPacketMessage(ctx, event);
     await handlePlayMessage(ctx, event);
+    handleApproveMessage(ctx, event);
   } catch (e) {
     ctx.logger?.error?.('[红包监控] 处理消息异常', e);
   }

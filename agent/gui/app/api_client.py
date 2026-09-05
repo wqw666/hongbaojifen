@@ -260,6 +260,20 @@ class PluginClient:
                 "已尝试写入空数据文件，请重启 NapCat 后生效。"
             )
 
+    def get_group_list(self) -> list[dict]:
+        """当前登录 QQ 的全部群列表（元素含 group_id/group_name/member_count）。"""
+        data = self._get("/groups")
+        return list(data.get("groups") or [])
+
+    def group_kick(self, group_id: str, user_id: str) -> dict:
+        """踢出群聊（登录 QQ 须是群主/管理员）。"""
+        return self._post("/group/kick", {"group_id": str(group_id), "user_id": str(user_id)})
+
+    def group_ban(self, group_id: str, user_id: str, duration: int = 600) -> dict:
+        """禁言（duration 秒；0=解除禁言）。"""
+        return self._post("/group/ban", {"group_id": str(group_id),
+                                         "user_id": str(user_id), "duration": int(duration)})
+
     def get_group_members(self, group_id: str, no_cache: bool = True) -> dict[str, Any]:
         try:
             data = self._get(

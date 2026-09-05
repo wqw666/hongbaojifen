@@ -51,7 +51,7 @@ public class ExecutorService {
         markStaleOffline();
         StringBuilder sql = new StringBuilder(
                 "SELECT e.id, e.name, e.token, e.status, e.version, e.host, e.admin_qq, e.last_ip, e.last_heartbeat,"
-                        + " e.banned_at, e.ban_reason, e.note, e.created_at, e.updated_at,"
+                        + " e.game_fee_rate, e.banned_at, e.ban_reason, e.note, e.created_at, e.updated_at,"
                         + " (SELECT q.nickname FROM qq_accounts q WHERE q.qq = e.admin_qq AND q.type = 'admin_qq') AS admin_nickname"
                         + " FROM executors e WHERE 1=1");
         List<Object> args = new java.util.ArrayList<>();
@@ -151,6 +151,13 @@ public class ExecutorService {
      */
     public Map<String, Object> heartbeat(String token, String host, String version,
                                          String adminQq, String adminNickname, String ip) {
+        return heartbeat(token, host, version, adminQq, adminNickname, ip, null);
+    }
+
+    /** 心跳（可携带 game_fee_rate 千分比更新游戏费率，20=2%；null=不更新） */
+    public Map<String, Object> heartbeat(String token, String host, String version,
+                                         String adminQq, String adminNickname, String ip,
+                                         Integer gameFeeRate) {
         Map<String, Object> exe = resolveByToken(token);
         String now = LocalDateTime.now().format(FMT);
         String admin = adminQq == null ? "" : adminQq.trim();
@@ -159,6 +166,10 @@ public class ExecutorService {
                         + " admin_qq=COALESCE(NULLIF(?,''), admin_qq), last_ip=?, last_heartbeat=?, updated_at=? WHERE id=?",
                 host == null ? "" : host, version == null ? "" : version, admin, ip == null ? "" : ip, now, now,
                 exe.get("id"));
+        if (gameFeeRate != null && gameFeeRate >= 0 && gameFeeRate <= 1000) {
+            jdbc.update("UPDATE executors SET game_fee_rate=?, updated_at=? WHERE id=?",
+                    gameFeeRate, now, exe.get("id"));
+        }
         if (!admin.isEmpty()) {
             upsertOperator(admin, adminNickname, ip == null ? "" : ip, host == null ? "" : host);
         }

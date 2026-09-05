@@ -48,6 +48,7 @@ class AppConfig:
     play_enabled: bool = False                   # 玩法运行开关
     play_callback_port: int = 6101               # agent 本地玩法回调端口（插件转发目标）
     game_round_seq: int = 0                      # 游戏局号计数器（开始本局递增，生成 hongbaojifen_XXXXXXXX）
+    game_fee_rate: int = 20                      # 游戏费率（千分比，20=2%）：修改即上报总后台执行器
     play_auto_register_members: bool = False     # 启用玩法后自动把游戏群成员注册为会员（幂等）
 
     def plays_dir(self) -> Path:

@@ -96,6 +96,10 @@ export default function ExecutorManager() {
     { title: '状态', dataIndex: 'status', width: 90, render: (_, row) => statusTag(row) },
     { title: '版本', dataIndex: 'version', width: 90, render: v => v || '—' },
     {
+      title: '游戏费率', dataIndex: 'game_fee_rate', width: 90,
+      render: v => <Text>{(v ?? 20) / 10}%</Text>,
+    },
+    {
       title: '管理员QQ', dataIndex: 'admin_qq', width: 120,
       render: (v, row) => v
         ? <Tooltip title={row.admin_nickname ? `昵称：${row.admin_nickname}` : ''}><Text>{v}</Text></Tooltip>

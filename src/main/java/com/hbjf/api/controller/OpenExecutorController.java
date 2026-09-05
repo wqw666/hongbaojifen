@@ -29,9 +29,16 @@ public class OpenExecutorController {
     @PostMapping("/heartbeat")
     public ResponseEntity<Map<String, Object>> heartbeat(@RequestBody Map<String, String> body,
                                                          HttpServletRequest request) {
+        Integer feeRate = null;
+        try {
+            String fr = body.get("game_fee_rate");
+            if (fr != null && !fr.trim().isEmpty()) feeRate = Integer.parseInt(fr.trim());
+        } catch (NumberFormatException ignored) {
+            // 非法费率忽略，不更新
+        }
         Map<String, Object> result = executorService.heartbeat(
                 body.get("token"), body.get("host"), body.get("version"),
-                body.get("admin_qq"), body.get("admin_nickname"), clientIp(request));
+                body.get("admin_qq"), body.get("admin_nickname"), clientIp(request), feeRate);
         return ResponseEntity.ok(MapBuilder.of("code", 0, "data", result));
     }
 

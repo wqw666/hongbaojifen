@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
 import time
 from datetime import datetime
@@ -69,6 +70,8 @@ class PlayTab(ctk.CTkScrollableFrame):
         self.session: RoundSession | None = None  # 启用玩法后存在；停止后清空
         self.rp_game: RedPacketGame | None = None  # 红包计分玩法（勾选开关后启用）
         self._admin_cache: dict[str, tuple[float, set[str]]] = {}
+        self._points_cache: dict[str, tuple[float, int]] = {}
+        self._base_cooldown: dict[str, float] = {}  # 无效指令按群冷却
         self._active_groups: set[str] = set()     # 已启用转发的游戏群
         self._msg_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
@@ -85,6 +88,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         self._last_settle: dict[str, dict] = {}     # gid -> {ok, error, time}
         self._payload_cache: dict[str, tuple[float, dict]] = {}  # 群成员 payload 30s 缓存
 
+        self.on_approve = None  # MainWindow 挂接审批页 push
         self._build_ui()
         self._start_callback_server()
         # GUI 启动时自动恢复上次启用的玩法
@@ -116,6 +120,17 @@ class PlayTab(ctk.CTkScrollableFrame):
         ctk.CTkButton(row, text="刷新玩法列表", width=120, command=self._refresh_rules).pack(side="left", padx=6)
         self.lbl_rules = ctk.CTkLabel(row, text="未连接", text_color="gray")
         self.lbl_rules.pack(side="left", padx=8)
+
+        fee_row = ctk.CTkFrame(card, fg_color="transparent")
+        fee_row.pack(fill="x", padx=10, pady=(2, 4))
+        ctk.CTkLabel(fee_row, text="游戏费率(‰)", width=96, anchor="w").pack(side="left")
+        self.entry_fee_rate = ctk.CTkEntry(fee_row, width=70)
+        self.entry_fee_rate.insert(0, str(int(getattr(self.cfg, "game_fee_rate", 20) or 20)))
+        self.entry_fee_rate.pack(side="left", padx=4)
+        self.entry_fee_rate.bind("<Return>", lambda _e: self._save_fee_rate())
+        ctk.CTkLabel(fee_row, text="（20=2%，红包玩法抽水比例；修改回车立即上报总后台）",
+                     text_color="gray", font=ctk.CTkFont(size=11)).pack(side="left", padx=6)
+        ctk.CTkButton(fee_row, text="保存费率", width=90, command=self._save_fee_rate).pack(side="left", padx=4)
 
         # ---- 游戏群勾选（多群，运行中可随时增删）----
         row = ctk.CTkFrame(card, fg_color="transparent")
@@ -174,7 +189,7 @@ class PlayTab(ctk.CTkScrollableFrame):
                 app = self.server.app  # type: ignore[attr-defined]
                 try:
                     path = self.path.rstrip("/")
-                    if path not in ("/play/msg", "/play/redpacket"):
+                    if path not in ("/play/msg", "/play/redpacket", "/play/approve"):
                         self.send_response(404)
                         self.end_headers()
                         return
@@ -183,6 +198,8 @@ class PlayTab(ctk.CTkScrollableFrame):
                     data = json.loads(raw.decode("utf-8", errors="replace") or "{}")
                     if path == "/play/redpacket":
                         app._on_callback_redpacket(data)
+                    elif path == "/play/approve":
+                        app._on_callback_approve(data)
                     else:
                         app._on_callback_message(data)
                     self.send_response(200)
@@ -223,6 +240,15 @@ class PlayTab(ctk.CTkScrollableFrame):
             return
         self._msg_queue.put({"group_id": group_id, "qq": qq,
                              "nickname": str(data.get("nickname") or ""), "text": text})
+
+    def _on_callback_approve(self, data: dict) -> None:
+        """HTTP 线程：上分/下分申请 → 审批页（on_approve 由 MainWindow 挂接）。"""
+        handler = getattr(self, "on_approve", None)
+        if callable(handler):
+            try:
+                handler(data)
+            except Exception:
+                pass
 
     def _on_callback_redpacket(self, data: dict) -> None:
         """HTTP 线程：红包领取事件入队（红包计分玩法）。"""
@@ -375,12 +401,47 @@ class PlayTab(ctk.CTkScrollableFrame):
                 self._log(f"✗ 群{gid} 结束本局结算失败（事件保留可重试）: {e}")
         self._rounds_refresh()
 
+    # ================= 基础玩法（监控群常驻） =================
+
+    def _base_approve_confirm(self, text: str) -> str:
+        """上分/下分申请确认语（局内玩法未处理时的兜底）。"""
+        m = re.match(r"^(上分|下分)\s*(\d+)$", (text or "").strip())
+        if m:
+            return f"{m.group(1)}{m.group(2)}申请已提交，等待管理员审批"
+        return ""
+
+    def _base_play_reply(self, gid: str, text: str) -> str:
+        """局外基础玩法：上分/下分确认、下注提示、无效指令（冷却防刷屏）。"""
+        t = (text or "").strip()
+        m = re.match(r"^(上分|下分)\s*(\d+)$", t)
+        if m:
+            return f"{m.group(1)}{m.group(2)}申请已提交，等待管理员审批"
+        if re.match(r"^(压|下注|投注|押)\s*\d+", t):
+            return "不在游戏局内，无法下注（请等管理员发「开始游戏」）"
+        now = time.time()
+        if now - self._base_cooldown.get(gid, 0.0) >= 10:
+            self._base_cooldown[gid] = now
+            return "无效指令（可发「上分100/下分100」，开局后发「下注N」参与游戏）"
+        return ""
+
+    def _send_base_reply(self, gid: str, qq: str, text: str) -> None:
+        """基础玩法回复（监控群放行，无需玩法开关）。"""
+        try:
+            r = requests.post(self.cfg.plugin_api("play/reply"),
+                              json={"group_id": gid, "at_qq": qq, "text": text}, timeout=5)
+            if not r.ok:
+                self.after(0, self._log, f"✗ 基础玩法回复失败 HTTP {r.status_code}")
+        except requests.RequestException as e:
+            self.after(0, self._log, f"✗ 基础玩法回复失败: {e}")
+
     def _handle_redpacket(self, payload: dict) -> None:
         """红包领取事件 → 红包计分玩法（worker 线程）。"""
         game = self.rp_game
         if game is None or not self.engine.is_active():
             _flog(f"忽略红包事件（玩法未启用或无红包协议）group={payload.get('group_id')}")
             return
+        # 把当前游戏费率带给玩法（批量结算抽水用）
+        payload["rate_permille"] = int(getattr(self.cfg, "game_fee_rate", 20) or 20)
         gid = str(payload.get("group_id") or "")
         if gid not in self._active_groups:
             _flog(f"忽略红包事件（群不在玩法名单）group={gid} active={sorted(self._active_groups)}")
@@ -397,6 +458,10 @@ class PlayTab(ctk.CTkScrollableFrame):
             self._mark_banned(e)
         except Exception as e:  # noqa: BLE001 — 单包事件异常不影响后续
             self.after(0, self._log, f"✗ 红包计分处理异常: {e}")
+
+    def _rp_rule_handler_batch(self, gid: str, claims: list[dict], rate: int) -> dict | None:
+        """红包领完时的批量结算（玩法 settle_redpacket 协议，带费率）。"""
+        return self.engine.handle_redpacket_batch(gid, claims, rate)
 
     def _rp_send_reply(self, gid: str, qq: str, text: str) -> None:
         """@领取人 回复（红包计分即时反馈）。"""
@@ -430,6 +495,34 @@ class PlayTab(ctk.CTkScrollableFrame):
                    + (f" ｜ 注意: {warn}" if warn else "")
                    + ("（重复上报，未重复入账）" if res.get("duplicate") else ""))
 
+    def _query_points(self, qq: str) -> int:
+        """查某成员当前积分（30s 缓存；查不到返回 0）。"""
+        now = time.time()
+        hit = self._points_cache.get(str(qq))
+        if hit and now - hit[0] < 30:
+            return hit[1]
+        pts = 0
+        client = self._backend_client_safe()
+        if client:
+            try:
+                rows = client.query_points_batch([str(qq)])
+                if rows and rows[0].get("exists"):
+                    pts = int(rows[0].get("points") or 0)
+            except Exception:
+                pts = 0
+        self._points_cache[str(qq)] = (now, pts)
+        return pts
+
+    def _backend_client_safe(self):
+        """总后台客户端（未配置返回 None）。"""
+        try:
+            if not (self.cfg.backend_base and self.cfg.backend_api_key):
+                return None
+            return HbjfClient(self.cfg.backend_base, self.cfg.backend_api_key,
+                              token=self.cfg.executor_token)
+        except Exception:
+            return None
+
     def _rp_admin_qqs(self, gid: str) -> set[str]:
         """群主+管理员 QQ 集合（600s 缓存；随 _fetch_payload 30s 缓存兜底）。"""
         now = time.time()
@@ -452,6 +545,7 @@ class PlayTab(ctk.CTkScrollableFrame):
             self.rp_game = RedPacketGame(
                 play_name=rule_name, play_id=rule_id,
                 rule_handler=lambda g, q, n, a: self.engine.handle_redpacket(g, q, n, a),
+                rule_handler_batch=self._rp_rule_handler_batch,
                 send_reply=self._rp_send_reply,
                 send_announce=self._rp_send_announce,
                 settle=self._rp_settle,
@@ -467,12 +561,34 @@ class PlayTab(ctk.CTkScrollableFrame):
         text = item["text"]
         who = f"{nickname}({qq})" if nickname else f"QQ{qq}"
 
-        # 停摆/未启用或该群不在启用列表 → 直接忽略（引擎已 deactivate 时 handle 恒 None）
-        if not self.engine.is_active() or group_id not in self._active_groups:
+        # 不在游戏局内 → 基础玩法兜底（监控群常驻）：
+        # 上分/下分申请确认、局外下注提示、无法识别回复「无效指令」
+        if not (self.engine.is_active() and group_id in self._active_groups):
+            base_reply = self._base_play_reply(group_id, text)
+            if base_reply:
+                self._send_base_reply(group_id, qq, base_reply)
+                self.after(0, self._log, f"基础玩法 群{group_id} {who}: {text[:40]}")
             return
 
+        # 「开始游戏」只认群主/管理员（普通成员发的不进玩法）
+        t_strip = (text or "").strip()
+        if t_strip in ("开始游戏", "开局"):
+            admins = self._rp_admin_qqs(group_id)
+            if admins and qq not in admins:
+                self.after(0, self._log, f"⚠ 群{group_id} {nickname or qq} 发「开始游戏」被忽略（非管理员）")
+                return
         reply = self.engine.handle_message(group_id, qq, nickname, text)
         delta = self.engine.last_delta if hasattr(self.engine, "last_delta") else 0
+        # 局内玩法未处理的上分/下分 → 基础玩法确认回复（申请照常进审批页）
+        if not reply:
+            confirm = self._base_approve_confirm(text)
+            if confirm:
+                self._send_base_reply(group_id, qq, confirm)
+                self.after(0, self._log, f"基础玩法 群{group_id} {who}: 申请确认")
+                return
+        # 余额占位符替换：玩法返回「剩余积分{balance}」时查总后台积分填充
+        if reply and "{balance}" in reply:
+            reply = reply.replace("{balance}", str(self._query_points(qq)))
         # 本局模式：把群内聊天过程记入回放（不计分）
         if self.rp_game is not None:
             self.rp_game.record_chat(group_id, qq, nickname, text)
@@ -608,6 +724,31 @@ class PlayTab(ctk.CTkScrollableFrame):
             self._log(f"已退出游戏群 {gid}")
         self._apply_state()
         self._rounds_refresh()
+
+    def _save_fee_rate(self) -> None:
+        """保存游戏费率（千分比）并立即上报总后台执行器。"""
+        try:
+            v = int(self.entry_fee_rate.get().strip())
+            if not 0 <= v <= 1000:
+                raise ValueError
+        except ValueError:
+            self._log("✗ 费率需为 0~1000 的整数（千分比，20=2%）")
+            return
+        self.cfg.game_fee_rate = v
+        self.save_config(self.cfg)
+        self._log(f"游戏费率已保存：{v / 10}%")
+
+        def work():
+            try:
+                r = self._client().heartbeat(game_fee_rate=v)
+                self.after(0, self._log,
+                           f"✓ 游戏费率 {v / 10}% 已上报总后台（执行器 {r.get('name')}）")
+            except BackendError as e:
+                self.after(0, self._log, f"✗ 费率上报失败: {e}")
+            except Exception as e:  # noqa: BLE001 — 未配置总后台等
+                self.after(0, self._log, f"✗ 费率上报失败: {e}")
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _refresh_rules(self) -> None:
         self.after(0, self._set_busy, True)

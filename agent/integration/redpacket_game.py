@@ -39,6 +39,7 @@ class RedPacketGame:
         play_name: str = "红包玩法",
         play_id: int | str = 0,
         rule_handler: Callable[[str, str, str, float], tuple[str | None, int]] | None = None,
+        rule_handler_batch: Callable[[str, list[dict], int], dict | None] | None = None,
         send_reply: Callable[[str, str, str], None] | None = None,
         send_announce: Callable[[str, str], None] | None = None,
         settle: Callable[[str, str, list[dict]], None] | None = None,
@@ -48,6 +49,7 @@ class RedPacketGame:
         self.play_name = play_name
         self.play_id = play_id
         self.rule_handler = rule_handler          # (group_id, qq, nickname, amount) -> (reply|None, delta)
+        self.rule_handler_batch = rule_handler_batch  # (group_id, claims, rate) -> {events, announce}|None
         self.send_reply = send_reply              # (group_id, at_qq, text)
         self.send_announce = send_announce        # (group_id, text)
         self.settle = settle                      # (round_id, group_id, events) 失败抛异常
@@ -136,8 +138,9 @@ class RedPacketGame:
                     except Exception:
                         pass
                 self._log(f"[红包玩法] 群{gid} {name}({qq}) 领取{amount:.2f}元 计分 +{int(delta or 0)}（本局 {ann['round_id']}）")
-            # 红包领完 → 3 秒后自动结束本局（统计+上报+总结语；期间允许补推合并）
+            # 红包领完：先跑玩法批量结算（大吃小等），再 3 秒后自动结束本局
             if total_num and recv_num and recv_num >= total_num:
+                self._apply_batch_settle(gid, ann, payload)
                 ann["auto_end_at"] = time.time() + 3
                 self._log(f"[红包玩法] 群{gid} 红包已领完（{recv_num}/{total_num}），3 秒后自动结束本局")
             return
@@ -307,7 +310,16 @@ class RedPacketGame:
     def _announce_round_summary(self, ann: dict) -> None:
         """@全体 总结语：领取人逐行 + 统计。"""
         claims = list(ann["claims"].values())
-        if not self.send_announce or not claims:
+        if not self.send_announce:
+            return
+        # 玩法自定义播报文本（大吃小等）优先
+        if ann.get("announce_text"):
+            try:
+                self.send_announce(ann["group_id"], str(ann["announce_text"]))
+            except Exception:
+                pass
+            return
+        if not claims:
             return
         lines = [f"{c['name']} 领取{c['amount']:.2f}元，获得{c['delta']}积分" for c in claims]
         total = sum(c["delta"] for c in claims)
@@ -317,6 +329,41 @@ class RedPacketGame:
             self.send_announce(ann["group_id"], text)
         except Exception:
             pass
+
+    def _apply_batch_settle(self, gid: str, ann: dict, payload: dict) -> None:
+        """调用玩法 settle_redpacket 批量结算：应用多玩家事件 + 保存播报文本。"""
+        if not self.rule_handler_batch:
+            return
+        rate = int(payload.get("rate_permille") or 20)
+        try:
+            result = self.rule_handler_batch(gid, list(payload.get("claims") or []), rate)
+        except Exception as e:  # noqa: BLE001
+            self._log(f"[红包玩法] 批量结算异常: {e}")
+            return
+        if not isinstance(result, dict):
+            return
+        if result.get("announce"):
+            ann["announce_text"] = str(result["announce"])
+        for ev in result.get("events") or []:
+            qq = str(ev.get("qq") or "")
+            if not qq or qq == self.self_uin or qq == "announce":
+                continue
+            delta = int(ev.get("delta") or 0)
+            reply_text = str(ev.get("reply") or "")
+            nickname = str(ev.get("nickname") or "")
+            if len(ann["events"]) < 2000:
+                ann["events"].append({
+                    "qq": qq, "nickname": nickname,
+                    "msg": "玩法结算",
+                    "reply": reply_text,
+                    "delta": delta, "ts": _now_full(),
+                })
+            if reply_text and self.send_reply:
+                try:
+                    self.send_reply(gid, qq, reply_text)
+                except Exception:
+                    pass
+            self._log(f"[红包玩法] 群{gid} 结算 {nickname or qq}({qq}) delta {delta:+d}")
 
     def _claim_ts(self, c: dict) -> str:
         """领取时间 → 'MM-dd HH:mm:ss'（回放用；缺省取当前时间）。"""
