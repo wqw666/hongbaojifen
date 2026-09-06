@@ -26,40 +26,44 @@ from .query_export import write_query_csv
 from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
 from integration.member_sync import group_create_time_str, run_member_sync
 
-APP_VERSION = "2026.09.07-01"
+APP_VERSION = "2026.09.07-03"
 
 HELP_TEXT = """【开箱步骤】
 1. 双击「agent.exe」，软件自动启动 QQ 环境（约半分钟）
 2. 用手机 QQ 扫描二维码登录
-3. 登录成功后自动进入主界面
-
-【群管理】
-• 「群管理」页：点「＋ 添加群」输入群号；选中群后可开启/关闭监控、同步会员
-• 「会员」页：选择群 → 「全部同步」，把群成员登记为会员并拉取积分
-
-【游戏玩法（复合玩法：大吃小×撑庄）】
-• 打开软件后「游戏玩法」页自动激活「复合玩法」（唯一玩法），勾选参与的群即可开始
-• 每个游戏群独立开局：「当前群」选群 → 「开始本局」→ 群内 @全体 播报局号
-• 群成员直接发数字下注（如 100）；想坐庄的发「撑」即可撑庄（已下注的不能再撑）
-• 发「查 / 查分 / 查积分」可查自己的当前积分；发「上100/下100」可提交上分/下分申请等审批
-• 「停止下注」封盘 → 管理员发红包开奖（每份 0.01~0.99 元，份数不少于需开奖人数）
-• 成员领到红包即收到点数回执；红包份数不足会自动作废播报（积分未扣）
-• 「结算」按规则开奖并上报总后台：每人收到个人开奖回复 + @全体 结算汇总；「作废本局」= 作废不上报
-• 开奖表双击「抢到金额」可直接改值，点数即时重算；「更新玩法文件」从总后台拉取最新玩法热生效
+3. 登录成功自动进入主界面
 
 【总后台对接】
-• 填总后台地址 / 对接密钥 / 执行器 token → 「启动对接」（由管理员配置）
+• 总后台地址 / 对接密钥 / 执行器 token 由管理员配置
+• 填好后点「启动对接」，心跳自动开启并保持在线（无停止入口）
 
 【退出登录 / 换 QQ】
 • 主界面右上角「退出登录」：立即停止本机 QQ 与 NapCat 服务（QQ 退出登录、服务进程结束）
 • 需要再次登录时，回登录页点「启动 QQ 环境并扫码登录」重新拉起，扫码即可换号
 
 【注意】
-• 仅 QQ 钱包红包有效
-• 本软件不会关闭您已打开的 QQ；监控账号需在软件内单独扫码登录
+• 仅 QQ 钱包红包有效；本软件不会关闭您已打开的 QQ
+• 监控账号需在软件内单独扫码登录
 • 同一账号可同时管理多个群，无需多开窗口
 • 自动化有封号风险，请合规使用
 """
+
+# 免责声明：使用说明之后醒目展示（仅用于抢红包娱乐，禁止非法用途）
+DISCLAIMER_TEXT = """1. 本软件仅用于 QQ 群内「抢红包」娱乐与群友互动，严禁用于任何非法、违规或不道德用途。
+
+2. 严禁用于赌博、博彩、赌资结算、诈骗、洗钱、非法集资、传销、高利贷、恶意套现、网络黑灰产等一切违法活动；如发现相关用途，请立即停用并删除本软件。
+
+3. 严禁利用本软件批量注册、盗号、刷量、外挂、抢购等损害平台或他人权益的行为，严禁骚扰、恐吓、攻击他人。
+
+4. 使用者应自觉遵守《中华人民共和国民法典》《刑法》《治安管理处罚法》《反电信网络诈骗法》等法律法规，以及 QQ / 微信等平台的服务协议与平台规则；因违法、违规使用产生的一切后果（包括但不限于账号封禁、资金损失、行政处罚、刑事责任）均由使用者自行承担，软件作者与开发者不承担任何责任。
+
+5. 红包金额往来仅限群友日常小额娱乐互动，切勿与任何充值提现、资金托管、盈利承诺相结合。
+
+6. 本软件含自动化操作，存在账号风控（封号）风险，请审慎、合规使用；由此产生的账号异常由使用者自行负责。
+
+7. 任何因使用本软件而引发的争议，由使用者自行协商或通过法律途径解决。
+
+8. 无法接受以上条款者，请立即删除本软件；继续使用即视为已阅读并同意本声明全部内容。"""
 
 
 def _is_startup_noise(err: Exception | str) -> bool:
@@ -86,8 +90,8 @@ class MainWindow(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title(f"agent 执行器  v{APP_VERSION}")
-        self.geometry("980x680")
-        self.minsize(860, 600)
+        self.geometry("1140x760")
+        self.minsize(960, 640)
 
         self.cfg = load_config()
         self.client = PluginClient(self.cfg)
@@ -699,7 +703,6 @@ class MainWindow(ctk.CTk):
         grid.grid_columnconfigure(1, weight=1)
         fields: list[tuple[str, str, str]] = [
             ("服务地址", "napcat_base", "http://127.0.0.1:6099（勿改）"),
-            ("监听群号（逗号分隔）", "watch_groups", "留空=全部群"),
             ("服务插件目录", "napcat_plugins_dir", "留空则自动猜测"),
         ]
         self.setting_entries: dict[str, ctk.CTkEntry] = {}
@@ -750,15 +753,28 @@ class MainWindow(ctk.CTk):
         ctk.CTkButton(grid, text="保存设置", command=self.save_settings).grid(
             row=row + 5, column=1, sticky="w", padx=8, pady=12)
 
-        # ---- ③ 使用说明 ----
+        # ---- ③ 使用说明（整宽展示；去重后只留开箱/对接/退出/注意） ----
         card = ctk.CTkFrame(wrap)
         card.grid(row=2, column=0, sticky="ew", padx=4, pady=6)
+        card.grid_columnconfigure(0, weight=1)   # 文本框拉满卡宽（与窗口同宽）
         ctk.CTkLabel(card, text="使用说明", font=ctk.CTkFont(size=15, weight="bold")).grid(
             row=0, column=0, sticky="w", padx=10, pady=(8, 2))
-        text = ctk.CTkTextbox(card, height=320)
+        text = ctk.CTkTextbox(card, height=300, wrap="word", font=ctk.CTkFont(size=14))
         text.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
         text.insert("1.0", HELP_TEXT)
         text.configure(state="disabled")
+
+        # ---- ④ 免责声明（整宽大字醒目，禁止非法用途） ----
+        card = ctk.CTkFrame(wrap)
+        card.grid(row=3, column=0, sticky="ew", padx=4, pady=6)
+        card.grid_columnconfigure(0, weight=1)   # 文本框拉满卡宽（与窗口同宽）
+        ctk.CTkLabel(card, text="⚠ 免责声明", font=ctk.CTkFont(size=22, weight="bold"),
+                     text_color="#ff5252").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+        box = ctk.CTkTextbox(card, height=360, wrap="word", text_color="#ff5252",
+                             font=ctk.CTkFont(size=16, weight="bold"))
+        box.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+        box.insert("1.0", DISCLAIMER_TEXT)
+        box.configure(state="disabled")
 
     # ---------- 群管理（表格） ----------
 
