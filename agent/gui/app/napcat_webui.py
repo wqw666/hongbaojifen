@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from dataclasses import dataclass
 from typing import Any
 
 import requests
 
 from .napcat_paths import read_webui_token
+
+# WebUI 登录有频率限制（webui.json loginRate，默认 10 次/60 秒/IP），
+# 且 Credential 是服务端签发的全局票据、不绑定请求方。GUI 各线程/各处会新建
+# 多个 WebUI 实例，若按实例各自 auth，瞬时并发就会打满限额并把自己锁死。
+# 故 credential 用进程级缓存：全进程同一服务只 auth 一次，其余实例共享；
+# 失效（QQ 重启后旧票据 401）时清缓存重试一次。
+_CRED_CACHE: dict[str, str] = {}
+_CRED_LOCK = threading.Lock()
 
 
 @dataclass
@@ -26,37 +35,60 @@ class NapCatWebUI:
         self.token = token
         self.timeout = timeout
         self.session = requests.Session()
-        self._credential: str | None = None
 
     @classmethod
     def from_napcat_dir(cls, base_url: str, napcat_dir) -> "NapCatWebUI":
         return cls(base_url, read_webui_token(napcat_dir))
 
+    @staticmethod
+    def _clear_cred(base_url: str) -> None:
+        _CRED_CACHE.pop(base_url, None)
+
     def _ensure_auth(self) -> dict[str, str]:
-        if not self._credential:
-            h = hashlib.sha256((self.token + ".napcat").encode()).hexdigest()
-            r = self.session.post(
-                f"{self.base}/api/auth/login",
-                json={"hash": h},
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-            body = r.json()
-            cred = (body.get("data") or {}).get("Credential") or body.get("Credential")
+        cred = _CRED_CACHE.get(self.base)
+        if cred:
+            return {"Authorization": f"Bearer {cred}"}
+        with _CRED_LOCK:
+            cred = _CRED_CACHE.get(self.base)
             if not cred:
-                raise RuntimeError("WebUI 登录失败：未返回 Credential")
-            self._credential = cred
-        return {"Authorization": f"Bearer {self._credential}"}
+                h = hashlib.sha256((self.token + ".napcat").encode()).hexdigest()
+                r = self.session.post(
+                    f"{self.base}/api/auth/login",
+                    json={"hash": h},
+                    timeout=self.timeout,
+                )
+                r.raise_for_status()
+                body = r.json()
+                cred = (body.get("data") or {}).get("Credential") or body.get("Credential")
+                if not cred:
+                    raise RuntimeError("WebUI 登录失败：未返回 Credential")
+                _CRED_CACHE[self.base] = cred
+        return {"Authorization": f"Bearer {cred}"}
 
     def _post(self, path: str, body: dict | None = None) -> dict[str, Any]:
-        r = self.session.post(
-            f"{self.base}{path}",
-            json=body or {},
-            headers=self._ensure_auth(),
-            timeout=self.timeout,
-        )
-        r.raise_for_status()
-        return r.json()
+        headers = self._ensure_auth()
+        try:
+            r = self.session.post(
+                f"{self.base}{path}",
+                json=body or {},
+                headers=headers,
+                timeout=self.timeout,
+            )
+            if r.status_code == 401:  # 票据失效（如 QQ 重启后）：清缓存重试一次
+                self._clear_cred(self.base)
+                headers = self._ensure_auth()
+                r = self.session.post(
+                    f"{self.base}{path}",
+                    json=body or {},
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+            r.raise_for_status()
+            return r.json()
+        except requests.HTTPError:
+            raise
+        except Exception:
+            raise
 
     def ping(self) -> bool:
         try:
@@ -91,28 +123,6 @@ class NapCatWebUI:
 
     def get_login_info(self) -> dict[str, Any]:
         return self._post("/api/QQLogin/GetQQLoginInfo").get("data") or {}
-
-    def get_quick_login_list(self) -> list[str]:
-        for path in ("/api/QQLogin/GetQuickLoginList", "/api/QQLogin/GetQuickLoginListNew"):
-            try:
-                r = self.session.get(
-                    f"{self.base}{path}",
-                    headers=self._ensure_auth(),
-                    timeout=self.timeout,
-                )
-                if r.status_code != 200:
-                    continue
-                data = r.json().get("data")
-                if isinstance(data, list):
-                    return [str(x) for x in data]
-            except Exception:
-                continue
-        return []
-
-    def quick_login(self, uin: str) -> None:
-        body = self._post("/api/QQLogin/SetQuickLogin", {"uin": uin})
-        if body.get("code", 0) != 0:
-            raise RuntimeError(str(body.get("message") or "快速登录失败"))
 
     def reload_plugin(self, plugin_id: str) -> None:
         """禁用再启用插件，使磁盘上的新代码/数据生效。"""

@@ -2,7 +2,9 @@
 
 能力（对应 integration 包）：
 - 连接设置：总后台地址 / X-Api-Key / 执行器 token / 名称 / 心跳间隔
-- 测试连接、保存到 AppConfig；启动/停止 SyncWorker（心跳 + 远程命令执行回报）
+- 测试连接、保存到 AppConfig；SyncWorker（心跳 + 远程命令执行回报）**登录进主界面即自动开启**，
+  「停止」按钮已移除——心跳在 agent 存活期间不可关停（总后台靠心跳判定在线，见 README；
+  改连接/密钥/token 保存后自动重启对接生效；封禁/停用解封后点「启动对接」重连）
 - 会员群：选择群（总后台群列表 / 手动上报插件监控群）设为会员群，一键同步全部成员为会员
   群已被总后台封禁（status=banned）→ 拒设会员群/拒立即同步
 - 操作员QQ：通过本 agent 登录并连总后台的 QQ 均为操作员（普通QQ即群会员，走会员同步，总后台
@@ -110,10 +112,10 @@ class BackendTab(ctk.CTkScrollableFrame):
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=(2, 8))
         ctk.CTkButton(row, text="启动对接（心跳+远程命令）", width=220, command=self._start_worker).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(row, text="停止", width=80, command=self._stop_worker).pack(side="left")
         self.lbl_state = ctk.CTkLabel(row, text="未启动", text_color="gray")
         self.lbl_state.pack(side="left", padx=10)
-        ctk.CTkLabel(card, text="连接设置改动后需停止再启动才生效；心跳间隔保存后下个周期自动生效。",
+        ctk.CTkLabel(card, text="心跳随 agent 启动自动开启（无需手动操作，无停止入口）；"
+                              "改连接/密钥/token 保存后自动重启对接生效；心跳间隔保存后下个周期生效。",
                      text_color="gray", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10, pady=(0, 6))
 
         # ---- 会员群 ----
@@ -197,7 +199,7 @@ class BackendTab(ctk.CTkScrollableFrame):
                 self.after(0, lambda: self._set_hb(f"测试连接成功（心跳 {r.get('now', '')}）", "#2ecc71"))
                 self.after(0, lambda: self._log("测试连接成功"))
             except BackendError as e:
-                self.after(0, lambda: self._set_hb(str(e), "#e74c3c"))
+                self.after(0, lambda e=e: self._set_hb(str(e), "#e74c3c"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -218,12 +220,24 @@ class BackendTab(ctk.CTkScrollableFrame):
         return None
 
     def _save_settings(self) -> None:
+        old = (self.cfg.backend_base, self.cfg.backend_api_key, self.cfg.executor_token)
         err = self._apply_to_cfg()
         if err:
             self._log(f"保存失败：{err}")
             return
+        changed_conn = old != (self.cfg.backend_base, self.cfg.backend_api_key, self.cfg.executor_token)
         self.save_config(self.cfg)
-        self._log("设置已保存（连接/密钥/token 改动需重启对接生效）")
+        if changed_conn and self.worker and self.worker.is_alive():
+            # 心跳没有手动停止入口 → 连接参数变更时自动重启对接，避免新旧设置并存
+            self._log("连接设置已变更：自动重启对接使新设置生效")
+            self.worker.stop_worker()
+            self.worker = None
+            self._start_worker()
+            return
+        if changed_conn:
+            self._log("设置已保存（连接/密钥/token 已更新，点「启动对接」生效）")
+        else:
+            self._log("设置已保存")
 
     def _set_hb(self, text: str, color: str) -> None:
         self.lbl_hb.configure(text=text, text_color=color)
@@ -263,12 +277,28 @@ class BackendTab(ctk.CTkScrollableFrame):
             return 10
 
     def _stop_worker(self) -> None:
+        """停止对接线程（仅供关窗/自动重启内部调用，界面无「停止」入口）。"""
         if self.worker:
             self.worker.stop_worker()
             self.worker = None
         self.lbl_state.configure(text="已停止", text_color="gray")
         self._set_hb("心跳：未启动", "gray")
         self._log("对接线程已停止")
+
+    def auto_start(self) -> None:
+        """登录进主界面后由 MainWindow 调用：配置齐全即自动开启心跳与远程命令。
+
+        心跳没有停止入口，agent 存活期间持续上报 → 总后台在线状态与「agent 能调用
+        总后台」不再矛盾（停止心跳按钮已移除）。缺配置只提示一次，不重复打扰。"""
+        if self.worker and self.worker.is_alive():
+            return
+        if not (self.cfg.backend_base and self.cfg.backend_api_key and self.cfg.executor_token):
+            self.lbl_state.configure(text="未自动启动（缺连接/token 配置）", text_color="gray")
+            self._log("尚未配置完整的总后台连接与执行器 token——未自动开启心跳；"
+                      "在上方填写并保存后点「启动对接」")
+            return
+        self._start_worker()
+        self._log("agent 启动：已按保存的配置自动开启心跳与远程命令（总后台将实时显示在线）")
 
     def _on_worker_event(self, kind: str, payload) -> None:
         try:
@@ -330,7 +360,7 @@ class BackendTab(ctk.CTkScrollableFrame):
                           for g in rows]
                 self.after(0, lambda: self._fill_group_menu(labels))
             except BackendError as e:
-                self.after(0, lambda: self._log(f"刷新群列表失败：{e}"))
+                self.after(0, lambda e=e: self._log(f"刷新群列表失败：{e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -448,7 +478,7 @@ class BackendTab(ctk.CTkScrollableFrame):
             except (ExecutorBanned, OperatorDisabled) as e:
                 self.after(0, lambda e=e: self._mark_banned(e))
             except Exception as e:  # noqa: BLE001 — 插件/网络等一切失败都回显
-                self.after(0, lambda: (self.lbl_sync.configure(text=f"同步失败：{e}", text_color="#e74c3c"),
+                self.after(0, lambda e=e: (self.lbl_sync.configure(text=f"同步失败：{e}", text_color="#e74c3c"),
                                        self._log(f"同步失败：{e}")))
             finally:
                 self._syncing = False
@@ -474,7 +504,7 @@ class BackendTab(ctk.CTkScrollableFrame):
                 self.after(0, lambda: (self._fill_qqs(rows), self._log(
                     f"操作员QQ 列表已刷新：{len(rows)} 条")))
             except BackendError as e:
-                self.after(0, lambda: self._log(f"刷新操作员QQ 失败：{e}"))
+                self.after(0, lambda e=e: self._log(f"刷新操作员QQ 失败：{e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -528,7 +558,7 @@ class BackendTab(ctk.CTkScrollableFrame):
                     f"本机登录 QQ {r.get('qq')} 已登记为操作员（新增={r.get('created')}）"),
                     self._refresh_qqs()))
             except Exception as e:  # noqa: BLE001 — 找不到目录/未登录等都回显
-                self.after(0, lambda: self._log(f"上报本机登录QQ失败：{e}"))
+                self.after(0, lambda e=e: self._log(f"上报本机登录QQ失败：{e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -546,7 +576,7 @@ class BackendTab(ctk.CTkScrollableFrame):
                 self.after(0, lambda: (self._log(
                     f"操作员QQ {qq} 已登记（新增={r.get('created')}）"), self._refresh_qqs()))
             except BackendError as e:
-                self.after(0, lambda: self._log(f"新增操作员QQ失败：{e}"))
+                self.after(0, lambda e=e: self._log(f"新增操作员QQ失败：{e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -562,7 +592,7 @@ class BackendTab(ctk.CTkScrollableFrame):
                 client.delete_qq_account(qq)
                 self.after(0, lambda: (self._log(f"QQ {qq} 已删除"), self._refresh_qqs()))
             except BackendError as e:
-                self.after(0, lambda: self._log(f"删除 QQ 失败：{e}"))
+                self.after(0, lambda e=e: self._log(f"删除 QQ 失败：{e}"))
 
         threading.Thread(target=work, daemon=True).start()
 

@@ -45,10 +45,6 @@ def read_webui_token(napcat_dir: Path) -> str:
         return "c8e8f6cfa7b0"
 
 
-def qrcode_png_path(napcat_dir: Path) -> Path:
-    return napcat_dir / "cache" / "qrcode.png"
-
-
 def plugins_root(napcat_dir: Path) -> Path:
     return napcat_dir / "plugins"
 

@@ -72,6 +72,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         self._admin_cache: dict[str, tuple[float, set[str]]] = {}
         self._points_cache: dict[str, tuple[float, int]] = {}
         self._base_cooldown: dict[str, float] = {}  # 无效指令按群冷却
+        self._query_cooldown: dict[str, float] = {}  # 查分按 群:qq 冷却
         self._active_groups: set[str] = set()     # 已启用转发的游戏群
         self._msg_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
@@ -131,6 +132,17 @@ class PlayTab(ctk.CTkScrollableFrame):
         ctk.CTkLabel(fee_row, text="（20=2%，红包玩法抽水比例；修改回车立即上报总后台）",
                      text_color="gray", font=ctk.CTkFont(size=11)).pack(side="left", padx=6)
         ctk.CTkButton(fee_row, text="保存费率", width=90, command=self._save_fee_rate).pack(side="left", padx=4)
+
+        bet_row = ctk.CTkFrame(card, fg_color="transparent")
+        bet_row.pack(fill="x", padx=10, pady=(2, 6))
+        ctk.CTkLabel(bet_row, text="最小下注(积分)", width=96, anchor="w").pack(side="left")
+        self.entry_min_bet = ctk.CTkEntry(bet_row, width=70)
+        self.entry_min_bet.insert(0, str(int(getattr(self.cfg, "play_min_bet", 10) or 10)))
+        self.entry_min_bet.pack(side="left", padx=4)
+        self.entry_min_bet.bind("<Return>", lambda _e: self._save_min_bet())
+        ctk.CTkLabel(bet_row, text="（下注玩法「下注N」：低于此值或超过自己当前积分会被拒绝并提示）",
+                     text_color="gray", font=ctk.CTkFont(size=11)).pack(side="left", padx=6)
+        ctk.CTkButton(bet_row, text="保存", width=70, command=self._save_min_bet).pack(side="left", padx=4)
 
         # ---- 游戏群勾选（多群，运行中可随时增删）----
         row = ctk.CTkFrame(card, fg_color="transparent")
@@ -368,6 +380,9 @@ class PlayTab(ctk.CTkScrollableFrame):
             round_id = f"hongbaojifen_{seq:08d}"
             if self.rp_game is not None:
                 self.rp_game.start_round(gid, round_id, name)
+            # 开局通知玩法（可选 handle_round_start(group_id, round_id)）：
+            # 大吃小等玩法借此进入下注期，并拿到局号用于回复「本局 {局号}，累计下注名单」
+            self.engine.notify_round_start(gid, round_id)
             text = (f"游戏开始，游戏名称为{name}，"
                     f"游戏介绍为{intro or '无'}"
                     f"，游戏对局id为：{round_id}")
@@ -410,6 +425,22 @@ class PlayTab(ctk.CTkScrollableFrame):
             return f"{m.group(1)}{m.group(2)}申请已提交，等待管理员审批"
         return ""
 
+    def _query_points_reply(self, gid: str, qq: str, text: str) -> str:
+        """内置查分：用户发「查 / 查分 / 查积分」→ 回复其当前积分。
+
+        规则层之上的常驻能力：任何群状态（玩法启停/开局与否）都先于玩法处理，
+        不进玩法、不入对局。每人 3s 冷却防刷屏；总后台未配置时给可操作提示。"""
+        if (text or "").strip() not in ("查", "查分", "查积分"):
+            return ""
+        key = f"{gid}:{qq}"
+        now = time.time()
+        if now - self._query_cooldown.get(key, 0.0) < 3:
+            return ""
+        self._query_cooldown[key] = now
+        if not (self.cfg.backend_base and self.cfg.backend_api_key):
+            return "无法查询积分：总后台连接未配置"
+        return f"当前积分：{self._query_points(qq)}"
+
     def _base_play_reply(self, gid: str, text: str) -> str:
         """局外基础玩法：上分/下分确认、下注提示、无效指令（冷却防刷屏）。"""
         t = (text or "").strip()
@@ -421,7 +452,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         now = time.time()
         if now - self._base_cooldown.get(gid, 0.0) >= 10:
             self._base_cooldown[gid] = now
-            return "无效指令（可发「上分100/下分100」，开局后发「下注N」参与游戏）"
+            return "无效指令（可发「上分100/下分100」「查分」查看积分，开局后发「下注N」参与游戏）"
         return ""
 
     def _send_base_reply(self, gid: str, qq: str, text: str) -> None:
@@ -550,7 +581,10 @@ class PlayTab(ctk.CTkScrollableFrame):
                 send_announce=self._rp_send_announce,
                 settle=self._rp_settle,
                 get_admin_qqs=self._rp_admin_qqs,
+                get_bettors=lambda gid: self.engine.rule_bettors(gid),
+                query_abort=lambda gid: self.engine.query_round_abort(gid),
                 on_log=lambda msg: self.after(0, self._log, msg),
+                on_round_end=lambda gid: self.engine.notify_round_end(gid),
             )
             self._log("玩法含 handle_redpacket：红包计分玩法已启用")
 
@@ -560,6 +594,13 @@ class PlayTab(ctk.CTkScrollableFrame):
         nickname = item.get("nickname") or ""
         text = item["text"]
         who = f"{nickname}({qq})" if nickname else f"QQ{qq}"
+
+        # 内置查分：查 / 查分 / 查积分 → 回复当前积分（先于玩法与局状态，不入对局）
+        query_reply = self._query_points_reply(str(group_id), str(qq), text)
+        if query_reply:
+            self._send_base_reply(str(group_id), str(qq), query_reply)
+            self.after(0, self._log, f"基础玩法 群{group_id} {who}: 查分")
+            return
 
         # 不在游戏局内 → 基础玩法兜底（监控群常驻）：
         # 上分/下分申请确认、局外下注提示、无法识别回复「无效指令」
@@ -576,6 +617,20 @@ class PlayTab(ctk.CTkScrollableFrame):
             admins = self._rp_admin_qqs(group_id)
             if admins and qq not in admins:
                 self.after(0, self._log, f"⚠ 群{group_id} {nickname or qq} 发「开始游戏」被忽略（非管理员）")
+                return
+        # 下注预检（进玩法前）：低于最小下注 / 超过当前积分 → 直接提示（不入玩法、不入对局）
+        m_bet = re.match(r"^下注\s*(\d+)$", t_strip)
+        if m_bet:
+            amount = int(m_bet.group(1))
+            min_bet = int(getattr(self.cfg, "play_min_bet", 10) or 10)
+            if amount < min_bet:
+                self._send_reply(group_id, qq, nickname, who,
+                                 f"下注失败：金额不能小于最小下注 {min_bet} 积分", 0)
+                return
+            pts = self._query_points(qq)
+            if amount > pts:
+                self._send_reply(group_id, qq, nickname, who,
+                                 f"下注失败：积分不足（当前 {pts} 积分，本次下注 {amount}）", 0)
                 return
         reply = self.engine.handle_message(group_id, qq, nickname, text)
         delta = self.engine.last_delta if hasattr(self.engine, "last_delta") else 0
@@ -749,6 +804,19 @@ class PlayTab(ctk.CTkScrollableFrame):
                 self.after(0, self._log, f"✗ 费率上报失败: {e}")
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _save_min_bet(self) -> None:
+        """保存最小下注金额（积分；持久化本机配置，下注预检即时生效）。"""
+        try:
+            v = int(self.entry_min_bet.get().strip())
+            if v < 1:
+                raise ValueError
+        except ValueError:
+            self._log("✗ 最小下注需为正整数（积分）")
+            return
+        self.cfg.play_min_bet = v
+        self.save_config(self.cfg)
+        self._log(f"最小下注已保存：{v} 积分")
 
     def _refresh_rules(self) -> None:
         self.after(0, self._set_busy, True)

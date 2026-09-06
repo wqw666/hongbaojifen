@@ -111,6 +111,7 @@ export function handleApproveMessage(ctx: NapCatPluginContext, event: any): bool
       nickname: String(event?.sender?.nickname ?? event?.nickname ?? ''),
       action: m[1] === '上分' ? 'up' : 'down',
       amount: Number(m[2]),
+      msg_time: Number(event?.time || 0), // QQ 消息发送时间（秒）→ agent 审批页显示申请时间
     }),
     signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
   }).catch(() => {});

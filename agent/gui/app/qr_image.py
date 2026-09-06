@@ -1,21 +1,16 @@
-"""二维码图片：优先读 NapCat 缓存 png，否则根据 URL 生成。"""
+"""二维码图片：按当前二维码 URL 用 qrcode 库现生成。
+
+不用 NapCat 缓存 qrcode.png——该文件只在 QQ 生成新码时重写，过期后不再更新，
+若优先读它，界面会永远停在过期码上（扫码失败，点「刷新」也只是重读同一文件）。
+URL 每轮轮询都从 QQ 实时取，按 URL 渲染才能保证图上画的与 QQ 侧的码一致。
+"""
 
 from __future__ import annotations
-
-from io import BytesIO
-from pathlib import Path
 
 from PIL import Image
 
 
-def load_qrcode_image(png_path: Path | None, url: str = "", size: int = 260) -> Image.Image | None:
-    if png_path and png_path.is_file() and png_path.stat().st_size > 100:
-        try:
-            img = Image.open(png_path).convert("RGB")
-            img.thumbnail((size, size), Image.Resampling.LANCZOS)
-            return img
-        except Exception:
-            pass
+def qrcode_image(url: str = "", size: int = 260) -> Image.Image | None:
     url = (url or "").strip()
     if not url:
         return None

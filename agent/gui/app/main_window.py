@@ -17,20 +17,20 @@ from .backend_tab import BackendTab
 from .config_manager import AppConfig, find_napcat_launcher, load_config, save_config
 from .play_tab import PlayTab
 from .approve_tab import ApprovalTab
-from .napcat_paths import find_napcat_dir, qrcode_png_path
+from .napcat_paths import find_napcat_dir
 from .napcat_webui import NapCatWebUI
 from .plugin_deploy import deploy_plugin
-from .qr_image import load_qrcode_image, pil_to_ctk
+from .qr_image import pil_to_ctk, qrcode_image
 from .query_export import write_query_csv
 
 from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
 from integration.member_sync import group_create_time_str, run_member_sync
 
-APP_VERSION = "2026.08.31-8"
+APP_VERSION = "2026.09.06-9"
 
 HELP_TEXT = """【开箱步骤】
-1. 双击「agent.exe」，软件自动准备环境（约半分钟）
-2. 用手机 QQ 扫描二维码登录（本机登录过的账号可点快捷登录）
+1. 双击「agent.exe」，软件自动启动 QQ 环境（约半分钟）
+2. 用手机 QQ 扫描二维码登录
 3. 登录成功后自动进入主界面
 
 【群管理】
@@ -44,6 +44,10 @@ HELP_TEXT = """【开箱步骤】
 
 【总后台对接】
 • 填总后台地址 / 对接密钥 / 执行器 token → 「启动对接」（由管理员配置）
+
+【退出登录 / 换 QQ】
+• 主界面右上角「退出登录」：立即停止本机 QQ 与 NapCat 服务（QQ 退出登录、服务进程结束）
+• 需要再次登录时，回登录页点「启动 QQ 环境并扫码登录」重新拉起，扫码即可换号
 
 【注意】
 • 仅 QQ 钱包红包有效
@@ -184,6 +188,10 @@ class MainWindow(ctk.CTk):
         ctk.CTkButton(header, text="刷新", width=100, command=self.refresh_status).grid(
             row=0, column=2, sticky="e"
         )
+        ctk.CTkButton(
+            header, text="退出登录", width=100, fg_color="#c0392b", hover_color="#96281b",
+            command=self.logout_qq,
+        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
 
         self.tabs = ctk.CTkTabview(self.view_main)
         self.tabs.grid(row=1, column=0, sticky="nsew", padx=16, pady=12)
@@ -246,7 +254,9 @@ class MainWindow(ctk.CTk):
         ctk.CTkLabel(left, text="登录二维码", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(12, 8))
         self.lbl_qr = ctk.CTkLabel(left, text="等待二维码…", width=280, height=280)
         self.lbl_qr.pack(padx=16, pady=8)
-        ctk.CTkButton(left, text="刷新二维码", command=self.refresh_login_qrcode).pack(pady=(0, 12))
+        ctk.CTkButton(
+            left, text="刷新二维码", command=lambda: self.refresh_login_qrcode(force_refresh=True)
+        ).pack(pady=(0, 12))
 
         right = ctk.CTkFrame(f)
         right.grid(row=1, column=1, sticky="nsew", padx=(8, 16), pady=8)
@@ -261,18 +271,20 @@ class MainWindow(ctk.CTk):
         self.lbl_login_uin = ctk.CTkLabel(right, text="", wraplength=360, justify="left")
         self.lbl_login_uin.grid(row=2, column=0, sticky="w", padx=16, pady=4)
 
-        ctk.CTkLabel(right, text="快捷登录（本机曾登录过的 QQ）", text_color="gray").grid(
-            row=3, column=0, sticky="w", padx=16, pady=(16, 4)
+        self.btn_start_env = ctk.CTkButton(
+            right,
+            text="启动 QQ 环境并扫码登录",
+            height=36,
+            state="disabled",
+            command=self._start_env_and_login,
         )
-        self.frame_quick_login = ctk.CTkScrollableFrame(right, height=160)
-        self.frame_quick_login.grid(row=4, column=0, sticky="nsew", padx=12, pady=4)
-        right.grid_rowconfigure(4, weight=1)
-
+        self.btn_start_env.grid(row=3, column=0, sticky="ew", padx=16, pady=(20, 4))
         ctk.CTkLabel(
             right,
             text="登录成功后自动进入主界面（无需其他操作）",
             text_color="gray",
-        ).grid(row=5, column=0, sticky="w", padx=16, pady=16)
+        ).grid(row=4, column=0, sticky="w", padx=16, pady=4)
+        right.grid_rowconfigure(5, weight=1)
 
     def _napcat_vbs_path(self):
         napcat = find_napcat_dir(self.cfg)
@@ -302,6 +314,7 @@ class MainWindow(ctk.CTk):
             if not napcat:
                 self.after(0, lambda: self.lbl_login_status.configure(
                     text="未找到服务组件，请确认安装包完整（缺少 tools 目录）", text_color="#e74c3c"))
+                self.after(0, lambda: self.btn_start_env.configure(state="normal"))
                 return
             webui = NapCatWebUI.from_napcat_dir(self.cfg.napcat_base, napcat)
             for _ in range(4):
@@ -323,11 +336,84 @@ class MainWindow(ctk.CTk):
                     self.after(0, lambda: self.refresh_login_qrcode(silent=True))
                     return
             self.after(0, lambda: self.lbl_login_status.configure(
-                text="环境启动超时，请重启软件重试", text_color="#e74c3c"))
+                text="环境启动超时，请点下方按钮重试", text_color="#e74c3c"))
+            self.after(0, lambda: self.btn_start_env.configure(state="normal"))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def launch_napcat(self, quick_uin: str = "") -> None:
+    def _start_env_and_login(self) -> None:
+        """登录页「启动 QQ 环境并扫码登录」：环境停止（如刚退出登录）后手动拉起。"""
+        self.launch_napcat()
+
+    def logout_qq(self) -> None:
+        """「退出登录」：停止本机 QQ 与 NapCat（QQ 退出登录、服务进程全部结束）。
+
+        关窗口并不会退出 QQ——QQ/NapCat 进程保持运行，所以重开 agent 会检测到
+        已登录而直接进主界面，永远到不了扫码页、无法换号。本按钮就是为此提供：
+        彻底杀掉 QQ 与 NapCat → 停在登录页，等用户点「启动 QQ 环境并扫码登录」
+        再干净地重新拉起（不自动重启，避免退出后又卡在拉起的坏状态上）。
+        """
+        if not messagebox.askyesno(
+            "退出登录",
+            "将停止本机 QQ 与 NapCat 服务：QQ 退出登录，红包监控/玩法全部停止。\n\n"
+            "需要再次使用时，回登录页点「启动 QQ 环境并扫码登录」重新拉起（约 15~60 秒后扫码）。\n\n"
+            "确认退出当前 QQ 吗？",
+            icon="warning",
+        ):
+            return
+        # 停监控轮询与登录轮询，避免 QQ 消失期间 404/503 噪音刷屏、状态被覆盖
+        self._polling = False
+        self._napcat_ready = False
+        for attr in ("_poll_job", "_login_poll_job"):
+            job = getattr(self, attr, None)
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._show_login_view()
+        self.lbl_login_status.configure(text="正在退出当前 QQ…", text_color="#e67e22")
+
+        def kill_all():
+            # 杀 NapCat 引导进程树与 QQ 树，并等 QQ 进程真正消失（最长约 15 秒）
+            import time
+
+            try:
+                for img in ("NapCatWinBootMain.exe", "QQ.exe"):
+                    subprocess.run(["taskkill", "/F", "/IM", img, "/T"],
+                                   capture_output=True, timeout=20)
+            except Exception:
+                pass
+            for _ in range(30):
+                try:
+                    out = subprocess.run(
+                        ["tasklist", "/FI", "IMAGENAME eq QQ.exe"],
+                        capture_output=True, text=True, timeout=10).stdout
+                    if "QQ.exe" not in out:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            self.after(0, self._after_logout_done)
+
+        threading.Thread(target=kill_all, daemon=True).start()
+
+    def _after_logout_done(self) -> None:
+        """退出完成收尾：停在登录页，等待用户决定何时重新拉起环境。"""
+        self.lbl_login_status.configure(
+            text="已退出登录：QQ 与 NapCat 已停止", text_color="#2ecc71")
+        self.lbl_login_uin.configure(
+            text="需要重新使用时，点下方「启动 QQ 环境并扫码登录」，再扫码即可（约 15~60 秒后出二维码）")
+        self.btn_start_env.configure(state="normal")
+
+    def launch_napcat(self) -> None:
+        """以扫码模式拉起 QQ 环境（vbs 无 -q 参数），随后轮询登录状态出二维码。
+
+        初始打开 agent、退出登录后点「启动 QQ 环境并扫码登录」都走这里。
+        启动期间启动按钮置灰（环境由轮询接管），vbs 每次都会先杀旧引导进程再拉新。
+        """
+        self.btn_start_env.configure(state="disabled", text="环境启动中…")
         vbs = self._napcat_vbs_path()
         if not vbs:
             launcher = find_napcat_launcher()
@@ -341,13 +427,13 @@ class MainWindow(ctk.CTk):
                     return
                 except OSError as e:
                     messagebox.showerror("启动失败", str(e))
+                    self.btn_start_env.configure(state="normal", text="启动 QQ 环境并扫码登录")
                     return
             messagebox.showerror("缺少服务组件", "请确认安装包完整（缺少 tools 目录）")
+            self.btn_start_env.configure(state="normal", text="启动 QQ 环境并扫码登录")
             return
         try:
             cmd = ["wscript", "//nologo", str(vbs)]
-            if quick_uin:
-                cmd.append(str(quick_uin))
             # 启动期间先停监控轮询，避免 503/404 刷屏
             self._napcat_ready = False
             self._polling = False
@@ -362,12 +448,14 @@ class MainWindow(ctk.CTk):
             if hasattr(self, "lbl_conn"):
                 self.lbl_conn.configure(text="环境启动中…", text_color="#e67e22")
             self.lbl_login_status.configure(text="环境启动中，约 15~60 秒后可扫码", text_color="#e67e22")
+            self.lbl_login_uin.configure(text="")
             self._schedule_login_poll()
             self.after(8000, self.refresh_login_qrcode)
             self.after(20000, self.refresh_login_qrcode)
             self.after(25000, self.refresh_status)
         except OSError as e:
             messagebox.showerror("启动失败", str(e))
+            self.btn_start_env.configure(state="normal", text="启动 QQ 环境并扫码登录")
 
     def _schedule_login_poll(self) -> None:
         if self._login_poll_job:
@@ -378,8 +466,19 @@ class MainWindow(ctk.CTk):
         self.refresh_login_qrcode(silent=True)
         self._login_poll_job = self.after(2500, self._login_poll_tick)
 
-    def refresh_login_qrcode(self, silent: bool = False, *_args) -> None:
+    def refresh_login_qrcode(self, silent: bool = False, force_refresh: bool = False, *_args) -> None:
+        """取最新登录态与二维码（登录轮询与「刷新二维码」按钮共用）。
+
+        silent=False + force_refresh=True 为按钮语义：向 QQ 请求一张新码（真刷新，
+        不是重读界面）；轮询（silent=True）发现二维码过期（loginError 带「过期」）
+        也自动刷一次（60 秒节流），不让界面停在过期码上。二维码图片一律按当前
+        URL 现渲染——NapCat 缓存 qrcode.png 只在 QQ 生成新码时重写，过期后文件
+        不更新，曾导致界面永远停在过期码、扫码失败且「刷新」看似无反应。
+        """
         def work():
+            import time as _t
+
+            ping_ok = False
             try:
                 napcat = find_napcat_dir(self.cfg)
                 if not napcat:
@@ -391,25 +490,43 @@ class MainWindow(ctk.CTk):
                     )
                     return
                 webui = NapCatWebUI.from_napcat_dir(self.cfg.napcat_base, napcat)
-                if not webui.ping():
+                ping_ok = webui.ping()
+                if not ping_ok:
                     if not getattr(self, "_env_started", False):
                         self.after(0, self._auto_env_start)
+                    else:
+                        # 自动启动流程已跑完仍连不上（环境被关/启动失败）：
+                        # 交还用户手动拉起，别让界面无限「环境启动中」
+                        self.after(0, lambda: self.btn_start_env.configure(
+                            state="normal", text="启动 QQ 环境并扫码登录"))
                     self.after(
                         0,
                         lambda: self.lbl_login_status.configure(
-                            text="环境启动中，请稍候…", text_color="#e67e22"
+                            text="环境未就绪，正在重试…", text_color="#e67e22"
                         ),
                     )
                     return
                 st = webui.check_login_status()
+                if not st.is_login:
+                    err_txt = st.login_error or ""
+                    is_expired = "过期" in err_txt or "refresh" in err_txt.lower()
+                    if force_refresh or is_expired:
+                        now = _t.time()
+                        if force_refresh or now - getattr(self, "_last_qr_auto_refresh", 0.0) > 60:
+                            try:
+                                webui.refresh_qrcode()
+                                if not force_refresh:
+                                    self._last_qr_auto_refresh = now
+                            except Exception:
+                                pass  # 刷新失败维持现状，等下一轮轮询再试
+                            st = webui.check_login_status()
                 url = st.qrcode_url
                 if not st.is_login:
                     try:
                         url = webui.get_qrcode_url() or url
                     except Exception:
                         pass
-                png = qrcode_png_path(napcat)
-                pil = load_qrcode_image(png, url)
+                pil = qrcode_image(url)
                 info = {}
                 if st.is_login:
                     try:
@@ -418,12 +535,21 @@ class MainWindow(ctk.CTk):
                         pass
                 self.after(0, lambda: self._apply_login_ui(st, pil, info, silent))
             except Exception as e:
-                if not silent:
-                    self.after(0, lambda: messagebox.showerror("登录页刷新失败", str(e)))
-                self.after(
-                    0,
-                    lambda: self.lbl_login_status.configure(text=f"刷新失败: {e}", text_color="#e74c3c"),
-                )
+                # 服务活着但取状态失败：可能是登录握手过渡、QQ 重建中、或瞬时波动——
+                # 无法据此断言「手机已确认」，只给中性提示并继续自动重试
+                # （真正的已确认态由 is_offline/登录成功呈现）
+                if ping_ok:
+                    self.after(0, lambda: self.lbl_login_status.configure(
+                        text="登录服务处理中，正在自动重试…请稍候",
+                        text_color="#e67e22"))
+                else:
+                    if not silent:
+                        self.after(0, lambda e=e: messagebox.showerror("登录页刷新失败", str(e)))
+                    self.after(
+                        0,
+                        lambda e=e: self.lbl_login_status.configure(
+                            text="连接服务失败，正在重试…", text_color="#e67e22"),
+                    )
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -437,7 +563,7 @@ class MainWindow(ctk.CTk):
         if st.is_login:
             nick = info.get("nick") or ""
             uin = info.get("uin") or ""
-            self.lbl_login_status.configure(text="已登录，正在进入…", text_color="#2ecc71")
+            self.lbl_login_status.configure(text="✓ 手机已确认，登录成功，正在进入主界面…", text_color="#2ecc71")
             self.lbl_login_uin.configure(text=f"{nick} ({uin})" if nick else str(uin))
             if hasattr(self, "lbl_conn"):
                 self.lbl_conn.configure(text=f"已连接 QQ {uin}", text_color="#2ecc71")
@@ -447,47 +573,36 @@ class MainWindow(ctk.CTk):
             # 登录成功：自动部署服务 → 进入主界面（后台执行，无需用户操作）
             self._after_login_auto()
         else:
-            err = st.login_error or "请使用手机 QQ 扫描二维码"
-            self.lbl_login_status.configure(text=err, text_color="#e67e22")
-            self.lbl_login_uin.configure(text=st.qrcode_url[:80] + "…" if len(st.qrcode_url) > 80 else st.qrcode_url)
-            self._fill_quick_login_buttons()
+            import time as _t
+            now = _t.time()
+            qr_url = st.qrcode_url
+            if qr_url and qr_url != getattr(self, "_last_qr_url", None):
+                self._last_qr_url = qr_url
+                self._qr_show_ts = now
+            wait_s = int(now - getattr(self, "_qr_show_ts", now))
+            if st.is_offline:
+                # QQ 已通过登录但还没上线：手机确认成功的过渡期
+                text, color = "手机已确认，正在登录上线（约需半分钟），请稍候…", "#2ecc71"
+            elif st.login_error:
+                text, color = st.login_error, "#e74c3c"
+            elif qr_url:
+                # 扫码确认后 QQ 静默处理几十秒，期间旧二维码不变——
+                # 用等待计时与文案让用户看到软件仍在工作，不会误以为卡死
+                wait_txt = f"（二维码已等待 {wait_s} 秒）" if wait_s > 3 else ""
+                text = f"请用手机 QQ 扫码，并在手机上点「确认登录」{wait_txt}"
+                if wait_s > 75:
+                    text += "　长时间无反应可点左侧「刷新二维码」重试"
+                color = "#e67e22"
+            else:
+                text, color = "正在获取二维码…", "#e67e22"
+            self.lbl_login_status.configure(text=text, text_color=color)
+            self.lbl_login_uin.configure(
+                text="扫码后登录处理约需 30~60 秒，期间界面无变化属正常，请耐心等待")
+            # 环境健康（轮询能取到状态）时启动按钮不可用，防误触重启；
+            # 由 ping 失败路径 / 退出登录流程放开
+            self.btn_start_env.configure(state="disabled", text="启动 QQ 环境并扫码登录")
             if getattr(self, "_main_built", False) and self.view_main.winfo_ismapped():
                 self._show_login_view()
-
-    def _fill_quick_login_buttons(self) -> None:
-        for w in self.frame_quick_login.winfo_children():
-            w.destroy()
-
-        def work():
-            try:
-                napcat = find_napcat_dir(self.cfg)
-                if not napcat:
-                    return
-                webui = NapCatWebUI.from_napcat_dir(self.cfg.napcat_base, napcat)
-                if not webui.ping():
-                    return
-                uins = webui.get_quick_login_list()
-                self.after(0, lambda: self._render_quick_login(uins))
-            except Exception:
-                pass
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _render_quick_login(self, uins: list[str]) -> None:
-        for w in self.frame_quick_login.winfo_children():
-            w.destroy()
-        if not uins:
-            ctk.CTkLabel(self.frame_quick_login, text="（无历史账号，请扫码）", text_color="gray").pack(
-                anchor="w", padx=4, pady=2
-            )
-            return
-        for uin in uins[:30]:
-            ctk.CTkButton(
-                self.frame_quick_login,
-                text=f"快速登录 {uin}",
-                anchor="w",
-                command=lambda u=uin: self.launch_napcat(u),
-            ).pack(fill="x", padx=4, pady=2)
 
     def _after_login_auto(self) -> None:
         """登录成功后的自动配置：部署服务 → 重载 → 同步设置 → 切主界面。只执行一次。"""
@@ -1503,7 +1618,7 @@ class MainWindow(ctk.CTk):
                 self.client.sync_plugin_config()
                 self.after(0, lambda: self._log_status("已同步设置到服务"))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("同步失败", str(e)))
+                self.after(0, lambda e=e: messagebox.showerror("同步失败", str(e)))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1607,7 +1722,7 @@ class MainWindow(ctk.CTk):
                 self.after(0, self.refresh_monitor)
                 self.after(0, self.refresh_status)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("同步失败", str(e)))
+                self.after(0, lambda e=e: messagebox.showerror("同步失败", str(e)))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1657,7 +1772,7 @@ class MainWindow(ctk.CTk):
                     )
                     self.after(0, self.refresh_status)
                 else:
-                    self.after(0, lambda: self._log_status(f"监控刷新失败: {e}"))
+                    self.after(0, lambda e=e: self._log_status(f"监控刷新失败: {e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1681,7 +1796,7 @@ class MainWindow(ctk.CTk):
                 n = self.client.clear_records()
                 self.after(0, lambda: self._after_clear_records(n))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("清空失败", str(e)))
+                self.after(0, lambda e=e: messagebox.showerror("清空失败", str(e)))
             finally:
                 self.after(0, self._start_poll)
 
@@ -1832,7 +1947,7 @@ class MainWindow(ctk.CTk):
                         text=f"加载失败: {e}", text_color="#e74c3c"
                     ),
                 )
-                self.after(0, lambda: self._log_status(f"群成员加载失败: {e}"))
+                self.after(0, lambda e=e: self._log_status(f"群成员加载失败: {e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1933,7 +2048,7 @@ class MainWindow(ctk.CTk):
                 )
                 self.after(0, lambda: self._log_status(f"已刷新详情 {bill}"))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("失败", str(e)))
+                self.after(0, lambda e=e: messagebox.showerror("失败", str(e)))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1981,9 +2096,9 @@ class MainWindow(ctk.CTk):
                 text = "\n".join(lines)
                 self.after(0, lambda d=data, t=text: self._set_query_result(t, d))
             except ApiError as e:
-                self.after(0, lambda: self._set_query_result(f"查询失败: {e}"))
+                self.after(0, lambda e=e: self._set_query_result(f"查询失败: {e}"))
             except Exception as e:
-                self.after(0, lambda: self._set_query_result(f"错误: {e}"))
+                self.after(0, lambda e=e: self._set_query_result(f"错误: {e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2048,6 +2163,8 @@ class MainWindow(ctk.CTk):
             app_version=APP_VERSION,
         )
         self.backend_tab.pack(fill="both", expand=True)
+        # agent 启动（登录进主界面）即自动开启心跳+远程命令，无需手动「启动对接」
+        self.backend_tab.auto_start()
 
     def _build_play_tab(self) -> None:
         """游戏玩法（群聊自动回复引擎）：独立模块挂载，见 play_tab.PlayTab。"""

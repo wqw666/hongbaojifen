@@ -6,6 +6,9 @@
   → 操作员选中点「通过」→ 调总后台 /api/open/points/up|down（带 executor_token，
   bizNo 幂等）→ 状态改为 已通过/已拒绝/失败(原因)
 
+「申请时间」= 群里发出申请的时刻：新版插件转发时附带 QQ 消息发送时间（msg_time，
+秒），据此格式化展示；旧插件不带时回退用 agent 收到时刻（转发即时，两者几乎一致）。
+
 线程纪律：网络在 daemon 线程，UI 一律 after(0) 回主线程。
 """
 from __future__ import annotations
@@ -62,7 +65,7 @@ class ApprovalTab(ctk.CTkFrame):
         cols = ("time", "gid", "qq", "nick", "action", "amount", "status")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
         for c, w, t in [
-            ("time", 150, "时间"),
+            ("time", 150, "申请时间"),
             ("gid", 110, "群号"),
             ("qq", 110, "QQ"),
             ("nick", 130, "昵称"),
@@ -102,8 +105,11 @@ class ApprovalTab(ctk.CTkFrame):
 
     def _add_row(self, data: dict) -> None:
         action = "上分" if data.get("action") == "up" else "下分"
+        ts = int(data.get("msg_time") or 0)
+        # 申请时间：优先 QQ 消息真实发送时刻（插件 msg_time）；没有则用 agent 收到时刻
+        applied_at = (datetime.fromtimestamp(ts) if ts > 0 else datetime.now())
         row = {
-            "time": datetime.now().strftime("%m-%d %H:%M:%S"),
+            "time": applied_at.strftime("%m-%d %H:%M:%S"),
             "group_id": str(data.get("group_id") or ""),
             "qq": str(data.get("qq") or ""),
             "nickname": str(data.get("nickname") or ""),
