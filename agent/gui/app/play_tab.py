@@ -140,7 +140,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         self.entry_min_bet.insert(0, str(int(getattr(self.cfg, "play_min_bet", 10) or 10)))
         self.entry_min_bet.pack(side="left", padx=4)
         self.entry_min_bet.bind("<Return>", lambda _e: self._save_min_bet())
-        ctk.CTkLabel(bet_row, text="（下注玩法「下注N」：低于此值或超过自己当前积分会被拒绝并提示）",
+        ctk.CTkLabel(bet_row, text="（下注玩法：玩家直接发数字下注（如 500），低于此值或超过自己当前积分会被拒绝并提示）",
                      text_color="gray", font=ctk.CTkFont(size=11)).pack(side="left", padx=6)
         ctk.CTkButton(bet_row, text="保存", width=70, command=self._save_min_bet).pack(side="left", padx=4)
 
@@ -254,7 +254,7 @@ class PlayTab(ctk.CTkScrollableFrame):
                              "nickname": str(data.get("nickname") or ""), "text": text})
 
     def _on_callback_approve(self, data: dict) -> None:
-        """HTTP 线程：上分/下分申请 → 审批页（on_approve 由 MainWindow 挂接）。"""
+        """HTTP 线程：上/下积分申请 → 审批页（on_approve 由 MainWindow 挂接）。"""
         handler = getattr(self, "on_approve", None)
         if callable(handler):
             try:
@@ -419,8 +419,8 @@ class PlayTab(ctk.CTkScrollableFrame):
     # ================= 基础玩法（监控群常驻） =================
 
     def _base_approve_confirm(self, text: str) -> str:
-        """上分/下分申请确认语（局内玩法未处理时的兜底）。"""
-        m = re.match(r"^(上分|下分)\s*(\d+)$", (text or "").strip())
+        """上/下申请确认语（局内玩法未处理时的兜底；玩家发「上1000/下100」，「上分/下分」旧词兼容）。"""
+        m = re.match(r"^(上|下)(?:分)?\s*(\d+)$", (text or "").strip())
         if m:
             return f"{m.group(1)}{m.group(2)}申请已提交，等待管理员审批"
         return ""
@@ -442,9 +442,9 @@ class PlayTab(ctk.CTkScrollableFrame):
         return f"当前积分：{self._query_points(qq)}"
 
     def _base_play_reply(self, gid: str, text: str) -> str:
-        """局外基础玩法：上分/下分确认、下注提示、无效指令（冷却防刷屏）。"""
+        """局外基础玩法：上/下申请确认、下注提示、无效指令（冷却防刷屏）。"""
         t = (text or "").strip()
-        m = re.match(r"^(上分|下分)\s*(\d+)$", t)
+        m = re.match(r"^(上|下)(?:分)?\s*(\d+)$", t)
         if m:
             return f"{m.group(1)}{m.group(2)}申请已提交，等待管理员审批"
         if re.match(r"^(压|下注|投注|押)\s*\d+", t):
@@ -452,7 +452,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         now = time.time()
         if now - self._base_cooldown.get(gid, 0.0) >= 10:
             self._base_cooldown[gid] = now
-            return "无效指令（可发「上分100/下分100」「查分」查看积分，开局后发「下注N」参与游戏）"
+            return "无效指令（可发「上100/下100」「查分」查看积分，开局后直接发数字参与游戏（如 500））"
         return ""
 
     def _send_base_reply(self, gid: str, qq: str, text: str) -> None:
@@ -603,7 +603,7 @@ class PlayTab(ctk.CTkScrollableFrame):
             return
 
         # 不在游戏局内 → 基础玩法兜底（监控群常驻）：
-        # 上分/下分申请确认、局外下注提示、无法识别回复「无效指令」
+        # 上/下申请确认、局外下注提示、无法识别回复「无效指令」
         if not (self.engine.is_active() and group_id in self._active_groups):
             base_reply = self._base_play_reply(group_id, text)
             if base_reply:
@@ -618,8 +618,13 @@ class PlayTab(ctk.CTkScrollableFrame):
             if admins and qq not in admins:
                 self.after(0, self._log, f"⚠ 群{group_id} {nickname or qq} 发「开始游戏」被忽略（非管理员）")
                 return
-        # 下注预检（进玩法前）：低于最小下注 / 超过当前积分 → 直接提示（不入玩法、不入对局）
+        # 下注预检（进玩法前）：低于最小下注 / 超过当前积分 → 直接提示（不入玩法、不入对局）。
+        # 显式「下注N」任何时候都拦；纯数字只在玩法明确处于下注期（betting_open=True）才拦，
+        # 避免把群聊里的普通数字当下注误校验。
+        bet_open = self.engine.betting_open(group_id) if self.engine.is_active() else None
         m_bet = re.match(r"^下注\s*(\d+)$", t_strip)
+        if not m_bet and bet_open:
+            m_bet = re.match(r"^(\d+)$", t_strip)
         if m_bet:
             amount = int(m_bet.group(1))
             min_bet = int(getattr(self.cfg, "play_min_bet", 10) or 10)
@@ -634,7 +639,7 @@ class PlayTab(ctk.CTkScrollableFrame):
                 return
         reply = self.engine.handle_message(group_id, qq, nickname, text)
         delta = self.engine.last_delta if hasattr(self.engine, "last_delta") else 0
-        # 局内玩法未处理的上分/下分 → 基础玩法确认回复（申请照常进审批页）
+        # 局内玩法未处理的上/下 → 基础玩法确认回复（申请照常进审批页）
         if not reply:
             confirm = self._base_approve_confirm(text)
             if confirm:

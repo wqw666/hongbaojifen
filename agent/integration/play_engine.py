@@ -15,6 +15,7 @@
     def handle_round_start(group_id)                             # GUI「开始本局」：开局重置玩法状态
     def handle_round_end(group_id)                               # GUI「结束本局」/自动收尾：清理玩法状态
     def handle_round_abort(group_id)                             # 下注期点「结束本局」：返回终止公告文本或 None
+    def betting_open(group_id)                                   # 当前是否处于下注期（agent 下注预检问询，返回 True/False）
 其中 handle_round_start/end 无返回值要求；引擎在操作员点「开始本局/结束本局」或
 红包领完自动收尾时调用。需要"整局状态"的玩法（如大吃小需要开局进入下注期）应在此重置。
 handle_round_abort 由引擎在「结束本局」进入结算收尾**前**问询玩法（大吃小在下注期点
@@ -337,6 +338,24 @@ class RuleEngine:
             return fn(int(group_id))
         except Exception as e:  # noqa: BLE001 — 玩法 bug 不影响引擎
             self.last_error = f"玩法handle_round_abort异常: {e.__class__.__name__}: {e}"
+            return None
+
+    def betting_open(self, group_id: int | str) -> bool | None:
+        """玩法可选 betting_open(group_id) → 本玩法当前是否处于可下注期（True/False）。
+
+        供 agent 在下注预检（最小下注/余额不足）前问询：仅在玩法明确返回 True 时
+        才把纯数字消息当下注拦截校验，避免群聊里的普通数字被误拦；未激活/玩法
+        未提供 → None（agent 端此时只按显式下注词预检）；调用异常记 last_error。"""
+        module = self._current_module()
+        if module is None:
+            return None
+        fn = getattr(module, "betting_open", None)
+        if not callable(fn):
+            return None
+        try:
+            return bool(fn(int(group_id)))
+        except Exception as e:  # noqa: BLE001 — 玩法 bug 不影响引擎
+            self.last_error = f"玩法betting_open异常: {e.__class__.__name__}: {e}"
             return None
 
     def _notify_optional(self, fn_name: str, group_id: int | str, extra: str = "") -> None:
@@ -760,6 +779,9 @@ def handle_round_abort(group_id):
 
 def bettor_qqs(group_id):
     return list(BETS) if PHASE["mode"] == "betting" else []
+
+def betting_open(group_id):
+    return PHASE["mode"] == "betting"
 ''', encoding="utf-8")
     err = eng2.activate(10, "rule_round2@1.0", rh2)
     step("带局号玩法激活", err is None, err or "")
@@ -774,16 +796,22 @@ def bettor_qqs(group_id):
     step("下注期 query_round_abort 返回终止公告",
          eng2.query_round_abort(10001) == "本局 已终止（积分已退还，不抽水）",
          repr(eng2.query_round_abort(10001)))
+    step("下注期 betting_open=True", eng2.betting_open(10001) is True,
+         repr(eng2.betting_open(10001)))
     eng2.notify_round_end(10001)
     step("收尾清局号", eng2.handle_message(10001, 9103, "丙", "局号") is None
          and eng2.handle_message(10001, 9104, "丁", "状态") == "idle")
     step("收尾后 bettor_qqs 为空", eng2.rule_bettors(10001) == set())
     step("收尾后 query_round_abort 为空", eng2.query_round_abort(10001) is None)
+    step("收尾后 betting_open=False", eng2.betting_open(10001) is False,
+         repr(eng2.betting_open(10001)))
     err = eng2.activate(11, "rule_add1@1.0", files["rule_add1"])
     step("无局回调的玩法通知为 no-op", err is None and eng2.handle_message(10001, 9005, "戊", "1") == "11"
          and (eng2.notify_round_start(10001) is None))
     step("无 bettor_qqs 玩法返回空集", eng2.rule_bettors(10001) == set())
     step("无 handle_round_abort 玩法 query 为空", eng2.query_round_abort(10001) is None)
+    step("无 betting_open 玩法返回 None", eng2.betting_open(10001) is None,
+         repr(eng2.betting_open(10001)))
 
     # ---- RoundSession：多群分局 / 结算上报 / 失败保留 ----
     fake = _FakeBackend()

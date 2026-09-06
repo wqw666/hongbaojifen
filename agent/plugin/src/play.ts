@@ -61,7 +61,7 @@ export async function handlePlayMessage(ctx: NapCatPluginContext, event: any): P
 
   const text = extractPlainText(event);
   if (!text) return false;
-  // 放行条件：玩法开启且群在玩法名单；或群在监控名单（基础玩法常驻：上分/下分/无效指令/局外下注提示）
+  // 放行条件：玩法开启且群在玩法名单；或群在监控名单（基础玩法常驻：上/下申请/无效指令/局外下注提示）
   const playOk = config.playEnabled
     && (!config.playGroups.length || config.playGroups.includes(groupId));
   const watchOk = (config.watchGroups || []).includes(groupId);
@@ -82,7 +82,8 @@ export async function handlePlayMessage(ctx: NapCatPluginContext, event: any): P
   return true;
 }
 
-/** 上分/下分申请：独立于玩法总开关，总是转发到 agent 审批页（/play/approve）。 */
+/** 上/下积分申请（上分/下分）：独立于玩法总开关，总是转发到 agent 审批页（/play/approve）。
+ *  玩家发「上1000」/「下100」申请；旧词「上分1000」/「下分100」仍兼容。 */
 export function handleApproveMessage(ctx: NapCatPluginContext, event: any): boolean {
   if (event?.post_type !== 'message') return false;
   if (event?.message_type !== 'group') return false;
@@ -91,7 +92,7 @@ export function handleApproveMessage(ctx: NapCatPluginContext, event: any): bool
   if (!groupId || !qq) return false;
   if (qq === String(event?.self_id ?? '')) return false;
   const text = extractPlainText(event);
-  const m = /^(上分|下分)\s*(\d+)$/.exec(text);
+  const m = /^(上|下)(?:分)?\s*(\d+)$/.exec(text);
   if (!m) return false;
   // 群过滤：玩法群优先，否则监控群，都没有则全部
   const allow = config.playGroups.length ? config.playGroups : (config.watchGroups || []);
@@ -109,7 +110,7 @@ export function handleApproveMessage(ctx: NapCatPluginContext, event: any): bool
     body: JSON.stringify({
       kind: 'approve', group_id: groupId, qq,
       nickname: String(event?.sender?.nickname ?? event?.nickname ?? ''),
-      action: m[1] === '上分' ? 'up' : 'down',
+      action: m[1] === '上' ? 'up' : 'down',
       amount: Number(m[2]),
       msg_time: Number(event?.time || 0), // QQ 消息发送时间（秒）→ agent 审批页显示申请时间
     }),

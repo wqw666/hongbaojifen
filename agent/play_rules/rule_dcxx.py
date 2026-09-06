@@ -2,7 +2,8 @@
 
 流程：
   1. 管理员「开始本局」（GUI 按钮 / 连续开局；也可群内发「开始游戏」）→ 进入下注阶段
-  2. 玩家发「下注N」→ 回复「本局 {局号}，{所有已下注玩家名单}」（累计名单，逐人追加）
+  2. 玩家直接发数字（如 500）即下注 N 积分（旧词「下注500」仍兼容）→ 回复
+     「本局 {局号}，{所有已下注玩家名单}」（累计名单，逐人追加）
   3. 管理员发红包，参与玩家抢红包 → 每人点数 = 红包金额各位数之和；
      每个抢到的人立即收到 @回复（金额+点数，未下注者提示不计分）
   4. 红包领完 → 自动结算（settle_redpacket）→ @全体 播报结果并逐人回复盈亏
@@ -36,28 +37,37 @@ def _digits(v):
     return sum(int(ch) for ch in s if ch.isdigit())
 
 
+def _register_bet(group_id, qq, nickname, amount):
+    """登记一笔押注并返回回复文本（成功=累计名单；失败=原因）。"""
+    if amount <= 0:
+        return "下注金额需大于0"
+    if str(qq) in BETS:
+        return "你已经下过注了，等待开奖"
+    BETS[str(qq)] = {"nickname": nickname or str(qq), "amount": amount, "score": 0}
+    rid = CURRENT_ROUND.get(int(group_id), "")
+    parts = "，".join(
+        f"{b['nickname']}下注{b['amount']}" for b in BETS.values())
+    return (f"本局 {rid}，{parts}" if rid else parts)
+
+
 def handle_message(group_id, qq, nickname, text):
     t = (text or "").strip()
     if t in ("开始游戏", "开局"):
         BETS.clear()
         PHASE["mode"] = "betting"
-        return ("游戏开始！玩法：大吃小。发送「下注N」参与（N=积分），"
+        return ("游戏开始！玩法：大吃小。直接发数字下注（N=积分，如 500），"
                 "一分钟后管理员发红包开奖：红包金额各位数之和定大小，"
                 "点数大者吃小者，抽水按游戏费率扣除。")
     m = re.match(r"^下注\s*(\d+)$", t)
     if m:
         if PHASE["mode"] != "betting":
             return "当前未开局，请等管理员发「开始游戏」"
-        amount = int(m.group(1))
-        if amount <= 0:
-            return "下注金额需大于0"
-        if str(qq) in BETS:
-            return "你已经下过注了，等待开奖"
-        BETS[str(qq)] = {"nickname": nickname or str(qq), "amount": amount, "score": 0}
-        rid = CURRENT_ROUND.get(int(group_id), "")
-        parts = "，".join(
-            f"{b['nickname']}下注{b['amount']}" for b in BETS.values())
-        return (f"本局 {rid}，{parts}" if rid else parts)
+        return _register_bet(group_id, qq, nickname, int(m.group(1)))
+    if t.isdigit():
+        # 纯数字 = 直接下注（下注期有效）；不在下注期当作闲聊静默，不打扰报数字
+        if PHASE["mode"] != "betting":
+            return None
+        return _register_bet(group_id, qq, nickname, int(t))
     return None
 
 
@@ -98,6 +108,11 @@ def bettor_qqs(group_id):
     return list(BETS.keys())
 
 
+def betting_open(group_id):
+    """当前是否处于可下注期（agent 下注预检问询：只有下注期才把纯数字拦下校验）。"""
+    return PHASE["mode"] == "betting"
+
+
 def handle_redpacket(group_id, qq, nickname, amount):
     """领取事件：记点数并即时@回复领取结果（类似红包计分玩法）；结算在 settle_redpacket。"""
     if PHASE["mode"] != "betting":
@@ -111,7 +126,7 @@ def handle_redpacket(group_id, qq, nickname, amount):
         BETS[qq]["score"] = pts
         return (f"抢到{a:.2f}元，点数{pts}（已下注{BETS[qq]['amount']}，"
                 "本包领完自动开奖结算）", 0)
-    return (f"抢到{a:.2f}元，点数{pts}（未下注不计分，发「下注N」参与本局）", 0)
+    return (f"抢到{a:.2f}元，点数{pts}（未下注不计分，直接发数字参与本局）", 0)
 
 
 def settle_redpacket(group_id, claims, rate_permille=20):
@@ -281,35 +296,42 @@ def _selftest() -> int:
     handle_round_start(1, "hongbaojifen_00000099")
     check("双参开局记住局号", PHASE["mode"] == "betting"
          and CURRENT_ROUND.get(1) == "hongbaojifen_00000099", str(CURRENT_ROUND))
-    r = handle_message(1, 1, "用户1", "下注100")
-    check("用户1下注100 回复本局+首名单", r == "本局 hongbaojifen_00000099，用户1下注100", f"{r!r}")
-    r = handle_message(1, 2, "用户2", "下注200")
-    check("用户2下注200 回复本局+累计名单",
+    r = handle_message(1, 1, "用户1", "100")
+    check("用户1 纯数字下注100 回复本局+首名单", r == "本局 hongbaojifen_00000099，用户1下注100", f"{r!r}")
+    r = handle_message(1, 2, "用户2", "200")
+    check("用户2 纯数字下注200 回复本局+累计名单",
          r == "本局 hongbaojifen_00000099，用户1下注100，用户2下注200", f"{r!r}")
     check("下注登记进 BETS", BETS.get("1", {}).get("amount") == 100
          and BETS.get("2", {}).get("amount") == 200, str(BETS))
-    r = handle_message(1, 1, "用户1", "下注300")
-    check("重复下注拒绝", r and "已经下过注" in r, f"{r!r}")
-    check("bettor_qqs 返回下注者集合", set(map(str, bettor_qqs(1))) == {"1", "2"}, str(bettor_qqs(1)))
+    r = handle_message(1, 6, "用户6", "下注300")  # 旧词兼容
+    check("旧词「下注300」仍受理", r == "本局 hongbaojifen_00000099，用户1下注100，用户2下注200，用户6下注300",
+         f"{r!r}")
+    r = handle_message(1, 1, "用户1", "300")
+    check("重复下注拒绝（纯数字）", r and "已经下过注" in r, f"{r!r}")
+    check("bettor_qqs 返回下注者集合", set(map(str, bettor_qqs(1))) == {"1", "2", "6"}, str(bettor_qqs(1)))
+    check("下注期 betting_open=True", betting_open(1) is True)
     ab = handle_round_abort(1)
     check("下注期终止返回公告（局号+退还+不抽水）", ab and "hongbaojifen_00000099" in ab
          and "已终止" in ab and "积分已退还" in ab and "不抽水" in ab, f"{ab!r}")
     check("终止只问询不动状态（等 handle_round_end 清理）",
-         PHASE["mode"] == "betting" and len(BETS) == 2, str(PHASE))
+         PHASE["mode"] == "betting" and len(BETS) == 3, str(PHASE))
     handle_round_end(1)
     check("收尾清局号回待机", PHASE["mode"] == "idle" and 1 not in CURRENT_ROUND, str(CURRENT_ROUND))
     check("待机期 bettor_qqs 为空", not bettor_qqs(1))
     check("待机期终止返回 None", handle_round_abort(1) is None)
     r = handle_message(1, 3, "用户3", "下注500")
-    check("待机期下注回复未开局", r and "未开局" in r, f"{r!r}")
+    check("待机期旧词下注回复未开局", r and "未开局" in r, f"{r!r}")
+    r = handle_message(1, 3, "用户3", "88")
+    check("待机期纯数字当作闲聊静默", r is None and "3" not in BETS, f"{r!r}")
+    check("待机期 betting_open=False", betting_open(1) is False)
 
     # 无局号路径：群内发「开始游戏」开局（CURRENT_ROUND 无局号）→ 回复不带局号前缀
     BETS.clear()
     r = handle_message(1, 4, "路人", "开始游戏")
     check("群内开始游戏进入下注期", r and "开始" in r and PHASE["mode"] == "betting", f"{r!r}")
     check("无人下注时终止返回 None", handle_round_abort(1) is None)
-    r = handle_message(1, 5, "新玩家", "下注50")
-    check("无局号下注回复裸名单", r == "新玩家下注50", f"{r!r}")
+    r = handle_message(1, 5, "新玩家", "50")
+    check("无局号纯数字下注回复裸名单", r == "新玩家下注50", f"{r!r}")
 
     print(f"rule_dcxx selftest OK ({ok} checks)")
     return 0

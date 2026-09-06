@@ -1,7 +1,8 @@
 """第 4.5 个 Tab「积分审批」：群内上分/下分申请 → 审批 → 同步总后台。
 
 链路：
-  群成员发「上分100」/「下分100」→ 插件（独立于玩法开关）POST 本机回调 /play/approve
+  群成员发「上100」/「下100」（旧词「上分100/下分100」兼容）→ 插件（独立于玩法开关）
+  POST 本机回调 /play/approve
   → play_tab 回调服务 → MainWindow 挂接 → 本页 push() 入队 → 表格展示「待审批」
   → 操作员选中点「通过」→ 调总后台 /api/open/points/up|down（带 executor_token，
   bizNo 幂等）→ 状态改为 已通过/已拒绝/失败(原因)
@@ -53,7 +54,7 @@ class ApprovalTab(ctk.CTkFrame):
         ctk.CTkButton(row, text="拒绝", width=80, fg_color="#c0392b", hover_color="#a93226",
                       command=self._reject_selected).pack(side="left", padx=4)
         ctk.CTkButton(row, text="清空已处理", width=100, command=self._clear_done).pack(side="left", padx=4)
-        self.lbl_info = ctk.CTkLabel(row, text="群成员发「上分100/下分100」即可在此看到申请",
+        self.lbl_info = ctk.CTkLabel(row, text="群成员发「上100/下100」即可在此看到申请",
                                      text_color="gray", font=ctk.CTkFont(size=11))
         self.lbl_info.pack(side="left", padx=10)
 

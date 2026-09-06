@@ -3,7 +3,8 @@
 流程：
   1. 管理员「开始本局」（GUI 按钮；也可群内发「开始游戏」）→ 进入下注期
   2. 玩家发「抢庄」（兼容旧词「抢老大」）→ 先到先得成为**庄家（擂主）**，发红包前不能再换
-  3. 其余玩家发「下注N」→ 押注挑战庄家（累计名单回复，逐人追加；庄家本人不用下注）
+  3. 其余玩家直接发数字（如 500）即押注挑战庄家（旧词「下注500」仍兼容；累计名单
+     回复，逐人追加；庄家本人不用下注）
   4. 管理员发红包，参与玩家抢红包 → 每人点数 = 红包金额各位数之和
   5. 红包领完 / 挑战者都已领 → 自动结算（settle_redpacket）→ @全体 播报逐人结果
 
@@ -41,15 +42,27 @@ def _round_head(group_id):
     return f"本局 {rid}，" if rid else ""
 
 
+def _register_bet(group_id, qq, nickname, amount):
+    """登记一笔挑战押注并返回回复文本（成功=庄家+累计名单；失败=原因）。"""
+    if amount <= 0:
+        return "下注金额需大于0"
+    if qq in BETS:
+        return "你已经押注过了，等待开奖"
+    BETS[qq] = {"nickname": nickname or f"用户{qq}", "amount": amount, "score": 0}
+    parts = "，".join(f"{b['nickname']}押注{b['amount']}" for b in BETS.values())
+    return (f"{_round_head(group_id)}庄家 {BOSS['nickname']}，当前押注：{parts}"
+            if parts else f"{_round_head(group_id)}庄家 {BOSS['nickname']} 等挑战者押注")
+
+
 def handle_message(group_id, qq, nickname, text):
     t = (text or "").strip()
     qq = str(qq)
     if t in ("开始游戏", "开局"):
         _reset(int(group_id))
         PHASE["mode"] = "betting"
-        return ("游戏开始！玩法：抢庄。发「抢庄」当庄家，其余玩家发「下注N」押注，"
-                "管理员发红包比点数：点数小的押注输给庄家，点数大的赢得押注（1:1），"
-                "没抢红包按 0 必输光。")
+        return ("游戏开始！玩法：抢庄。发「抢庄」当庄家，其余玩家直接发数字押注"
+                "（如 500），管理员发红包比点数：点数小的押注输给庄家，"
+                "点数大的赢得押注（1:1），没抢红包按 0 必输光。")
     if t in ("抢庄", "抢老大"):
         if PHASE["mode"] != "betting":
             return "当前未开局，请等管理员开始本局"
@@ -57,7 +70,7 @@ def handle_message(group_id, qq, nickname, text):
             return f"{BOSS['nickname']} 已是本局庄家，不能重复抢庄（点数输赢按他算）"
         BOSS["qq"] = qq
         BOSS["nickname"] = nickname or f"用户{qq}"
-        return (f"🎤 {BOSS['nickname']} 抢到庄家！其余玩家发「下注N」押注挑战，"
+        return (f"🎤 {BOSS['nickname']} 抢到庄家！其余玩家直接发数字押注挑战，"
                 "管理员发红包定点数：比庄家小的押注输，比庄家大的赢得押注"
                 "（没抢红包按 0 必输光）")
     m = re.match(r"^下注\s*(\d+)$", t)
@@ -68,15 +81,14 @@ def handle_message(group_id, qq, nickname, text):
             return "还没人抢庄：发「抢庄」先当庄家，再下注挑战"
         if qq == BOSS["qq"]:
             return "你是本局庄家，坐庄不用下注，发红包开打即可"
-        if qq in BETS:
-            return "你已经押注过了，等待开奖"
-        amount = int(m.group(1))
-        if amount <= 0:
-            return "下注金额需大于0"
-        BETS[qq] = {"nickname": nickname or f"用户{qq}", "amount": amount, "score": 0}
-        parts = "，".join(f"{b['nickname']}押注{b['amount']}" for b in BETS.values())
-        return (f"{_round_head(group_id)}庄家 {BOSS['nickname']}，当前押注：{parts}"
-                if parts else f"{_round_head(group_id)}庄家 {BOSS['nickname']} 等挑战者押注")
+        return _register_bet(group_id, qq, nickname, int(m.group(1)))
+    if t.isdigit():
+        # 纯数字 = 直接押注（下注期有效）；不在下注期或无庄家时当作闲聊静默，不打扰报数字
+        if PHASE["mode"] != "betting" or not BOSS.get("qq"):
+            return None
+        if qq == BOSS["qq"]:
+            return "你是本局庄家，坐庄不用下注，发红包开打即可"
+        return _register_bet(group_id, qq, nickname, int(t))
     return None
 
 
@@ -112,6 +124,11 @@ def bettor_qqs(group_id):
     return list(BETS.keys())
 
 
+def betting_open(group_id):
+    """当前是否处于可下注期（agent 下注预检问询：只有下注期才把纯数字拦下校验）。"""
+    return PHASE["mode"] == "betting"
+
+
 def handle_redpacket(group_id, qq, nickname, amount):
     """领取事件：记点数并即时@回复领取结果（结算在 settle_redpacket）。"""
     if PHASE["mode"] != "betting":
@@ -127,7 +144,7 @@ def handle_redpacket(group_id, qq, nickname, amount):
         BETS[qq]["score"] = pts
         return (f"抢到{a:.2f}元，点数{pts}（押注{BETS[qq]['amount']}，"
                 "本包领完自动开奖结算）", 0)
-    return (f"抢到{a:.2f}元，点数{pts}（未押注不计分，发「下注N」挑战庄家）", 0)
+    return (f"抢到{a:.2f}元，点数{pts}（未押注不计分，直接发数字押注挑战庄家）", 0)
 
 
 def settle_redpacket(group_id, claims, rate_permille=20):
@@ -211,15 +228,18 @@ def _selftest() -> int:
     check("甲抢到庄家", r and "甲" in r and "抢到庄家" in r and BOSS["qq"] == "100", f"{r!r}")
     r = handle_message(1, 200, "乙", "抢老大")  # 旧词兼容
     check("已有庄家不能再抢（旧词也提示）", r and "已是本局庄家" in r and BOSS["qq"] == "100", f"{r!r}")
-    # 庄家本人不用下注；挑战者押注累计名单
-    r = handle_message(1, 100, "甲", "下注500")
-    check("庄家下注被拒", r and "坐庄不用下注" in r, f"{r!r}")
-    r = handle_message(1, 200, "乙", "下注100")
-    check("乙押注100 回复带局号+庄家", r == "本局 hongbaojifen_00000500，庄家 甲，当前押注：乙押注100", f"{r!r}")
+    # 庄家本人不用下注；挑战者直接发数字押注（旧词「下注N」兼容）
+    r = handle_message(1, 100, "甲", "500")
+    check("庄家发数字下注被拒", r and "坐庄不用下注" in r, f"{r!r}")
+    r = handle_message(1, 100, "甲", "下注888")  # 旧词
+    check("庄家旧词下注也被拒", r and "坐庄不用下注" in r, f"{r!r}")
+    r = handle_message(1, 200, "乙", "100")
+    check("乙发数字100押注 回复带局号+庄家", r == "本局 hongbaojifen_00000500，庄家 甲，当前押注：乙押注100", f"{r!r}")
     r = handle_message(1, 300, "丙", "下注200")
-    check("丙押注200 累计名单", r == "本局 hongbaojifen_00000500，庄家 甲，当前押注：乙押注100，丙押注200", f"{r!r}")
+    check("丙旧词下注200 累计名单", r == "本局 hongbaojifen_00000500，庄家 甲，当前押注：乙押注100，丙押注200", f"{r!r}")
     check("bettor_qqs 只含挑战者（不含庄家）", set(map(str, bettor_qqs(1))) == {"200", "300"},
          str(bettor_qqs(1)))
+    check("下注期 betting_open=True", betting_open(1) is True)
     # 抢包即时记点：庄家与挑战者不同提示；路人提示不计分
     r, d = handle_redpacket(1, 100, "甲", 0.08)   # 甲 点8
     check("庄家抢包回复点数", d == 0 and r and "你是庄家" in r, f"{r!r},{d}")
@@ -241,9 +261,11 @@ def _selftest() -> int:
     _reset()
     handle_round_start(1)
     handle_message(1, 100, "甲", "抢庄")
-    handle_message(1, 200, "乙", "下注100")
-    handle_message(1, 300, "丙", "下注200")
-    handle_message(1, 400, "丁", "下注300")
+    r = handle_message(1, 200, "乙", "100")
+    check("平点局 乙发数字100 回复裸名单（无局号不带头）",
+         r == "庄家 甲，当前押注：乙押注100", f"{r!r}")
+    handle_message(1, 300, "丙", "200")
+    handle_message(1, 400, "丁", "300")
     res = settle_redpacket(1, [{"qq": "100", "amount": 0.15}, {"qq": "200", "amount": 1.11},
                                {"qq": "300", "amount": 0.15}, {"qq": "400", "amount": 0.91}])
     ev = get(res)
@@ -257,7 +279,7 @@ def _selftest() -> int:
     _reset()
     handle_round_start(1)
     handle_message(1, 100, "甲", "抢庄")
-    handle_message(1, 200, "乙", "下注100")
+    handle_message(1, 200, "乙", "100")
     res = settle_redpacket(1, [{"qq": "100", "amount": 0.15}])  # 只有庄家领了，乙没抢
     ev = get(res)
     check("乙没抢红包 输100给庄家", ev["200"]["delta"] == -100
@@ -267,8 +289,8 @@ def _selftest() -> int:
     _reset()
     handle_round_start(1)
     handle_message(1, 100, "甲", "抢庄")
-    handle_message(1, 200, "乙", "下注100")
-    handle_message(1, 300, "丙", "下注200")
+    handle_message(1, 200, "乙", "100")
+    handle_message(1, 300, "丙", "200")
     res = settle_redpacket(1, [{"qq": "300", "amount": 1.11}])  # 甲、乙都没抢，丙抢了 3 点
     ev = get(res)
     check("庄家0分+乙没抢：乙输100", ev["200"]["delta"] == -100, str(ev["200"]))
@@ -279,16 +301,20 @@ def _selftest() -> int:
     _reset()
     handle_round_start(1)
     r = handle_message(1, 200, "乙", "下注100")
-    check("无庄家押注被拒", r and "还没人抢庄" in r, f"{r!r}")
+    check("无庄家旧词押注被拒", r and "还没人抢庄" in r, f"{r!r}")
+    r = handle_message(1, 200, "乙", "88")
+    check("无庄家纯数字当作闲聊静默", r is None and "200" not in BETS, f"{r!r}")
+    check("无庄家时 betting_open 仍 True（下注期已开）", betting_open(1) is True)
     ab = handle_round_abort(1)
     check("空局终止返回 None", ab is None, f"{ab!r}")
     handle_message(1, 200, "乙", "抢庄")
-    handle_message(1, 300, "丙", "下注50")
+    handle_message(1, 300, "丙", "50")
     ab = handle_round_abort(1)
     check("下注期终止返回公告", ab and "已终止" in ab and "积分已退还" in ab and "不抽水" in ab, f"{ab!r}")
     check("终止只问询不动状态", PHASE["mode"] == "betting" and len(BETS) == 1, str(PHASE))
     handle_round_end(1)
     check("收尾清状态回待机", PHASE["mode"] == "idle" and not BOSS.get("qq") and not BETS)
+    check("待机期 betting_open=False", betting_open(1) is False)
     check("待机期终止返回 None", handle_round_abort(1) is None)
     r, d = handle_redpacket(1, 200, "乙", 1.11)
     check("待机期抢包不回复", r is None and d == 0)
