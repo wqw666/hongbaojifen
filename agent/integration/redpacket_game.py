@@ -1,19 +1,21 @@
 """红包计分玩法：管理员发红包 → 成员领取按玩法规则计分 → 领完 @全体 结算。
 
-积分规则由**总后台玩法文件**决定（handle_redpacket 协议，见 play_rules/rule_redpacket.py），
+积分规则由**总后台玩法文件**决定（handle_redpacket 协议，见 play_rules/rule_fuhe.py），
 本模块只做玩法无关的编排：
 - 只有群主/管理员发的红包参与玩法（get_admin_qqs 注入校验）
 - 每个领取人调用 rule_handler(group_id, qq, nickname, amount) -> (回复|None, 积分)
-  有回复则立即 @领取人（send_reply 注入）；无回复且无积分变动则跳过该领取
+  有回复则立即 @领取人（send_reply 注入）；显式空串回执 = 记账但不发消息（静默领取）；
+  无回复（None）且无积分变动则跳过该领取（不记录）
 - 一局 = 一个红包（bill_no）。领完判定：插件汇总 recv_num>=total_num，
   或领取人数 >= 总份数，或领取人数 >= 群人数 → 自动结算：
     1) settle 上报总后台（round_id=bill_no 幂等，逐条入账）
     2) send_announce @全体 播报：用户X 领取A元，获得B积分 …
 - 机器人自己领的不计；同人同包幂等（去重）；结算失败事件保留在 pending，
   下次事件到达或 retry_pending() 自动重试；上报成功后才播报（保证「说出口=已入账」）
-- 开始本局模式（announced）：红包领完**或所有下注者均已领取**（玩法可选
-  bettor_qqs(group_id) 提供下注者名单，get_bettors 注入）→ 立即 @全体「游戏结束」→
-  10 秒后玩法批量结算（个人开奖回复）→ 再 10 秒后 @全体播报结算详情并上报结束本局
+- 开始本局模式（announced）= **手动结算驱动**：红包事件记入当前局，只认第 1 个管理员
+  红包（D6）；封盘后红包份数 < 需开奖人数 → 立即作废（A3，积分未扣）；「结算」由 GUI
+  按钮调 settle_round_now（玩法批量结算 → 上报成功才 @全体 播报并清局）；「作废本局」
+  调 void_round（@全体 公告 → 关局，不上报不结算）
 - 下注期手动「结束本局」= **提前终止**：玩法可选 handle_round_abort(group_id)（query_abort
   注入）返回终止公告文本 → 只 @全体 播报「本局已终止（积分已退还，不抽水）」并作废本局、
   不上报（玩法下注期从未扣分，退还即无操作）；返回 None → 走正常结算上报收尾
@@ -27,10 +29,6 @@ from datetime import datetime
 from typing import Any, Callable
 
 from .backend_client import ExecutorBanned, OperatorDisabled
-
-# 本局模式收尾节奏：领完/下注者都领 → 「游戏结束」 → SETTLE 秒后结算 → DETAIL 秒后播报详情
-STAGE_SETTLE_SEC = 10
-STAGE_DETAIL_SEC = 10
 
 
 def _now() -> str:
@@ -58,6 +56,7 @@ class RedPacketGame:
         query_abort: Callable[[str], str | None] | None = None,
         on_log: Callable[[str], None] | None = None,
         on_round_end: Callable[[str], None] | None = None,
+        claim_need: Callable[[str], int] | None = None,
     ) -> None:
         self.play_name = play_name
         self.play_id = play_id
@@ -71,6 +70,7 @@ class RedPacketGame:
         self.query_abort = query_abort            # (group_id) -> 终止公告文本|None（下注期手动「结束本局」问询）
         self.on_log = on_log                      # (msg) 日志回调
         self.on_round_end = on_round_end          # (group_id) 本局结束回调（自动收尾/作废时也通知）
+        self._claim_need = claim_need             # (group_id) -> 本局需开奖人数（A3 作废/可结算判定）
         self.rounds: dict[str, dict] = {}         # bill_no -> 局（未点「开始本局」的传统模式）
         self.pending: dict[str, dict] = {}        # 结算失败待重试
         self.last: dict[str, dict] = {}           # bill_no/round_id -> {ok, error, time}
@@ -123,10 +123,25 @@ class RedPacketGame:
         key = bill
         ann = self.announced.get(gid)
         if ann is not None:
-            # 开始本局模式：红包领取记入当前局（不收完红包 = 不立即结算，按阶段收尾）
-            if ann.get("ended") or ann.get("claim_done"):
-                return  # 已收尾/已进入收尾计时：后续红包事件不再受理
+            # 开始本局模式（复合玩法）：红包事件记入当前局；只认第 1 个管理员红包（D6）
+            if ann.get("ended"):
+                return  # 已收尾：后续红包事件不再受理
+            fb = ann.get("first_bill")
+            if fb is None:
+                ann["first_bill"] = {"bill": bill, "total_num": total_num, "recv_num": recv_num}
+            elif str(fb.get("bill")) != bill:
+                self._log(f"[红包玩法] 群{gid} 只认第 1 个红包（单号 {fb['bill'][:12]}…），"
+                          f"第 2 个红包单号 {bill[:12]}… 忽略不计入")
+                ann.setdefault("bills", set()).add(bill)  # 单号进护栏：局收尾后补推也不落 legacy
+                return  # 不接受第 2 个管理员红包
+            else:
+                fb["total_num"] = max(int(fb.get("total_num") or 0), total_num)
+                fb["recv_num"] = max(int(fb.get("recv_num") or 0), recv_num)
             ann.setdefault("bills", set()).add(bill)
+            # 封盘后不再覆盖费率：封盘公告 fee 与结算 fee 同口径（正常流=先封盘后红包，
+            # 此时 sealed 已置 True；首红包先于封盘的异常流仍会写入，封盘时 GUI 会再覆写一次）
+            if int(payload.get("rate_permille") or 0) > 0 and not ann.get("sealed"):
+                ann["rate_permille"] = int(payload["rate_permille"])
             for c in payload.get("claims") or []:
                 qq = str(c.get("qq") or "")
                 if not qq or qq == self.self_uin:
@@ -152,7 +167,7 @@ class RedPacketGame:
                     ann["events"].append({
                         "qq": qq, "nickname": name,
                         "msg": f"领取红包 {amount:.2f} 元",
-                        "reply": str(reply_text or f"获得{int(delta or 0)}积分"),
+                        "reply": str(reply_text or ""),
                         "delta": int(delta or 0), "ts": ts,
                     })
                 if reply_text and self.send_reply:
@@ -160,11 +175,10 @@ class RedPacketGame:
                         self.send_reply(gid, qq, reply_text)
                     except Exception:
                         pass
-                self._log(f"[红包玩法] 群{gid} {name}({qq}) 领取{amount:.2f}元 计分 +{int(delta or 0)}（本局 {ann['round_id']}）")
-            # 领完判定：红包全领完 或 下注者均已领取 → 立即 @全体「游戏结束」→ 计时结算
-            reason = self._claim_end_reason(gid, ann, total_num, recv_num)
-            if reason:
-                self._schedule_round_end(gid, ann, payload, reason)
+                self._log(f"[红包玩法] 群{gid} {name}({qq}) 领取{amount:.2f}元 计分 +{int(delta or 0)}"
+                          f"（本局 {ann['round_id']}）")
+            # A3 作废判定 + 可结算状态（不再自动收尾；结算由 GUI「结算」按钮手动驱动）
+            self._evaluate_round(gid, ann, payload)
             return
 
         r = self.rounds.get(key)
@@ -225,7 +239,7 @@ class RedPacketGame:
         if full and r["claims"] and not r["ended"]:
             self._finalize(r)
 
-    # ---------- 本局模式：领完判定与分阶段收尾 ----------
+    # ---------- 本局模式：下注者名单与提前终止问询 ----------
 
     def _current_bettors(self, gid: str) -> set[str]:
         """当前局已下注者 QQ 集合（玩法可选 bettor_qqs(group_id) 提供；失败/未提供返回空）。"""
@@ -247,48 +261,6 @@ class RedPacketGame:
             return self.query_abort(str(gid))
         except Exception:  # noqa: BLE001
             return None
-
-    def _claim_end_reason(self, gid: str, ann: dict, total_num: int, recv_num: int) -> str:
-        """领完/可收尾原因：'' = 未到时机；否则返回原因文案。
-
-        三种情况都算「红包领完」：recv>=total（全领完）、领取人数 >= 群人数兜底，
-        或玩法提供下注者名单且所有下注者都已领到（余量无所谓，如大吃小）。"""
-        if total_num and recv_num and recv_num >= total_num:
-            return f"红包已领完（{recv_num}/{total_num}）"
-        mc2 = self.group_member_count.get(gid, 0)
-        if mc2 and len(ann["claims"]) >= mc2:
-            return f"领取人数已达群人数（{mc2}）"
-        bettors = self._current_bettors(gid)
-        if bettors and bettors <= set(ann["claims"]):
-            return "所有下注玩家均已领取红包"
-        return ""
-
-    def _schedule_round_end(self, gid: str, ann: dict, payload: dict, reason: str) -> None:
-        """红包领完/下注者都领 → 立即 @全体「游戏结束」，随后分阶段收尾。
-
-        阶段：t0 游戏结束 → t0+STAGE_SETTLE_SEC 玩法批量结算（个人开奖回复）
-             → t0+SETTLE+DETAIL 秒 @全体播报结算详情并上报结束本局（poll_auto_end 驱动）。"""
-        ann["claim_done"] = True
-        ann["last_payload"] = payload  # 结算阶段用这份领取明细跑玩法批量结算
-        now = time.time()
-        ann["settle_at"] = now + STAGE_SETTLE_SEC
-        ann["detail_at"] = now + STAGE_SETTLE_SEC + STAGE_DETAIL_SEC
-        text = (f"游戏结束（局号 {ann['round_id']}）：{reason}，"
-                f"{STAGE_SETTLE_SEC} 秒后结算，结算后公布详情")
-        if self.send_announce:
-            try:
-                self.send_announce(gid, text)
-            except Exception:  # noqa: BLE001
-                pass
-        self._log(f"[红包玩法] 群{gid} 收尾计时开始：{reason}，"
-                  f"{STAGE_SETTLE_SEC}s 后结算、{STAGE_SETTLE_SEC + STAGE_DETAIL_SEC}s 后播报详情")
-
-    def _batch_settle_once(self, gid: str, ann: dict) -> None:
-        """收尾结算阶段执行一次玩法批量结算（幂等：batch_done 置位防重）。"""
-        if ann.get("batch_done"):
-            return
-        ann["batch_done"] = True
-        self._apply_batch_settle(gid, ann, ann.get("last_payload") or {})
 
     # ---------- 结算与播报 ----------
 
@@ -343,6 +315,8 @@ class RedPacketGame:
         self.announced[gid] = {
             "group_id": gid, "round_id": str(round_id), "play_name": play_name,
             "events": [], "claims": {}, "ended": False,
+            "sealed": False, "first_bill": None, "ready_to_settle": False,
+            "rate_permille": 20, "batch_applied": False, "settle_results": [],
         }
         self._log(f"[红包玩法] 群{gid} 本局开始 局号 {round_id}")
 
@@ -390,9 +364,6 @@ class RedPacketGame:
                 self._log(f"[红包玩法] 群{gid} 本局 {rid} 已终止（积分已退还，不抽水），不上报不结算")
                 self._notify_round_end(gid)
                 return
-        # 自动收尾途中被手动「结束本局」：先补跑未执行的玩法批量结算（开奖回复/详情文本）
-        if ann.get("claim_done") and not ann.get("batch_done"):
-            self._batch_settle_once(gid, ann)
         ann["ended"] = True
         self._close_round_bills(ann)
         events = ann["events"]
@@ -418,6 +389,152 @@ class RedPacketGame:
         self._log(f"[红包玩法] 本局 {ann['round_id']} 已结算上报并播报总结")
         self._notify_round_end(gid)
 
+    def _need_claimers(self, gid: str) -> int:
+        """本局需开奖人数（玩法 claim_need；缺省=已下注者数）。"""
+        if self._claim_need:
+            try:
+                n = int(self._claim_need(str(gid)) or 0)
+                if n > 0:
+                    return n
+            except Exception:  # noqa: BLE001
+                pass
+        return len(self._current_bettors(gid))
+
+    def _evaluate_round(self, gid: str, ann: dict, payload: dict | None = None) -> None:
+        """红包事件后 / 封盘时的本局状态评估（A3）：
+        1) 封盘后已见首红包且份数 < 需开奖人数 → 立即作废（不必等领完）并播报；
+        2) 封盘后领完（recv>=total）或参与领取人数>=需开奖人数 → ready_to_settle=True。"""
+        fb = ann.get("first_bill")
+        total = int((fb or {}).get("total_num") or 0)
+        if fb and ann.get("sealed") and total and total < self._need_claimers(gid):
+            need = self._need_claimers(gid)
+            self._log(f"[红包玩法] 群{gid} 红包 {total} 份 < 需开奖 {need} 人 → 本局作废（积分未扣）")
+            text = (f"⚠ 管理员红包份数（{total}）少于本局需开奖人数（{need}），"
+                    f"本局作废（积分未扣），请重新开局。")
+            self.void_round(gid, text)
+            return
+        if not ann.get("sealed"):
+            return
+        need = self._need_claimers(gid)
+        recv = int((fb or {}).get("recv_num") or 0)
+        ready = bool(fb and need > 0 and
+                     ((total and recv >= total) or len(ann["claims"]) >= need))
+        if ready and not ann.get("ready_to_settle"):
+            ann["ready_to_settle"] = True
+            self._log(f"[红包玩法] 群{gid} 红包已领完（{recv}/{total}）→ 可点「结算」")
+
+    def seal_round(self, group_id: str) -> None:
+        """「停止下注」成功后调用：置 sealed 并做 A3 首红包不足立即作废判定。幂等。"""
+        gid = str(group_id)
+        ann = self.announced.get(gid)
+        if ann is None or ann.get("sealed"):
+            return
+        ann["sealed"] = True
+        self._evaluate_round(gid, ann)
+        if gid in self.announced:
+            self._log(f"[红包玩法] 群{gid} 已封盘（等红包领完 → 手动「结算」）")
+
+    def set_claim_amount(self, group_id: str, qq: str, amount: float,
+                         nickname: str = "") -> str | None:
+        """表格改/补开奖金额（改红包金额，不改下注）：0.01~0.99 两位小数校验。
+
+        已抢者改值（留日志）；未抢的下注者/庄家补值视同抢到该金额（edited=True 标记，
+        settle_round_now 用最新值结算）。返回错误文本或 None。"""
+        gid = str(group_id)
+        ann = self.announced.get(gid)
+        if ann is None or ann.get("ended"):
+            return "当前群没有进行中的本局"
+        try:
+            amt = float(amount or 0)
+        except (TypeError, ValueError):
+            return "金额必须是数字"
+        if not (0.01 <= amt <= 0.99):
+            return "金额须在 0.01~0.99 之间（两位小数）"
+        qq_s = str(qq)
+        old = None
+        c = ann["claims"].get(qq_s)
+        if c is not None:
+            old = float(c.get("amount") or 0)
+            c["amount"] = round(amt, 2)
+            c["edited"] = True
+            if nickname:
+                c["name"] = nickname
+        else:
+            ann["claims"][qq_s] = {"qq": qq_s, "name": nickname or f"用户{qq_s}",
+                                   "amount": round(amt, 2), "delta": 0,
+                                   "reply": "", "edited": True}
+        self._log(f"[红包玩法] 群{gid} 管理员改开奖：{qq_s} "
+                  + (f"{old:.2f}→{amt:.2f}" if old is not None else f"补值 {amt:.2f}"))
+        return None
+
+    def settle_round_now(self, group_id: str) -> dict:
+        """「结算」：合并表格改值/补值的 claims → 玩法批量结算（batch_applied 防重）→ 上报。
+
+        上报成功才 @全体 播报总结并清局（说出口=已入账）；失败 ann 保留（ended 回滚）、
+        进 pending_announced 待「重试未上报」。返回 {ok:True, results} 或 {ok:False, error}。
+        results = 批量结算产出的 [{qq,nickname,delta}]（含 0/平局行），供 GUI 表格展示。"""
+        gid = str(group_id)
+        ann = self.announced.get(gid)
+        if ann is None:
+            return {"ok": False, "error": "当前群没有进行中的本局"}
+        if ann.get("ended"):
+            return {"ok": False, "error": "本局已结束/收尾中，请勿重复结算"}
+        ann["ended"] = True  # 防重入；任一步失败回滚
+        if not ann.get("batch_applied"):
+            claims = [{"qq": c["qq"], "nickname": c.get("name") or "",
+                       "amount": c.get("amount") or 0}
+                      for c in ann["claims"].values()]
+            n0 = len(ann["events"])
+            self._apply_batch_settle(gid, ann, claims)
+            results = [{"qq": str(ev.get("qq") or ""), "nickname": str(ev.get("nickname") or ""),
+                        "delta": int(ev.get("delta") or 0)}
+                       for ev in ann["events"][n0:] if str(ev.get("qq") or "")]
+            ann["settle_results"] = results
+            if not results:
+                ann["ended"] = False
+                return {"ok": False, "error": "玩法结算无产出（先发红包开奖，或双击表格补开奖金额）"}
+            ann["batch_applied"] = True
+        if not self.settle:
+            ann["ended"] = False
+            return {"ok": False, "error": "未配置总后台上报"}
+        try:
+            self.settle(ann["round_id"], gid, ann["events"])
+        except (ExecutorBanned, OperatorDisabled):
+            ann["ended"] = False
+            raise
+        except Exception as e:  # noqa: BLE001 — 网络/参数错误保留待重试
+            ann["ended"] = False
+            self.pending_announced[ann["round_id"]] = ann
+            self.last[ann["round_id"]] = {"ok": False, "error": str(e), "time": _now()}
+            self._log(f"[红包玩法] 本局结算上报失败（保留待重试）: {e}")
+            return {"ok": False, "error": str(e)}
+        self.pending_announced.pop(ann["round_id"], None)
+        self.last[ann["round_id"]] = {"ok": True, "error": "", "time": _now()}
+        self._close_round_bills(ann)
+        self._announce_round_summary(ann)
+        del self.announced[gid]
+        self._log(f"[红包玩法] 本局 {ann['round_id']} 已结算上报并播报总结")
+        self._notify_round_end(gid)
+        return {"ok": True, "results": ann.get("settle_results") or []}
+
+    def void_round(self, group_id: str, announce_text: str | None = None) -> None:
+        """作废本局（红包不足/庄家余额不足/手动）：@全体 公告 → 关局，不上报不结算。
+
+        同时清掉同局待重试记录（若有）。幂等：本局不在 announced 则 no-op。"""
+        gid = str(group_id)
+        ann = self.announced.pop(gid, None)
+        if ann is None:
+            return
+        if announce_text and self.send_announce:
+            try:
+                self.send_announce(gid, str(announce_text))
+            except Exception:  # noqa: BLE001
+                pass
+        self.pending_announced.pop(ann.get("round_id") or "", None)
+        self._close_round_bills(ann)
+        self._log(f"[红包玩法] 群{gid} 本局 {ann.get('round_id')} 已作废（不上报不结算）")
+        self._notify_round_end(gid)
+
     def _announce_round_summary(self, ann: dict) -> None:
         """@全体 总结语：领取人逐行 + 统计。"""
         claims = list(ann["claims"].values())
@@ -441,13 +558,16 @@ class RedPacketGame:
         except Exception:
             pass
 
-    def _apply_batch_settle(self, gid: str, ann: dict, payload: dict) -> None:
-        """调用玩法 settle_redpacket 批量结算：应用多玩家事件 + 保存播报文本。"""
+    def _apply_batch_settle(self, gid: str, ann: dict, claims: list[dict]) -> None:
+        """调用玩法 settle_redpacket 批量结算：应用多玩家事件 + 发送个人开奖回复 + 存播报文本。
+
+        claims: 本局最终领取明细（已含表格改值/补值；未领取者由玩法按 0 处理）。
+        rate 取 ann['rate_permille']（由红包事件/GUI 封盘写入，见 Task 4）。"""
         if not self.rule_handler_batch:
             return
-        rate = int(payload.get("rate_permille") or 20)
+        rate = int(ann.get("rate_permille") or 20)
         try:
-            result = self.rule_handler_batch(gid, list(payload.get("claims") or []), rate)
+            result = self.rule_handler_batch(gid, list(claims or []), rate)
         except Exception as e:  # noqa: BLE001
             self._log(f"[红包玩法] 批量结算异常: {e}")
             return
@@ -487,25 +607,9 @@ class RedPacketGame:
         return _now_full()
 
     def poll_auto_end(self) -> None:
-        """worker 定时调用：驱动分阶段收尾（游戏结束 → +SETTLE秒 批量结算 → +DETAIL秒 详情并收局）。
-
-        阶段 1（settle_at）：玩法批量结算——大吃小等开奖，个人「赢/亏」回复随结算发出；
-        阶段 2（detail_at）：上报本局并 @全体 播报结算详情（玩法自定义 announce 文本优先）。"""
-        for gid, ann in list(self.announced.items()):
-            if ann.get("ended") or not ann.get("claim_done"):
-                continue
-            now = time.time()
-            if not ann.get("batch_done") and now >= (ann.get("settle_at") or now + 1):
-                self._batch_settle_once(gid, ann)
-                self._log(f"[红包玩法] 群{gid} 红包结算完成（{ann['round_id']}），"
-                          f"{max(0, int((ann.get('detail_at') or 0) - now))}s 后播报详情")
-            if now >= (ann.get("detail_at") or 0):
-                try:
-                    self.end_round(gid)
-                except (ExecutorBanned, OperatorDisabled):
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    self._log(f"[红包玩法] 自动结束本局异常: {e}")
+        """worker 每 0.5s 调用点：分阶段自动收尾已废弃（改为 GUI「结算」按钮手动驱动）。
+        保留空壳兼容调用方；无自动行为。"""
+        return
 
     def cancel_rounds(self) -> int:
         """作废所有进行中的本局（终止连续模式时调用：数据不上报、不播报）。"""
@@ -564,6 +668,9 @@ class RedPacketGame:
             del self.pending_announced[rid]
             self.last[rid] = {"ok": True, "error": "", "time": _now()}
             self._announce_round_summary(ann)
+            self.announced.pop(str(ann.get("group_id") or ""), None)  # 防同局残留重复结算
+            self._notify_round_end(str(ann.get("group_id") or ""))
+            self._close_round_bills(ann)  # 首红包单号进护栏：插件补推不再落 legacy 二次入账
             self._log(f"[红包玩法] 本局补结算成功 {rid}")
 
     def pending_count(self) -> int:
@@ -571,8 +678,9 @@ class RedPacketGame:
 
 
 def _selftest() -> int:
-    """单元自测：规则注入、去重、管理员过滤、领完结算与播报。"""
+    """单元自测：手动结算驱动 + 首红包不足作废 + 只认首红包 + 表格改值/补值 + 幂等/重试。"""
     ok = 0
+
     def check(name: str, cond: bool, detail: str = "") -> None:
         nonlocal ok
         ok += 1
@@ -580,184 +688,140 @@ def _selftest() -> int:
             raise SystemExit(f"FAIL: {name} {detail}")
 
     def rule(gid, qq, nickname, amount):
-        """模拟 rule_redpacket.py：积分=金额各位数之和。"""
-        a = float(amount or 0)
-        if a <= 0:
-            return None, 0
-        s = f"{a:.2f}".replace(".", "")
-        points = sum(int(ch) for ch in s if ch.isdigit())
-        return f"领取{a:.2f}元，获得{points}积分", points
+        """模拟玩法 handle_redpacket 回执：金额合法给提示，delta 0。"""
+        try:
+            amt = float(amount or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        if not (0 < amt <= 0.99):
+            return "金额异常", 0
+        return f"已记录 {amt:.2f} 元", 0
 
-    replies: list[tuple] = []
-    announces: list[tuple] = []
-    settled: list[tuple] = []
-    logs: list[str] = []
+    def batch_rule(gid, claims, rate):
+        """模拟玩法 settle_redpacket：delta = 点数（改值 0.77 → 4 可断言参与）。"""
+        events = []
+        for c in claims or []:
+            try:
+                amt = float(c.get("amount") or 0)
+            except (TypeError, ValueError):
+                amt = 0.0
+            pts = 0
+            if 0 < amt <= 0.99:
+                s = f"{amt:.2f}"
+                pts = (int(s[2]) + int(s[3])) % 10
+            events.append({"qq": str(c["qq"]), "nickname": str(c.get("nickname") or c["qq"]),
+                           "reply": f"结算点{pts}", "delta": pts})
+        return {"events": events, "announce": "结算详情（模拟）"}
 
-    def send_reply(g, q, t):
-        replies.append((g, q, t))
-    def send_announce(g, t):
-        announces.append((g, t))
+    replies, announces, settled, logs, ended = [], [], [], [], []
+    failed_once = {"cnt": 0}
+
     def settle(rid, g, events):
+        if failed_once["cnt"] == 0:  # 第一次上报模拟失败 → 测 pending 重试
+            failed_once["cnt"] += 1
+            raise RuntimeError("模拟网络失败")
         settled.append((rid, g, events))
-    admins = {"414744169": {"909736102"}}  # 群主
 
-    game = RedPacketGame(play_name="红包玩法", play_id=2,
-                         rule_handler=rule, send_reply=send_reply,
-                         send_announce=send_announce, settle=settle,
+    game = RedPacketGame(play_name="复合玩法", play_id=77,
+                         rule_handler=rule, rule_handler_batch=batch_rule,
+                         send_reply=lambda g, q, t: replies.append((g, q, t)),
+                         send_announce=lambda g, t: announces.append((g, t)),
+                         settle=settle,
                          get_admin_qqs=lambda g: admins.get(g, set()),
-                         on_log=logs.append)
-    # 普通成员发的红包 → 忽略
-    game.handle_claim({"group_id": "414744169", "bill_no": "B1", "sender_uin": "999",
-                       "total_num": 2, "recv_num": 2,
-                       "claims": [{"qq": "111", "name": "甲", "amount": 1.11}]})
-    check("非管理员红包忽略", not game.rounds and not replies)
-    check("跳过有日志", any("非管理员" in l for l in logs))
+                         get_bettors=lambda g: {"111", "222"},
+                         claim_need=lambda g: 2 if g == "414744169" else 0,
+                         on_log=logs.append, on_round_end=ended.append)
+    game.self_uin = "999"
+    admins = {"414744169": {"909736102"}}
+    G = "414744169"
 
-    # 管理员红包：先 甲 领（机器人自己也领了一份，不计分）→ 未领完不结算
-    game.handle_claim({"group_id": "414744169", "bill_no": "B2", "sender_uin": "909736102",
-                       "sender_name": "群主", "total_num": 2, "recv_num": 1,
-                       "self_uin": "1125163007",
-                       "claims": [{"qq": "111", "name": "甲", "amount": 1.11},
-                                  {"qq": "1125163007", "name": "机器人", "amount": 0.30}]})
-    check("回复1条且@甲", len(replies) == 1 and replies[0][1] == "111", str(replies))
-    check("机器人自己不计", "1125163007" not in game.rounds["B2"]["claims"])
-    check("未领完未结算", not settled and not announces)
+    def claim(bill, total, recv, claims_list, rate=20):
+        game.handle_claim({"group_id": G, "bill_no": bill, "sender_uin": "909736102",
+                           "total_num": total, "recv_num": recv,
+                           "rate_permille": rate, "claims": claims_list})
 
-    # 乙 领取 → 领完（recv_num=2）→ 自动结算 + @全体
-    game.handle_claim({"group_id": "414744169", "bill_no": "B2", "sender_uin": "909736102",
-                       "total_num": 2, "recv_num": 2,
-                       "claims": [{"qq": "111", "name": "甲", "amount": 1.11},
-                                  {"qq": "222", "name": "乙", "amount": 0.15}]})
-    check("领完自动结算", len(settled) == 1 and settled[0][0] == "B2")
-    check("事件 delta 正确",
-          {e["qq"]: e["delta"] for e in settled[0][2]} == {"111": 3, "222": 6},
-          str(settled))
-    check("@全体播报", len(announces) == 1 and "甲" in announces[0][1] and "乙" in announces[0][1],
-          str(announces))
-    # 幂等：同一包重复推送不重复计分
-    game.handle_claim({"group_id": "414744169", "bill_no": "B2", "sender_uin": "909736102",
-                       "total_num": 2, "recv_num": 2,
-                       "claims": [{"qq": "111", "name": "甲", "amount": 1.11},
-                                  {"qq": "222", "name": "乙", "amount": 0.15}]})
-    check("重复推送幂等", len(replies) == 2 and len(settled) == 1 and len(announces) == 1)
-
-    # 本局模式：局收尾（自动/手动结束、作废）都要通知玩法 handle_round_end
-    ended: list[str] = []
-    gm = RedPacketGame(play_name="玩法", play_id=9,
-                       rule_handler=rule, settle=settle,
-                       get_admin_qqs=lambda g: admins.get(g, set()),
-                       on_log=logs.append, on_round_end=ended.append)
-    gm.start_round("414744169", "hongbaojifen_00000100", "玩法")
-    check("无事件结束本局也通知", gm.has_active_round("414744169"))
-    gm.end_round("414744169")
-    check("无事件局取消并通知", not gm.has_active_round("414744169") and ended == ["414744169"],
-          str(ended))
-    gm.start_round("414744169", "hongbaojifen_00000101", "玩法")
-    gm.record_chat("414744169", "111", "甲", "下注100")
-    gm.end_round("414744169")
-    check("正常结束本局通知", ended[-1] == "414744169", str(ended))
-    gm.start_round("414744169", "hongbaojifen_00000102", "玩法")
-    gm.start_round("555555", "hongbaojifen_00000103", "玩法")
-    n = gm.cancel_rounds()
-    check("作废本局逐群通知", n == 2 and ended.count("414744169") == 3
-         and ended.count("555555") == 1, str(ended))
-
-    # ---- 本局模式分阶段收尾：下注者都领 → 「游戏结束」→ +10s 批量结算 → +10s 详情 ----
-    msgs_r2: list[tuple] = []
-    msgs_a2: list[tuple] = []
-    settled2: list[tuple] = []
-    ended2: list[str] = []
-
-    def batch_rule2(g, claims, rate):
-        return {"events": [{"qq": str(c["qq"]), "nickname": str(c.get("name") or ""),
-                            "reply": f"开奖结算 {str(c.get('amount') or '')}", "delta": 5}
-                           for c in claims],
-                "announce": f"结算详情：共{len(claims)}人参与"}
-
-    gm2 = RedPacketGame(play_name="玩法", play_id=10, rule_handler=rule,
-                        rule_handler_batch=batch_rule2,
-                        send_reply=lambda g, q, t: msgs_r2.append((g, q, t)),
-                        send_announce=lambda g, t: msgs_a2.append((g, t)),
-                        settle=lambda rid, g, ev: settled2.append((rid, g, ev)),
-                        get_admin_qqs=lambda g: admins.get(g, set()),
-                        get_bettors=lambda g: {"111", "222"},
-                        on_round_end=ended2.append)
-    gm2.start_round("414744169", "hongbaojifen_00000200", "玩法")
-    gm2.group_member_count["414744169"] = 100  # 群人数兜底不干扰
-    # 红包 99 份只发来甲一份 → 未到收尾
-    gm2.handle_claim({"group_id": "414744169", "bill_no": "B9", "sender_uin": "909736102",
-                      "total_num": 99, "recv_num": 1,
-                      "claims": [{"qq": "111", "name": "甲", "amount": 1.11}]})
-    ann = gm2.announced["414744169"]
-    check("下注者未领齐不收尾", not ann.get("claim_done") and not msgs_a2, str(msgs_a2))
-    # 甲+乙都领 → 下注者齐（红包未领完也收尾）→ 立即 @全体 游戏结束，不结算
-    gm2.handle_claim({"group_id": "414744169", "bill_no": "B9", "sender_uin": "909736102",
-                      "total_num": 99, "recv_num": 2,
-                      "claims": [{"qq": "111", "name": "甲", "amount": 1.11},
-                                 {"qq": "222", "name": "乙", "amount": 0.15}]})
-    check("下注者都领进入收尾计时", ann.get("claim_done") and not ann.get("batch_done"))
-    check("@全体先播游戏结束", len(msgs_a2) == 1 and "游戏结束" in msgs_a2[0][1], str(msgs_a2))
-    # 到 10s 结算时刻：玩法批量结算跑一次（个人开奖回复发出），详情未播
-    ann["settle_at"] = time.time() - 1
-    gm2.poll_auto_end()
-    check("10s 后批量结算一次", ann.get("batch_done")
-         and any("开奖结算" in t for _, _, t in msgs_r2), str(msgs_r2))
-    check("详情阶段未到不播报", len(msgs_a2) == 1)
-    # 再 10s：上报 + @全体 结算详情 + 通知玩法收局
-    ann["detail_at"] = time.time() - 1
-    gm2.poll_auto_end()
-    check("详情播报+本局上报", len(msgs_a2) == 2 and "结算详情" in msgs_a2[-1][1]
-         and settled2 and settled2[0][0] == "hongbaojifen_00000200", str(msgs_a2))
-    check("收局并通知玩法", ended2 == ["414744169"] and not gm2.has_active_round("414744169"))
-    # 收尾后重复推送的领取事件被忽略（不重复回复/不重复播报）
-    n_replies = len(msgs_r2)
-    gm2.handle_claim({"group_id": "414744169", "bill_no": "B9", "sender_uin": "909736102",
-                      "total_num": 99, "recv_num": 3,
-                      "claims": [{"qq": "111", "name": "甲", "amount": 1.11},
-                                 {"qq": "222", "name": "乙", "amount": 0.15},
-                                 {"qq": "333", "name": "路人", "amount": 0.05}]})
-    check("收尾后事件忽略", len(msgs_r2) == n_replies and len(msgs_a2) == 2)
-
-    # 全领完路径（无下注者）：recv>=total → 同样分阶段收尾
-    gm2.start_round("414744169", "hongbaojifen_00000201", "玩法")
-    gm2.handle_claim({"group_id": "414744169", "bill_no": "B10", "sender_uin": "909736102",
-                      "total_num": 1, "recv_num": 1,
-                      "claims": [{"qq": "111", "name": "甲", "amount": 0.01}]})
-    ann = gm2.announced["414744169"]
-    check("红包全领完也进收尾计时", ann.get("claim_done"), str(ann.get("claim_done")))
-    gm2.cancel_rounds()
-
-    # ---- 提前终止：下注期手动「结束本局」→ 玩法 handle_round_abort 返回公告 → 只播报作废、不上报 ----
-    msgs_a3: list[tuple] = []
-    settled3: list[tuple] = []
-    ended3: list[str] = []
-    gm3 = RedPacketGame(play_name="玩法", play_id=11, rule_handler=rule,
-                        send_announce=lambda g, t: msgs_a3.append((g, t)),
-                        settle=lambda rid, g, ev: settled3.append((rid, g, ev)),
-                        query_abort=lambda g: "本局 hongbaojifen_00000300 已终止（积分已退还，不抽水），等待管理员重新开局",
-                        on_round_end=ended3.append)
-    gm3.start_round("414744169", "hongbaojifen_00000300", "玩法")
-    gm3.record_chat("414744169", "111", "甲", "下注100")  # 下注期已有人下注（过程事件）
-    gm3.end_round("414744169")
-    check("终止：@全体 收到终止公告（含积分已退还）",
-          len(msgs_a3) == 1 and "已终止" in msgs_a3[0][1] and "积分已退还" in msgs_a3[0][1],
-          str(msgs_a3))
-    check("终止：不上报不结算", not settled3, str(settled3))
-    check("终止：本局作废并通知玩法收尾", not gm3.has_active_round("414744169")
-         and ended3 == ["414744169"], str(ended3))
-    # 玩法说不可终止（返回 None）→ 走正常结算上报收尾
-    msgs_a4: list[tuple] = []
-    gm4 = RedPacketGame(play_name="玩法", play_id=12, rule_handler=rule,
-                        send_announce=lambda g, t: msgs_a4.append((g, t)),
-                        settle=lambda rid, g, ev: settled3.append((rid, g, ev)),
-                        query_abort=lambda g: None,
-                        on_round_end=ended3.append)
-    gm4.start_round("414744169", "hongbaojifen_00000301", "玩法")
-    gm4.record_chat("414744169", "111", "甲", "下注100")
-    gm4.end_round("414744169")
-    check("玩法返回 None → 正常上报收尾", len(settled3) == 1
-         and settled3[0][0] == "hongbaojifen_00000301" and ended3[-1] == "414744169",
-         str(settled3))
+    # 1) 开局 → 甲领部分：不自动收尾、首红包记账、未封盘不判作废
+    game.start_round(G, "hongbaojifen_00000900", "复合玩法")
+    claim("B1", 3, 1, [{"qq": "111", "name": "甲", "amount": 0.66}], rate=35)
+    check("部分领取不触发结算/播报", not settled and not announces)
+    check("首红包已记 + 费率已记",
+          game.announced[G]["first_bill"]["bill"] == "B1"
+          and game.announced[G]["rate_permille"] == 35)
+    check("未封盘不作废", G in game.announced)
+    # 2) 表格：甲 0.66→0.77；乙（未抢）补值 0.55；超范围拒绝
+    err = game.set_claim_amount(G, "111", 0.77, "甲")
+    check("改值合法", err is None, str(err))
+    err = game.set_claim_amount(G, "111", 1.50)
+    check("超范围拒绝", err is not None)
+    err = game.set_claim_amount(G, "222", 0.55, "乙")
+    check("未抢补值合法", err is None, str(err))
+    # 3) 结算第一次上报失败 → 保留待重试、不播报不清局
+    r = game.settle_round_now(G)
+    check("首次结算失败 ok=False", r["ok"] is False and r.get("error"), str(r))
+    check("失败未播报未清局", not announces and G in game.announced)
+    check("失败进 pending_announced", "hongbaojifen_00000900" in game.pending_announced)
+    # 4) 重试成功 → 播报 + 清局 + 通知玩法；改值 0.77 以 delta 4 参与上传；再结算被拒
+    game.retry_pending()
+    check("重试成功播报", announces and "结算详情" in announces[-1][1], str(announces))
+    check("重试后清局", G not in game.announced)
+    check("重试后通知玩法", ended and ended[-1] == G, str(ended))
+    check("改值 0.77 参与结算", settled and any(
+        ev["delta"] == 4 for ev in settled[-1][2]), str(settled))
+    r = game.settle_round_now(G)
+    check("已结束局再结算被拒", r["ok"] is False, str(r))
+    # 5) 封盘后首红包不足 → 立即作废（A3；total=1 < need=2）
+    game.start_round(G, "hongbaojifen_00000901", "复合玩法")
+    game.seal_round(G)
+    claim("B2", 1, 1, [{"qq": "111", "name": "甲", "amount": 0.66}])
+    check("份数不足即作废", G not in game.announced, str(game.announced))
+    check("作废播报含原因", announces and "少于本局需开奖人数" in announces[-1][1], str(announces))
+    # 6) 只认第 1 个红包：B4 第 2 个红包整体忽略；同单号重复推送按 qq 幂等
+    game.start_round(G, "hongbaojifen_00000902", "复合玩法")
+    claim("B3", 2, 1, [{"qq": "111", "name": "甲", "amount": 0.66}])
+    claim("B4", 2, 2, [{"qq": "111", "name": "甲", "amount": 0.66},
+                       {"qq": "222", "name": "乙", "amount": 0.55}])
+    ann = game.announced[G]
+    check("只认首红包单号", ann["first_bill"]["bill"] == "B3", str(ann["first_bill"]))
+    check("第2红包 claims 未记", "222" not in ann["claims"], str(ann["claims"]))
+    claim("B3", 2, 2, [{"qq": "111", "name": "甲", "amount": 0.66}])
+    check("同单号推送 qq 幂等", len(ann["claims"]) == 1)
+    game.void_round(G, "管理员手动作废")
+    check("手动作废清局", G not in game.announced)
+    # 7) 领完 → ready → 手动结算成功（rate 沿用首红包写入值）
+    game.start_round(G, "hongbaojifen_00000903", "复合玩法")
+    game.seal_round(G)
+    claim("B5", 2, 2, [{"qq": "111", "name": "甲", "amount": 0.66},
+                       {"qq": "222", "name": "乙", "amount": 0.55}])
+    check("领完置 ready", game.announced[G].get("ready_to_settle") is True)
+    r = game.settle_round_now(G)
+    check("正常结算 ok + results", r.get("ok") is True and r.get("results"),
+          str(r)[:200])
+    check("结算上报含两玩家", settled and settled[-1][0] == "hongbaojifen_00000903"
+          and len([e for e in settled[-1][2] if e["delta"] != 0]) >= 1)
+    check("结算后清局", G not in game.announced)
+    # 8) 机器人自己在开始本局模式下领取不计入；传统单红包(rounds，无 announced)不回归；
+    #    机器人自己/非管理员不产生额外上报（只经 settle 桩观察，不依赖内部结构）
+    game.start_round(G, "hongbaojifen_00000904", "复合玩法")
+    claim("B6", 2, 2, [{"qq": "999", "name": "机器人自己", "amount": 0.50},
+                       {"qq": "111", "name": "甲", "amount": 0.66}])
+    check("机器人自己领取不入本局 claims", "999" not in game.announced[G]["claims"])
+    game.seal_round(G)
+    claim("B6", 2, 2, [{"qq": "222", "name": "乙", "amount": 0.55}])  # 同单号补推：乙补记、甲幂等
+    check("领完可结算", game.announced[G].get("ready_to_settle") is True)
+    r = game.settle_round_now(G)
+    check("上报含 甲(111)+乙(222)", r["ok"] is True and len(r["results"]) == 2, str(r)[:200])
+    n0 = len(settled)
+    game.handle_claim({"group_id": G, "bill_no": "B8", "sender_uin": "909736102",
+                       "total_num": 1, "recv_num": 1,
+                       "claims": [{"qq": "111", "name": "甲", "amount": 0.66}]})
+    check("传统模式仍自动收尾上报", settled and settled[-1][0] == "B8")
+    game.handle_claim({"group_id": G, "bill_no": "B8", "sender_uin": "909736102",
+                       "total_num": 1, "recv_num": 1,
+                       "claims": [{"qq": "999", "name": "机器人自己", "amount": 0.50}]})
+    game.handle_claim({"group_id": G, "bill_no": "B10", "sender_uin": "55555555",
+                       "total_num": 1, "recv_num": 1,
+                       "claims": [{"qq": "111", "name": "甲", "amount": 0.66}]})
+    check("机器人/非管理员不产生额外上报", len(settled) == n0 + 1, str(settled))
 
     print(f"selftest OK ({ok} checks)")
     return 0

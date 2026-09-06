@@ -2,7 +2,7 @@
 
 会员积分管理系统。会员从 QQ 群拉取，以 **QQ 号作为唯一标识**；系统对外开放接口，供外部程序（执行器 agent）上下分/查积分/上报对局结算。QQ 只有两种身份：**会员**（members，由 agent 从群成员同步）或 **操作员**（管理员登录的管理 QQ，agent 心跳自动登记）；不做普通 QQ 号池。仅管理员一人登录本系统，会员不能登录。
 
-版本迁移当前到 **V1.0.4**（flyway 历史：V1 / 1.0.1 / 1.0.2 / 1.0.3 / 1.0.4）。跨会话交接、上线部署注意见 [HANDOFF.md](HANDOFF.md)。
+版本迁移当前到 **V1.0.11**（flyway 历史：V1 / 1.0.1 / 1.0.2 / 1.0.3 / 1.0.4 / 1.0.7 / 1.0.8 / 1.0.9 / 1.0.10 / 1.0.11，版本号不连续为计划内跳过）。跨会话交接、上线部署注意见 [HANDOFF.md](HANDOFF.md)。
 
 ## 技术栈
 
@@ -28,7 +28,7 @@ cd frontend && npm install && npm run dev
 - 打包：`./build.sh`（或 `build.bat`，自动构建前端并打包进 jar），产物 `target/hongbaojifen-api-<版本>.jar`
 - 部署：服务器 `/opt/hongbaojifen/` 常驻 `start.sh` / `stop.sh` / `deploy.sh`；发版 = `scp jar → /tmp/` + `ssh /opt/hongbaojifen/deploy.sh`（详见 DEPLOY.md）
 
-## 页面功能（左侧菜单 8 项）
+## 页面功能（左侧菜单 9 项）
 
 | 菜单 | 说明 |
 | --- | --- |
@@ -37,9 +37,12 @@ cd frontend && npm install && npm run dev
 | 操作员管理 | **操作员 QQ**（agent 上报本机登录的管理 QQ）：改备注/停用/**禁手动上下分**（can_manual_points）/删除；显示最近登录时间、来源 IP、主机名 |
 | 配置管理 | 通用键值配置（玩法提示词、系统参数；数据保留天数等） |
 | 执行器管理 | 部署在 QQ 群的 agent：注册即得 token（一次性显示），心跳维持在线；列表含状态/最近心跳/来源 IP/绑定的操作员QQ。操作：编辑/删除/**重置token**/**封禁**/**封禁并重置token**/解封；详情含命令下发与结果（下发用 curl，见下） |
-| 会员玩法管理 | 上传玩法规则文件（Python 源码，任意格式 ≤20MB），启停；agent 下载后在游戏群按规则自动回复 |
+| 会员玩法管理 | 玩法规则文件（Python 源码）：**唯一内置「复合玩法」**（rule_fuhe.py，V1.0.11 收敛全部旧玩法种子），可查看/重传文件、启停；agent 自动拉取并在游戏群运行（复合玩法 = 群内下注/「撑」即可撑庄 + 管理员红包开奖 + agent 面板手动结算上报，玩法见 agent/README「游戏玩法」） |
 | 游戏记录 | 游戏对局列表（群/玩法/局号/时间/会员数/净积分/异常数），详情含逐条**回放时间线**；默认保留 30 天（配置键 `game_record_retention_days` 可改） |
 | 操作记录 | 登录/上下分/增删改等操作审计（默认保留 30 天，`operation_log_retention_days`） |
+| 用户管理 | 后台登录用户：新增/删除/重置密码（内置 admin 标金章、不可删除；密码 BCrypt、用户名唯一）；**仅超级管理员 admin 可见可管**，其余用户接口返回 403 |
+
+> **复合玩法行不要手动删除**：「会员玩法管理」中复合玩法那一行是内置种子（`seed_rules/rule_fuhe.py`）。若在管理页删除该行，agent/服务重启时 `PlayRuleService.ensureSeedRules`（启动兜底）会把它连文件一起复活——这是**预期行为**（保证玩法不丢）。停用玩法请用页面上的启停状态开关，不要删行。
 
 ## 对外开放接口（`/api/open/**`，给执行器 agent 调用）
 
@@ -132,7 +135,8 @@ src/main/java/com/hbjf/api/
   dao/          RowMapMapper 行映射
   util/         MapBuilder 响应构造
 src/main/resources/
-  db/migration/ Flyway 迁移（V1__init.sql 建表 + V1.0.1~V1.0.4 增量）
+  db/migration/ Flyway 迁移（V1__init.sql 建表 + V1.0.1~V1.0.4 / V1.0.7~V1.0.11 增量；5/6 号跳号未用）
+  seed_rules/   玩法内置种子（rule_fuhe.py 复合玩法，启动 ensureSeedRules 兜底落盘 data/rules/）
   application*.yml  配置（local 本地 / prod 生产）
 frontend/       PC 管理后台（React + AntD，打包进 static/admin）
 data/rules/     玩法文件存储目录（自动创建）
@@ -143,5 +147,5 @@ tools/e2e_full.py   全链路 E2E 脚本（对本地 MySQL 真实写入，见 HA
 
 - API 字段 snake_case；`created_at/updated_at` 为 `yyyy-MM-dd HH:mm:ss` 字符串
 - 数据库变更只走 Flyway 迁移（新建 `V1.x.y__描述.sql`），禁止改已执行迁移；H2 测试库同步追加 `src/test/resources/schema-h2.sql`
-- 测试：`mvn -Dskip.fe=true test`（跳过前端构建，40 个用例，含命令通道/群封禁/操作员/对局结算/心跳超时离线）
+- 测试：`mvn -Dskip.fe=true test`（跳过前端构建，48 个用例，含命令通道/群封禁/操作员/对局结算/心跳超时离线/玩法种子兜底）
 - 全链路验证：`tools/e2e_full.py`（本机后端 8892 + MySQL）；agent 冒烟 `python -m integration.smoke`（见 agent/README.md）

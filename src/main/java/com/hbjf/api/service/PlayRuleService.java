@@ -32,11 +32,10 @@ public class PlayRuleService {
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final Logger log = LoggerFactory.getLogger(PlayRuleService.class);
-    /** 随 jar 内置的默认玩法（classpath:seed_rules/；迁移 V1.0.2/V1.0.3 已插对应元数据行） */
+    /** 随 jar 内置的唯一默认玩法（classpath:seed_rules/rule_fuhe.py）。复合玩法元数据行
+     *  由 ensureSeedRules 幂等补齐（收敛前由迁移/手动插入的旧玩法行见收敛 SQL）。 */
     private static final String[][] SEED_RULES = {
-            {"seed_rules/rule_add1.py", "seed_rule_add1.py"},
-            {"seed_rules/rule_add2.py", "seed_rule_add2.py"},
-            {"seed_rules/rule_redpacket.py", "seed_rule_redpacket.py"},
+            {"seed_rules/rule_fuhe.py", "seed_rule_fuhe.py"},
     };
 
     private final JdbcTemplate jdbc;
@@ -55,9 +54,9 @@ public class PlayRuleService {
         return dir;
     }
 
-    /** 首次启动把默认玩法文件从 classpath 落盘到 rules-dir（纯 SQL 写不了磁盘文件，
-     *  元数据由迁移插入，二者配合才构成可用玩法）。文件已存在则跳过 ——
-     *  不覆盖用户重传/替换过的同名玩法；失败只告警，不阻断启动。 */
+    /** 启动兜底：classpath 默认玩法落盘 rules-dir（已存在不覆盖 —— 不覆盖用户重传版本），
+     *  并幂等补齐 play_rule_files 元数据行（name='复合玩法' 的 active 行存在则跳过）。
+     *  失败只告警，不阻断启动。 */
     @PostConstruct
     public void ensureSeedRules() {
         for (String[] pair : SEED_RULES) {
@@ -68,13 +67,26 @@ public class PlayRuleService {
                     continue;
                 }
                 File target = new File(rulesDir().getAbsoluteFile(), pair[1]);
-                if (target.exists()) continue;
-                try (InputStream in = cp.getInputStream()) {
-                    Files.copy(in, target.toPath());
+                if (!target.exists()) {
+                    try (InputStream in = cp.getInputStream()) {
+                        Files.copy(in, target.toPath());
+                    }
+                    log.info("默认玩法已落盘: {}", target.getAbsolutePath());
                 }
-                log.info("默认玩法已落盘: {}", target.getAbsolutePath());
+                Integer cnt = jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM play_rule_files WHERE name='复合玩法' AND status='active'",
+                        Integer.class);
+                if (cnt == null || cnt == 0) {
+                    String now = LocalDateTime.now().format(FMT);
+                    jdbc.update("INSERT INTO play_rule_files "
+                                    + "(name, description, file_name, file_size, version, status, created_at, updated_at) "
+                                    + "VALUES (?,?,?,?,?,?,?,?)",
+                            "复合玩法", "大吃小×撑庄（唯一玩法）：封盘后管理员发红包定大小，发「撑」即可撑庄",
+                            target.getName(), target.length(), "1.0", "active", now, now);
+                    log.info("默认玩法元数据行已补齐: 复合玩法 file_name={}", target.getName());
+                }
             } catch (Exception e) {
-                log.warn("默认玩法落盘失败: {}", pair[0], e);
+                log.warn("默认玩法兜底失败: {}", pair[0], e);
             }
         }
     }

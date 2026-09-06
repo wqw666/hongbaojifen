@@ -45,6 +45,7 @@ class AppConfig:
     play_rule_id: int = 0                        # 启用中的玩法 id（0=未启用）
     play_rule_name: str = ""                     # 玩法名@版本（仅展示）
     play_group_id: str = ""                      # 游戏群号（逗号分隔多个）
+    play_group_current: str = ""                 # 玩法页当前操作群（按钮/表格作用对象）
     play_enabled: bool = False                   # 玩法运行开关
     play_callback_port: int = 6101               # agent 本地玩法回调端口（插件转发目标）
     game_round_seq: int = 0                      # 游戏局号计数器（开始本局递增，生成 hongbaojifen_XXXXXXXX）

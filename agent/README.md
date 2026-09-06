@@ -8,9 +8,9 @@ QQ 只有两种身份：**会员**（members，从群成员同步而来）或**�
 
 | 路径 | 说明 |
 |------|------|
-| `gui/` | Python + CustomTkinter 桌面端（扫码登录/状态/实时监控/历史查询/设置/总后台对接/游戏玩法/使用说明） |
+| `gui/` | Python + CustomTkinter 桌面端（扫码登录；主界面 7 个 tab：群管理/会员/游戏玩法/积分审批/实时监控/总后台对接/更多） |
 | `integration/` | **总后台对接包**（独立于 GUI，纯 requests+标准库，见下文「与总后台对接」） |
-| `play_rules/` | 玩法文件样本（rule_add1/add2 数字±n 基础、rule_redpacket 红包计分、rule_dcxx 大吃小、rule_laoda 抢庄），上传总后台试用 |
+| `play_rules/` | 玩法文件样本（**rule_fuhe.py 复合玩法**——当前唯一玩法，与总后台内置种子同源镜像） |
 | `plugin/` | NapCat 插件 TS 源码（grabRedBag / pullDetail / play 玩法转发），构建产物 `plugin/dist/index.mjs` |
 | `client/` | 命令行红包查询工具 `query.py` |
 | `tools/` | `NapCat/` QQ 框架运行时（不入 git，`setup_napcat.bat` 安装）+ `restart_napcat_hidden.vbs` |
@@ -64,7 +64,8 @@ build.bat     完整交付包：产物 release\ + agent_交付包.zip（慢，�
 | `member_sync.py` | 会员同步：取群成员 → 上报群信息(含群创建时间) → 批量查积分 → 未建档自动注册为会员(注册人=操作员QQ) |
 | `auth.py` | 把本机登录 QQ 上报为**操作员**（通过 agent 登录并连接总后台的都是操作员） |
 | `smoke.py` | 全链路冒烟测试（心跳自动登记/群/会员同步/对局上报+幂等可选） |
-| `play_engine.py` | 玩法引擎 v2：加载玩法 .py 算回复与积分变动（`engine.last_delta`）+ `RoundSession` 每群每局缓冲/结算（GUI 玩法页使用；`python -m integration.play_engine` 自测） |
+| `play_engine.py` | 玩法引擎：加载玩法 .py 算回复与积分变动（`engine.last_delta`）+ `call_rule(fn_name, gid, *args)` 原样透传带返回值协议；`RoundSession` 为 v2 遗留类（v3 复合玩法不启用）；`python -m integration.play_engine` 自测 |
+| `redpacket_game.py` | 红包计分会话驱动 `RedPacketGame`：红包开奖会话/作废/手动结算上报（GUI 玩法页使用；`python -m integration.redpacket_game` 自测） |
 
 ### 使用
 
@@ -104,64 +105,50 @@ python -m integration.smoke --base http://localhost:8892 --key hbjf-open-2026 \
 
 心跳默认 **10 秒一次**，agent 启动进主界面后**自动开启、无法手动停止**——agent 存活且能调用总后台期间心跳持续上报，总后台显示「在线」与「agent 实际在调总后台」必然一致；总后台超过阈值（默认 30s ≈ 3 个心跳周期，`app.executor-offline-seconds` 可调）未收到心跳才自动把执行器显示为**离线**（即 agent 进程退出/断网时）。若调大本机心跳间隔，需同步调大总后台阈值避免误判离线。
 
-## 游戏玩法（多游戏群自动回复 + 结算上报）
+## 游戏玩法（复合玩法唯一化 · 手动操作台 + 红包开奖 + 结算上报）
 
-在总后台「会员玩法管理」上传玩法文件，本 agent 拉取后在指定**游戏群**里自动回复并按玩法返回的积分变动计分；操作员在 GUI 结算上报对局 → 总后台实时入账，管理端「游戏记录」可见每局**回放**（默认保留 30 天）。群主/管理员（NapCat 登录 QQ）也是玩家，同样触发（只有机器人自己的发言不触发，防回环）。
+**玩法已收敛为唯一「复合玩法」（大吃小×撑庄合一）**：总后台「会员玩法管理」只有这一行内置玩法（`seed_rules/rule_fuhe.py`），本 agent 启动/重启用时自动拉取并激活，GUI「游戏玩法」页是它的**手动操作台**——不再有多玩法列表与启停切换。操作员在面板点「开始本局」→ 群成员发数字下注/发「撑」即可撑庄 → 点「停止下注」封盘 → 管理员在群内发红包开奖 → 点「结算」开奖并上报总后台实时入账（管理端「游戏记录」可见每局**回放**，默认保留 30 天）。**积分只经红包结算产生**（下注/撑庄不动任何积分），群主/管理员（NapCat 登录 QQ）也是玩家（只有机器人自己的发言不触发，防回环）。**玩法细节（指令文案、点数算法、结算向量）以 `play_rules/rule_fuhe.py` 顶部说明与内建自测为准**，本节讲操作与协议。
 
 ### 链路
 
 ```
-QQ 群消息 → NapCat 插件 play.ts → POST 127.0.0.1:6101/play/msg（本机回调）
-          → 玩法引擎 RuleEngine 加载玩法 .py 算 (回复, delta) → POST 插件 /play/reply
-          → send_group_msg（自动 @ 发言者）→ 群成员看到机器人回复
-          → 该条 (reply, delta) 计入当前局 RoundSession 事件缓冲
-          → 「结算并上报」→ POST /api/open/games/report → 总后台逐事件入账
+QQ 群消息 → NapCat 插件 play.ts（过滤 message_sent/白名单群/纯文本）→ POST 127.0.0.1:6101/play/msg
+红包领取   → 插件实时推送 → POST 127.0.0.1:6101/play/redpacket
+          → PlayTab 本地 ThreadingHTTPServer 入队 → daemon worker（_worker_loop）
+文字消息   → 内置查分「查/查分/查积分」→ 局外基础玩法（上100/下100 申请确认等）
+          → 下注预检（≥ 最小下注 10、不超当前积分）→ 玩法引擎算回复（下注登记/撑庄/引导语）
+          → POST 插件 /play/reply → send_group_msg（自动 @ 发言者）
+红包事件   → RedPacketGame.handle_claim（只认本局第 1 个管理员红包）→ 逐领取人回执「已记录：抢到 X 元（点数 N）」
+          → 红包总份数 < 需开奖人数 → 自动作废播报（积分未扣）
+结算（面板按钮，worker 线程）→ 玩法 settle_redpacket 逐人开奖算 delta（未领者按 0 点）
+          → POST /api/open/games/report {round_id, ...} → 总后台逐事件入账（round_id 幂等）
+          → 逐人 @ 开奖回复 + @全体 播报结算汇总
 ```
 
-GUI「游戏玩法」页操作：填总后台地址 →「刷新玩法列表」（仅显示**启用**状态玩法）→ 选中玩法 → 填/选**游戏群号（可多个，逗号分隔）**→（可选勾「自动注册群成员为会员」）→「启用玩法」（自动下载玩法文件 → 打开插件转发 → 激活引擎）。重启 GUI 自动恢复上次玩法（重新拉最新文件）并续传未结算对局。「停止玩法」先自动结算，成功才停。
+### GUI 玩法页操作（手动操作台）
 
-- 每群独立成局：`round_id = 群尾号-开赛时间-随机`，同局事件累积 → 结算一次性入账；`round_id` 幂等，崩溃/重传不重复计分
-- 事件缓冲达 1000 条自动结算（软阈值），2000 条硬性截断（先结算再继续）；玩法页实时显示每群「局号 | 事件数 | 净积分」
+1. 启动 agent 进主界面「游戏玩法」页：自动从总后台拉取**唯一玩法**并激活（`_auto_restore`；连接好总后台前按钮置灰）
+2. 勾选**游戏群**（可多群；勾选即时推送插件转发名单并落盘，重启自动恢复）
+3. 「当前群」选群 → 「开始本局」→ @全体 播报开场白（含局号 `hongbaojifen_XXXXXXXX`，`game_round_seq` 持久递增）
+4. 群内玩法：成员直接发**数字下注**（如 500；旧词「下注500」兼容）；发**「撑」即可撑庄**（先到先得，已下注的不能再撑）；发「上100/下100」提交上/下分申请（进「积分审批」页）；群内发「开始游戏/开局」只引导去面板（Ruling：不开局）
+5. 「停止下注」封盘：@全体 播报下注汇总 +「请管理员发红包开奖（每份 0.01~0.99 元，份数不少于 N 份）」（N=下注人数+有庄 1 份，庄家另留 1 份定自己点数）；**撑庄局先查庄家余额**（需 ≥ 下注池+抽水，不足自动作废播报，积分未扣）
+6. 管理员在群内发**红包**开奖 → 成员抢到即收到回执（金额+点数）；红包份数不足 → 自动作废播报；**第 2 个管理员红包被忽略**（只认第 1 个，防凑份数）
+7. 「结算」开奖：未领完需**再点一次确认**（未领者按 0 点输光）→ 逐人 @ 开奖回复 + @全体 汇总 → 开奖表补「结果」列（保留到下次开局）
+   - 开奖表每行 = 下注人或庄家；**双击「抢到金额」可直接改值**（补记管理员没抢到的成员），点数即时重算
+8. 「作废本局」= 播报作废并关局、**不上报不结算**（无人下注/红包不足/余额不足/手动均可作废，积分未扣）
+9. 「更新玩法文件」= 从总后台重下载最新玩法 → 热生效；「重试未上报」= 补上报失败/未上报的红包局（每 30s 自动兜底重试，round_id 幂等防重复入账）
+
+- 回放：本局内下注、撑庄、领取回执、开奖回复与群聊天全程计入对局回放（`record_chat`），随结算上报总后台
 - 总后台未知会员/停用/余额不足 → 该事件按 delta=0 记入时间线并随结算回报 `warning` 明细
-- 被总后台封禁（40310）/操作员停用或禁手动（40311）→ 引擎与同步全部停摆（GUI 红字），未结算事件保留，后台处理后重开/重试恢复
+- 被总后台封禁（40310）/操作员停用或禁手动（40311）→ 引擎与同步全部停摆（GUI 红字），局与事件保留，后台处理后重开/重试恢复
 - 常驻查分指令：成员发「查 / 查分 / 查积分」→ @回复其当前积分（查总后台余额；先于玩法与局状态处理，不入对局不计回放，每人 3s 冷却）
 
-### 红包计分玩法（玩法文件协议，与 rule_add1/2 同机制）
+### 复合玩法规则速览（rule_fuhe.py）
 
-红包玩法**也是一份玩法文件**：总后台「会员玩法管理」上传 `play_rules/rule_redpacket.py` 样本（或自定义），玩法文件里定义可选函数：
-
-```python
-def handle_redpacket(group_id, qq, nickname, amount):
-    # 返回协议同 handle_message：None / str / (reply, delta) / {"reply":…, "delta":…}
-
-def settle_redpacket(group_id, claims, rate_permille=20):
-    # 可选：红包领完批量结算 → {"events":[{qq,nickname,reply,delta}...], "announce":str} | None
-
-def handle_round_start(group_id, round_id=""):
-    # 可选：玩法页「开始本局」→ 开局进入下注期等（玩法状态机不必依赖群内发「开始游戏」）
-    # round_id 为本局局号（如 hongbaojifen_00000001），玩法收下后可在回复里带「本局 {局号}」；
-    # 只声明 (group_id) 的旧写法也兼容（引擎按参数个数自动适配）
-
-def handle_round_end(group_id):
-    # 可选：「结束本局」/红包领完自动收尾 → 清理整局状态（防止串局）
-
-def handle_round_abort(group_id):
-    # 可选：下注期点「结束本局」→ agent 先问询能否按「提前终止」收：
-    # 返回公告文本 → @全体 播报「本局已终止（积分已退还，不抽水）」并作废本局、不上报
-    # （大吃小等玩法下注期积分从未扣除，退还即无操作）；返回 None → 正常结算上报收尾
-
-def bettor_qqs(group_id):
-    # 可选：返回本局已下注者 QQ 列表 → 红包未全领完但下注者都已领到时，agent 提前分阶段收尾
-```
-
-选中含 `handle_redpacket` 的玩法启用后**自动开启红包玩法**（无需额外开关）：**管理员/群主**在游戏群发红包 → 成员领取时插件推送领取事件给 agent（`/play/redpacket`）→ 按玩法规则计分并立即 @领取人 回复；红包领完（`recv_num>=total_num` 或领取人数达群人数）→ 自动上报总后台（`round_id`=红包单号，幂等）→ @全体 播报：用户X 领取A元 获得B积分…
-
-- 样本规则：积分 = 金额各位数之和（1.11 元=3 分、0.15=6 分），见 `play_rules/rule_redpacket.py`
-- 机器人自己领取的份额不计分；同人同包幂等去重；结算失败事件保留自动重试；上报成功后才 @全体 播报
-- **开始本局/结束本局**：玩法页「开始本局」→ 为每个游戏群生成局号 `hongbaojifen_XXXXXXXX`（持久递增）→ @全体公告（游戏名称/介绍/对局id）→ 本局期间红包领取与全部群聊天都记入回放（含时间）。**红包被领完（或玩法提供 `bettor_qqs` 时所有下注者都已领到，未领满也收）→ 立即 @全体「游戏结束」→ 10 秒后开奖批量结算（逐人盈亏回复）→ 再 10 秒后 @全体 结算详情并上报总后台收局**（round_id=局号）；无红包时「结束本局」手动收局；**下注期（红包未开/未领完）点「结束本局」= 提前终止**——agent 先问玩法 `handle_round_abort`，玩法返回公告文本 → @全体「本局已终止（积分已退还，不抽水）」作废本局、不上报（玩法返回 None 才走正常结算收尾）。不点开始则保持原「领完自动结算」模式（round_id=红包单号）
-- **玩法4 大吃小**（`play_rules/rule_dcxx.py`，杀小赔大带抽水）：管理员点「开始本局」即进入下注期（玩法可选 `handle_round_start(group_id, round_id)` 收下本局局号 + `bettor_qqs` 提供下注者名单，不依赖群内发「开始游戏」）；玩家直接发数字即下注（如 500；旧词「下注500」兼容）→ 回复「本局 {局号}，{累计下注名单}」（如「本局 hongbaojifen_00000001，用户1下注100，用户2下注200」），**下注金额 < 最小下注或 > 自己当前积分 → 直接 @回复原因并拒绝**（最小下注在玩法页配置，默认 10 积分，存 `play_min_bet`）；管理员发红包 → 抢到的人即时收到 @回复（金额+点数，同红包计分玩法）；红包领完/下注者都领 → 按上条 10s/10s 分阶段收尾：先批量结算（`settle_redpacket`）→ @全体 播报 + 逐人回复盈亏（下注者按点数组赔，未抢按 0 分）；**管理员在下注期点「结束本局」→ 玩法按提前终止收**：@全体「本局已终止（积分已退还，不抽水），请等待管理员重新开局」（下注期积分从未扣除，「退还」即无操作；不抽水、本局不上报），下注名单一并清空，等下一次「开始本局」重新开局
-- **玩法5 抢庄**（`play_rules/rule_laoda.py`，庄家制擂台、1:1 无抽水）：管理员「开始本局」后玩家发「抢庄」（兼容旧词「抢老大」）→ 先到先得当**庄家（擂主）**，其余玩家直接发数字押注挑战（如 500；旧词「下注500」兼容）；管理员发红包 → 点数 = 红包金额各位数之和 → 红包领完/挑战者都领按 10s/10s 收尾：**点数小于庄家 → 押注输给庄家；大于庄家 → 赢得自己押注（庄家 1:1 赔付）；与庄家同点 → 打平退回押注**；**下注的人没抢红包 → 点数按 0 必输光押注（不参与打平退回）**；庄家点数靠抢包：没抢到按 0 作基准（抢到包的挑战者全赢他、没抢的输给他），不阻塞收尾；庄家净得 = 收输家 − 赔赢家（可为负，赔不起由总后台按余额不足处理）；下注期点「结束本局」→ 同 v-9 终止协议 @全体「本局已终止（积分已退还，不抽水）」。自测：`python play_rules/rule_laoda.py`
-- 实现：`integration/redpacket_game.py`（编排，`python -m integration.redpacket_game` 自测）+ `play_engine.RuleEngine.handle_redpacket` + 插件 play.ts 推送；玩法4 自测：`python play_rules/rule_dcxx.py`
+- **下注期**：发数字即下注（自动 @ 回复「本局 {局号}，{累计下注名单}」）；发「撑」→ 成为庄家（已下注者不能撑庄）；群主/管理员也按同一规则参与（机器人自己除外）
+- **点数**：每份红包金额（0.01~0.99 元）的两位小数位数字相加取个位（0.60→6 点、0.77→4 点）；金额越界（>0.99 或非法）回执提示不计点，可在开奖表修正或作废
+- **封盘后**：无庄 = 大吃小（点数比大小，赢家吃输家，抽水按费率 `game_fee_rate`‰ 抽取）；有庄 = 撑庄擂台（点数小于庄家押注归庄、大于庄家 1:1 赢得押注、同点退回押注；未抢红包按 0 点）。平局/多同名次消化顺序见 rule_fuhe `_settle` 与自测验收向量
+- 自测：`python play_rules/rule_fuhe.py`（65 断言：下注/撑庄/封盘/点数比较/大吃小/撑庄结算/作废向量）
 
 ### 玩法文件协议（总后台玩法页上传的 .py 必须遵守）
 
@@ -174,12 +161,14 @@ def handle_message(group_id: int, qq: int, nickname: str, text: str):
     """
 ```
 
+- 玩法可选协议（未定义即忽略）：`handle_redpacket` / `settle_redpacket` / `handle_round_start(group_id[, round_id])` / `handle_round_end` / `handle_round_abort`（旧「结束本局」终止问询，复合玩法已用 `handle_void` 取代）/ `bettor_qqs` / `betting_open`
+- **带返回值协议**（复合玩法在用）：`handle_seal(group_id, rate_permille) -> {ok,text,banker_check}`（封盘汇总）、`handle_void(group_id) -> str`（作废公告并复位）、`claim_need(group_id) -> int`（需开奖人数）、`bet_snapshot(group_id) -> list`（开奖表行数据）、`seal_info(group_id) -> dict`（局状态/按钮门控）——一律经 `engine.call_rule(fn_name, group_id, *args)` 调用、返回值原样透传，GUI 按上述结构自行解析；`handle_redpacket` 逐领取人回执、`settle_redpacket(group_id, claims, rate_permille)` 结算返回 `{"events":[{qq,nickname,reply,delta}...], "announce":str}`
 - 玩法就是一段普通 Python 源码，可自由 import 标准库/自写逻辑；上传格式任意，引擎按 .py 执行
-- 引擎按文件 mtime **热重载**：总后台重传 → 玩法页重新启用/agent 下次启用即取新逻辑
+- 引擎按文件 mtime **热重载**：总后台重传 → 玩法页「更新玩法文件」/agent 下次启用即取新逻辑
 - 引擎对同一 qq 1 秒内重复发言去重（防刷屏）；玩法代码抛异常只记日志不崩引擎；每次调用后的积分变动落在 `engine.last_delta`
-- 样本在 `play_rules/`（rule_add1.py 数字+1、rule_add2.py 数字+2，v1 无积分版）；v2 写法参考引擎自测内置用例：`python -m integration.play_engine`
+- 样本在 `play_rules/`（**rule_fuhe.py 复合玩法**，与总后台内置种子同源）；协议细节/自测：`python -m integration.play_engine`
 
-玩法相关配置项：`play_rule_id` / `play_rule_name` / `play_group_id`（游戏群号，逗号分隔多个）/ `play_enabled` / `play_callback_port`（默认 6101）/ `play_auto_register_members`（启用玩法后自动把游戏群成员注册为会员）。玩法文件缓存于 `%APPDATA%\QQHongbaoMonitor\plays\rule_{id}.py`。完整设计见 [docs/玩法v2结算与上报设计.md](docs/玩法v2结算与上报设计.md)。
+玩法相关配置项：`play_rule_id` / `play_rule_name` / `play_group_id`（游戏群号，逗号分隔多个）/ `play_group_current` / `play_enabled` / `play_callback_port`（默认 6101）/ `game_round_seq`（局号计数器）/ `game_fee_rate`（费率‰，默认 20）/ `play_min_bet`（最小下注，默认 10）/ `play_auto_register_members`（启用玩法后自动把游戏群成员注册为会员）。玩法文件缓存于 `%APPDATA%\QQHongbaoMonitor\plays\rule_{id}.py`。完整架构见 [docs/代码架构说明.md §8](docs/代码架构说明.md)；玩法 v2 历史设计见 [docs/玩法v2结算与上报设计.md](docs/玩法v2结算与上报设计.md)（2026-09-06 起仅留档）。
 
 **后端注意**：玩法文件存放目录由总后台 `rules-dir` 配置；上传用相对路径（如默认 `./data/rules`）时 `MultipartFile.transferTo` 会解析到 Servlet 临时目录导致下载「文件已丢失」，已修复为绝对路径落盘（prod 请继续用绝对路径，如 `/opt/hongbaojifen/data/rules`）。
 

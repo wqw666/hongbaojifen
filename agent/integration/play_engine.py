@@ -7,7 +7,8 @@
         -> (reply, delta)                    # v2 元组写法
 其中 delta>0 玩家加分、delta<0 玩家扣分、0=只记过程不加分；None=本条纯互动不回复。
 引擎每次调用后把积分变动放在 engine.last_delta（单消息 worker 串行，线程安全）；
-群消息 → 玩法 → 回复/积分落进 RoundSession 当前局，操作员「结算」后整局上报总后台入账。
+群消息 → 玩法 → 回复文本回群、积分变动经 engine.last_delta 供调用方读取（当前唯一玩法
+「复合玩法」的积分只经红包结算产生，handle_message/handle_redpacket 的 delta 恒 0）。
 
 玩法可选协议（按需定义，未定义即忽略）：
     def handle_redpacket(group_id, qq, nickname, amount)         # 红包领取事件（返回协议同 handle_message）
@@ -16,11 +17,21 @@
     def handle_round_end(group_id)                               # GUI「结束本局」/自动收尾：清理玩法状态
     def handle_round_abort(group_id)                             # 下注期点「结束本局」：返回终止公告文本或 None
     def betting_open(group_id)                                   # 当前是否处于下注期（agent 下注预检问询，返回 True/False）
+    def handle_seal(group_id, rate_permille=20)                          # 「停止下注」：封盘并返回 {ok,text,banker_check}|None
+    def handle_void(group_id)                                            # 作废：返回作废公告文本并复位该群状态
+    def claim_need(group_id)                                             # 本局需开奖人数（红包份数不足判定；非下注/封盘期=0）
+    def bet_snapshot(group_id)                                           # 注序下注明细（供 GUI 开奖表格）
+    def seal_info(group_id)                                              # 当前局状态快照（供 GUI 状态栏/按钮门控）
 其中 handle_round_start/end 无返回值要求；引擎在操作员点「开始本局/结束本局」或
 红包领完自动收尾时调用。需要"整局状态"的玩法（如大吃小需要开局进入下注期）应在此重置。
 handle_round_abort 由引擎在「结束本局」进入结算收尾**前**问询玩法（大吃小在下注期点
 结束本局 = 提前终止）：返回非空文本 → agent 按「本局已终止（积分已退还，不抽水）」
 只 @全体 播报并作废本局、不上报；返回 None → 按正常结算上报收尾。
+以上 handle_seal/handle_void/claim_need/bet_snapshot/seal_info（复合玩法 fuhe 首批使用）
+是"要返回值"的协议；带返回值的可选协议一律经 engine.call_rule(fn_name, group_id, *args)
+调用：引擎不解析返回值协议类型，原样返回（GUI 经 call_rule 读取后自行按需解析）。
+handle_round_start 也可返回开场白文本（GUI 播报用；经 call_rule 读取，notify_round_start
+调用时引擎照旧不取返回值）。
 
 约定：
 - 玩法文件应快速返回，不要做阻塞 IO/长循环（引擎在 GUI 的消息 worker 线程里逐个调用）
@@ -41,6 +52,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from .backend_client import BackendError, ExecutorBanned, OperatorDisabled, HbjfClient
 
@@ -250,7 +262,9 @@ class RuleEngine:
         """按激活玩法处理一条红包领取事件。返回 (回复文本|None, 积分变动)。
         玩法文件可选定义 handle_redpacket(group_id, qq, nickname, amount)，返回协议同
         handle_message（None / str / dict / tuple）；未定义或未激活返回 (None, 0)。
-        不做同 qq 去重（红包去重由 RedPacketGame 按单号+QQ 幂等处理）。"""
+        None = 该领取不记录不回复；显式空串回执 = 已受理、记账但不发消息（静默领取，
+        与 None 区分，None 会把领取整体跳过）。不做同 qq 去重（红包去重由
+        RedPacketGame 按单号+QQ 幂等处理）。"""
         self.last_delta = 0
         with self._lock:
             if self.active_rule_id is None:
@@ -279,8 +293,7 @@ class RuleEngine:
             self.last_delta = delta
             if reply is None:
                 return None, delta
-            reply = reply.strip()
-            return reply or None, delta
+            return reply.strip(), delta
         except Exception as e:  # noqa: BLE001 — 玩法 bug 不影响引擎
             self.last_error = f"玩法红包处理异常: {e.__class__.__name__}: {e}"
             return None, 0
@@ -356,6 +369,24 @@ class RuleEngine:
             return bool(fn(int(group_id)))
         except Exception as e:  # noqa: BLE001 — 玩法 bug 不影响引擎
             self.last_error = f"玩法betting_open异常: {e.__class__.__name__}: {e}"
+            return None
+
+    def call_rule(self, fn_name: str, group_id: int | str, *args) -> Any:
+        """通用转发：调当前激活玩法的 fn_name(group_id, *args)，原样返回其返回值。
+
+        供 handle_seal/handle_void/claim_need/bet_snapshot/seal_info 及所有"要返回值"
+        的新协议使用（热重载语义同其它入口）；未激活/玩法未定义该函数/调用异常 → None
+        并记 last_error。注意：不经过同 qq 去重（供 GUI 按钮调用，非群消息路径）。"""
+        module = self._current_module()
+        if module is None:
+            return None
+        fn = getattr(module, fn_name, None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(int(group_id), *args)
+        except Exception as e:  # noqa: BLE001 — 玩法 bug 不影响引擎
+            self.last_error = f"玩法{fn_name}异常: {e.__class__.__name__}: {e}"
             return None
 
     def _notify_optional(self, fn_name: str, group_id: int | str, extra: str = "") -> None:
@@ -571,6 +602,22 @@ def handle_message(group_id, qq, nickname, text):
     return None
 '''
 
+_SAMPLE_REDPACKET = '''"""红包协议样本（原 play_rules/rule_redpacket.py 语义；该文件已随玩法唯一化删除，内联保留
+供引擎侧覆盖 handle_redpacket 的 v2 tuple 解析与 has_redpacket_handler）：
+领取计分：积分 = 金额各位数之和（1.11 元 → 1+1+1=3 分；0.15 → 0+1+5=6 分）。
+返回协议同 handle_message：None=不计这条；tuple=(回复, 积分)。"""
+def handle_message(group_id, qq, nickname, text):
+    return None
+
+def handle_redpacket(group_id, qq, nickname, amount):
+    a = float(amount or 0)
+    if a <= 0:
+        return None
+    s = f"{a:.2f}".replace(".", "")
+    points = sum(int(ch) for ch in s if ch.isdigit())
+    return f"领取{a:.2f}元，获得{points}积分", points
+'''
+
 
 class _FakeBackend:
     """selftest 用假总后台：记录上报、可注入失败/封禁。"""
@@ -694,20 +741,24 @@ def _selftest() -> int:
 
     # ---- 红包玩法协议：handle_redpacket ----
     rp_src = samples / "rule_redpacket.py"
+    rp_dst = tmp / "rule_redpacket.py"
     if rp_src.is_file():
-        rp_dst = tmp / "rule_redpacket.py"
         rp_dst.write_text(rp_src.read_text(encoding="utf-8"), encoding="utf-8")
-        err = eng2.activate(3, "rule_redpacket@1.0", rp_dst)
-        step("红包玩法激活", err is None, err or "")
-        step("has_redpacket_handler=True", eng2.has_redpacket_handler())
-        r, d = eng2.handle_redpacket(10001, 1, "甲", 1.11)
-        step("红包 1.11 → 回复+3分", r == "领取1.11元，获得3积分" and d == 3, f"{r!r},{d}")
-        r, d = eng2.handle_redpacket(10001, 2, "乙", 0.15)
-        step("红包 0.15 → 6分", d == 6, str(d))
-        r, d = eng2.handle_redpacket(10001, 3, "丙", 0)
-        step("金额0 → 不计", r is None and d == 0)
-        err = eng2.activate(7, "v2demo@1.0", v2)
-        step("切回无红包协议的玩法", err is None and not eng2.has_redpacket_handler())
+        step("红包样本 rule_redpacket.py 从仓库 play_rules/ 取用", True)
+    else:
+        rp_dst.write_text(_SAMPLE_REDPACKET, encoding="utf-8")
+        step("红包样本 rule_redpacket.py 回退内联（仓库 play_rules/ 已删除）", True)
+    err = eng2.activate(3, "rule_redpacket@1.0", rp_dst)
+    step("红包玩法激活", err is None, err or "")
+    step("has_redpacket_handler=True", eng2.has_redpacket_handler())
+    r, d = eng2.handle_redpacket(10001, 1, "甲", 1.11)
+    step("红包 1.11 → 回复+3分", r == "领取1.11元，获得3积分" and d == 3, f"{r!r},{d}")
+    r, d = eng2.handle_redpacket(10001, 2, "乙", 0.15)
+    step("红包 0.15 → 6分", d == 6, str(d))
+    r, d = eng2.handle_redpacket(10001, 3, "丙", 0)
+    step("金额0 → 不计", r is None and d == 0)
+    err = eng2.activate(7, "v2demo@1.0", v2)
+    step("切回无红包协议的玩法", err is None and not eng2.has_redpacket_handler())
 
     # ---- 局生命周期通知：handle_round_start / handle_round_end ----
     rh = tmp / "rule_round.py"

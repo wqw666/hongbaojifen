@@ -19,8 +19,8 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * 默认玩法种子（V1.0.2 迁移 + classpath:seed_rules/ + PlayRuleService.ensureSeedRules）
- * 任何环境部署即有 rule_add1/rule_add2，且 open 下载能取到文件内容。
+ * 默认玩法种子（classpath:seed_rules/rule_fuhe.py + PlayRuleService.ensureSeedRules）
+ * 任何环境部署即有唯一玩法「复合玩法」，且 open 下载能取到文件内容。
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -41,27 +41,25 @@ class SeedPlayRuleTest {
 
     @Test
     void seedResourcesOnClasspath() throws Exception {
-        // 玩法文件随 jar 内置（内容与 agent/play_rules 样本同源，UTF-8）
-        byte[] b1 = new ClassPathResource("seed_rules/rule_add1.py").getInputStream().readAllBytes();
-        byte[] b2 = new ClassPathResource("seed_rules/rule_add2.py").getInputStream().readAllBytes();
-        assertThat(b1).isNotEmpty();
-        assertThat(b2).isNotEmpty();
-        assertThat(new String(b1, StandardCharsets.UTF_8)).contains("handle_message");
-        assertThat(b1.length).isEqualTo(633); // 与 V1.0.2 迁移 file_size 一致
-        assertThat(b2.length).isEqualTo(678);
+        // 玩法文件随 jar 内置（内容与 agent/play_rules/rule_fuhe.py 同源，UTF-8）
+        byte[] b = new ClassPathResource("seed_rules/rule_fuhe.py").getInputStream().readAllBytes();
+        assertThat(b).isNotEmpty();
+        assertThat(new String(b, StandardCharsets.UTF_8)).contains("handle_message");
+        assertThat(b.length).isEqualTo(30521); // 与 agent/play_rules/rule_fuhe.py 字节数一致
     }
 
     @Test
     void seedFilesAreLaidDownAndDownloadable() throws Exception {
         // Bean 构造时 @PostConstruct 已把种子文件落盘到 rules-dir（target/test-rules）
-        File f = new File("target/test-rules/seed_rule_add1.py");
+        File f = new File("target/test-rules/seed_rule_fuhe.py");
         assertThat(f).exists();
-        byte[] expected = new ClassPathResource("seed_rules/rule_add1.py").getInputStream().readAllBytes();
+        byte[] expected = new ClassPathResource("seed_rules/rule_fuhe.py").getInputStream().readAllBytes();
 
-        // 模拟迁移插入的元数据行（生产由 V1.0.2 负责；测试上下文不跑 Flyway）
-        jdbc.update("INSERT INTO play_rule_files (name, description, file_name, file_size, version, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
-                "rule_add1", "测试玩法1", "seed_rule_add1.py", expected.length, "1.0", "active", "2026-01-01 00:00:00", "2026-01-01 00:00:00");
+        // @BeforeEach 已 TRUNCATE，再触发 ensureSeedRules 让兜底插入「复合玩法」元数据行
+        playRuleService.ensureSeedRules();
         Long id = jdbc.queryForObject("SELECT MAX(id) FROM play_rule_files", Long.class);
+        assertThat(jdbc.queryForObject("SELECT name FROM play_rule_files WHERE id=?", String.class, id))
+                .isEqualTo("复合玩法");
 
         byte[] body = mvc.perform(get("/api/open/rules/" + id + "/download")
                         .header("X-Api-Key", "test-open-key"))
@@ -74,10 +72,15 @@ class SeedPlayRuleTest {
     void ensureSeedRulesIdempotent() throws Exception {
         // 文件已存在时再次触发不覆盖、不报错（用户重传替换后也不会被重置）
         byte[] before = java.nio.file.Files.readAllBytes(
-                new File("target/test-rules/seed_rule_add2.py").toPath());
+                new File("target/test-rules/seed_rule_fuhe.py").toPath());
         playRuleService.ensureSeedRules();
         byte[] after = java.nio.file.Files.readAllBytes(
-                new File("target/test-rules/seed_rule_add2.py").toPath());
+                new File("target/test-rules/seed_rule_fuhe.py").toPath());
         assertThat(after).isEqualTo(before);
+        // 元数据行同样幂等：active「复合玩法」已存在则不重复插入
+        playRuleService.ensureSeedRules();
+        Integer cnt = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM play_rule_files WHERE name='复合玩法' AND status='active'", Integer.class);
+        assertThat(cnt).isEqualTo(1);
     }
 }

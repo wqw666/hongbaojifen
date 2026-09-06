@@ -78,14 +78,14 @@
 10. **VERSION 文件在 Windows 编辑会带 \r（CRLF）** — start.sh/deploy.sh 已用通配符 + `tr -d '\r'` 防御；手动编辑 VERSION 注意行尾。
 11. **运行中后端可能落后于代码/迁移**（血泪）：IDEA 在 V1.0.3 落地前启动的旧进程 → 新 URL 通（controller 按需加载）但新表/列缺失（对局上报 50002）。判断：查 flyway_schema_history 是否到 1.0.4，或 `GET /api/open/groups` 是否带 create_time。修复：taskkill 后重启（Flyway 自动补齐），别急着改代码。
 12. **tools/e2e_full.py 需要 8892 起好后端**（本机 MySQL 真实写入）；执行器名/round_id 带时间戳，重复执行不冲突；积分断言用「基线→变动量」而非绝对值（可重复跑）。
-13. **agent 停摆态**：执行器被封禁(40310)或操作员被停用/禁手动(40311) → SyncWorker/玩法全部停下，GUI 红字提示；解封后重开 GUI 自动恢复；**若重置过 token 需在 GUI 重填**。玩法事件在结算成功前留在本地，关 GUI 前先「结算并上报」。
+13. **agent 停摆态**：执行器被封禁(40310)或操作员被停用/禁手动(40311) → SyncWorker/玩法全部停下，GUI 红字提示；解封后重开 GUI 自动恢复；**若重置过 token 需在 GUI 重填**。红包局在结算成功前留在本地，关 GUI 前先在玩法页「结算」或「作废本局」。
 14. **后端当前由 bash 启动（PID 12204）**，IDEA 的旧 run tab 显示 stopped 属正常；要用 IDEA 跑先把 bash 那个 kill 掉。
 
 ## 结构速览
 
 - `src/main/java/com/hbjf/api/` — controller（admin 管理端 + open 开放端）/ service（含 RetentionCleanupService 定时清理）/ security / dao（RowMapMapper）/ util（MapBuilder）
-- `src/main/resources/db/migration/` — V1__init.sql（9 表）+ V1.0.1(executor_commands)/V1.0.2(玩法种子)/V1.0.3(群封禁·执行器操作员·游戏记录)/V1.0.4(biz_no 加宽)
-- `frontend/src/App.jsx` — 8 菜单：会员管理 / QQ群管理 / 操作员管理 / 配置管理 / 执行器管理 / 会员玩法管理 / 游戏记录 / 操作记录；组件在 `components/`（QqGroupManager 有封禁状态、QqAccountManager 有禁手动、ExecutorManager 有封禁按钮、GameRecordManager 回放）
+- `src/main/resources/db/migration/` — V1__init.sql（9 表）+ V1.0.1(executor_commands)/V1.0.2(玩法种子)/V1.0.3(群封禁·执行器操作员·游戏记录)/V1.0.4(biz_no 加宽)/V1.0.7(红包玩法种子)/V1.0.8(游戏记录回放明细)/V1.0.9(保留天数配置)/V1.0.10(执行器费率)/V1.0.11(删旧玩法种子只留复合玩法)；5/6 号跳号未用。玩法内置种子在 `src/main/resources/seed_rules/rule_fuhe.py`（启动 ensureSeedRules 兜底落盘 data/rules）
+- `frontend/src/App.jsx` — 9 菜单：会员管理 / QQ群管理 / 操作员管理 / 配置管理 / 执行器管理 / 会员玩法管理 / 游戏记录 / 操作记录 / 用户管理（仅内置超级管理员 admin 可见可管，`AdminUsers.jsx` 增删用户/重置密码）；组件在 `components/`（QqGroupManager 有封禁状态、QqAccountManager 有禁手动、ExecutorManager 有封禁按钮、GameRecordManager 回放）
 - `agent/` — 执行器（README + docs/代码架构说明.md + docs/玩法v2结算与上报设计.md 见 agent 侧）；integration/ 对接包独立于 GUI
 - `data/rules/` — 玩法文件存储（运行时自动创建）
 - `tools/e2e_full.py` — 全链路 E2E（本机）

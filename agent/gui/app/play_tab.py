@@ -1,17 +1,18 @@
-"""第 8 个 Tab「游戏玩法」：多游戏群玩法回复 + 结算自动上报总后台。
+"""第 8 个 Tab「游戏玩法」：复合玩法手动驱动操作台（唯一玩法，多群各开各局）。
 
-能力（v2）：
-- 从总后台拉取启用的玩法列表，下载所选玩法 .py 到本地缓存
-- 游戏群：可填多个（逗号分隔）。插件把已启用群的群消息转发到本机回调端口 →
-  玩法引擎按规则算 (回复, 积分变动 delta) → 有回复时插件自动 @ 发言者发回群里
+能力（v3）：
+- 启动后自动激活唯一玩法（复合玩法）：拉总后台 active 玩法列表 → 挑名字含「复合」的玩法
+  （没有则取第一条）→ 下载到本地 plays/ 缓存 → 插件转发配置（有游戏群时）→ 本地引擎激活
+- 多群各开各局：「当前群」切换器决定按钮与开奖表作用对象；开始本局 / 停止下注 / 结算 /
+  作废本局 四个手动按钮驱动本局生命周期（各群独立，互不影响）
+- 开奖表（右侧半宽可编辑）：双击「抢到金额」修改或补填 0.01~0.99（点数随之重算）；
+  下注列不可改；结算成功后结果保留展示到下次开局
+- 管理员发红包开奖：红包领取事件进玩法判定（首红包/领完即「可结算」），份数不足自动作废；
+  「结算」= 玩法批量结算 → 上报总后台（round_id 幂等）→ 成功才 @全体 播报
 - 玩法协议 v2：handle_message(group_id, qq, nickname, text) 可返回
   None / 回复文本 / (回复, delta) / {"reply":…, "delta":…}（str 单返回=旧协议 delta=0）
-- 每个游戏群维护「当前局」（RoundSession）：有回复或 delta≠0 的消息入局记回放；
-  达到 1000 事件自动结算上报一次；「结算并上报」手动上报全部群（round_id 幂等，
-  可重复结算不重复入账）；上报失败事件保留可重试
-- 启用玩法时可自动把游戏群成员注册为会员并拉积分（play_auto_register_members 开关）
-- 执行器被封禁（40310）/操作员停用（40311）→ 玩法停摆红字，事件保留待解封后重试上报
-- 重启 GUI 自动恢复上次启用的玩法（重新下载最新版 + 多群转发）
+- 执行器被封禁（40310）/操作员停用（40311）→ 玩法停摆红字，待解封后重试上报
+- 重启 GUI 自动恢复：重新下载玩法最新版 + 多群转发 + 自动激活
 
 线程纪律：所有网络/引擎操作在临时 daemon 线程，UI 一律 after(0) 回主线程改控件
 （与 backend_tab / main_window 同款模式）。
@@ -25,6 +26,7 @@ import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from tkinter import ttk
 from typing import Any, Callable
 
 import customtkinter as ctk
@@ -67,32 +69,31 @@ class PlayTab(ctk.CTkScrollableFrame):
         self.app_version = app_version
 
         self.engine = RuleEngine(rules_dir=cfg.plays_dir())
-        self.session: RoundSession | None = None  # 启用玩法后存在；停止后清空
-        self.rp_game: RedPacketGame | None = None  # 红包计分玩法（勾选开关后启用）
+        self.session: RoundSession | None = None  # 复合玩法不建对局会话（保持 None，旧引用判空不触发）
+        self.rp_game: RedPacketGame | None = None  # 红包计分玩法（玩法含 handle_redpacket 时启用）
         self._admin_cache: dict[str, tuple[float, set[str]]] = {}
         self._points_cache: dict[str, tuple[float, int]] = {}
         self._base_cooldown: dict[str, float] = {}  # 无效指令按群冷却
         self._query_cooldown: dict[str, float] = {}  # 查分按 群:qq 冷却
         self._active_groups: set[str] = set()     # 已启用转发的游戏群
+        self._cur_group: str = ""                # 当前操作群
+        self._table_rows: dict[str, list] = {}   # 群 -> 表格行缓存（结算后保留展示用）
+        self._table_live: set[str] = set()       # 群 -> 有活动本局（live 数据源有效）
         self._msg_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._server: ThreadingHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
         self._server_error = ""
-        self._rules_rows: list[dict] = []
-        self._selected_rule_id: int | None = None
         self._busy = False
         self._banned_reason: str = ""               # 非空=玩法已停摆（红字展示）
-        self._continuous = False                    # 连续开局模式：每局结束后 60 秒自动开下一局
-        self._cont_next_at: float | None = None     # 下一局自动开始时间戳
         self._last_settle: dict[str, dict] = {}     # gid -> {ok, error, time}
         self._payload_cache: dict[str, tuple[float, dict]] = {}  # 群成员 payload 30s 缓存
 
         self.on_approve = None  # MainWindow 挂接审批页 push
         self._build_ui()
         self._start_callback_server()
-        # GUI 启动时自动恢复上次启用的玩法
+        # GUI 启动时自动激活唯一玩法（复合玩法）
         self.after(400, self._auto_restore)
 
     # ================= 界面构建 =================
@@ -101,29 +102,19 @@ class PlayTab(ctk.CTkScrollableFrame):
         # ---- 引擎状态 ----
         card = ctk.CTkFrame(self)
         card.pack(fill="x", padx=4, pady=(2, 6))
-        ctk.CTkLabel(card, text="玩法回复引擎（游戏群多群，回复自动@发言者）",
+        ctk.CTkLabel(card, text="复合玩法操作台（多群各开各局；按钮与开奖表只作用于「当前群」）",
                      font=ctk.CTkFont(size=15, weight="bold")).pack(
             anchor="w", padx=10, pady=(8, 2))
         self.lbl_state = ctk.CTkLabel(card, text="初始化中…", text_color="orange", wraplength=760,
                                       justify="left", anchor="w")
         self.lbl_state.pack(fill="x", padx=10, pady=(2, 4))
 
-        # ---- 玩法选择（总后台）----
+        # ---- 费率 / 最小下注 / 游戏群 / 本局操作 ----
         card = ctk.CTkFrame(self)
         card.pack(fill="x", padx=4, pady=6)
-        ctk.CTkLabel(card, text="玩法选择（总后台「会员玩法管理」上传，仅启用状态可见）",
-                     font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", padx=10, pady=(8, 2))
-        row = ctk.CTkFrame(card, fg_color="transparent")
-        row.pack(fill="x", padx=10, pady=2)
-        self.opt_rule = ctk.CTkOptionMenu(row, values=["（先刷新玩法列表）"], width=300,
-                                          command=self._on_rule_picked)
-        self.opt_rule.pack(side="left")
-        ctk.CTkButton(row, text="刷新玩法列表", width=120, command=self._refresh_rules).pack(side="left", padx=6)
-        self.lbl_rules = ctk.CTkLabel(row, text="未连接", text_color="gray")
-        self.lbl_rules.pack(side="left", padx=8)
 
         fee_row = ctk.CTkFrame(card, fg_color="transparent")
-        fee_row.pack(fill="x", padx=10, pady=(2, 4))
+        fee_row.pack(fill="x", padx=10, pady=(8, 2))
         ctk.CTkLabel(fee_row, text="游戏费率(‰)", width=96, anchor="w").pack(side="left")
         self.entry_fee_rate = ctk.CTkEntry(fee_row, width=70)
         self.entry_fee_rate.insert(0, str(int(getattr(self.cfg, "game_fee_rate", 20) or 20)))
@@ -134,7 +125,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         ctk.CTkButton(fee_row, text="保存费率", width=90, command=self._save_fee_rate).pack(side="left", padx=4)
 
         bet_row = ctk.CTkFrame(card, fg_color="transparent")
-        bet_row.pack(fill="x", padx=10, pady=(2, 6))
+        bet_row.pack(fill="x", padx=10, pady=(2, 2))
         ctk.CTkLabel(bet_row, text="最小下注(积分)", width=96, anchor="w").pack(side="left")
         self.entry_min_bet = ctk.CTkEntry(bet_row, width=70)
         self.entry_min_bet.insert(0, str(int(getattr(self.cfg, "play_min_bet", 10) or 10)))
@@ -150,7 +141,8 @@ class PlayTab(ctk.CTkScrollableFrame):
         ctk.CTkLabel(row, text="游戏群（勾选参与玩法的群，可多选）", width=230, anchor="w").pack(side="left")
         ctk.CTkButton(row, text="刷新群列表", width=100, command=self._refresh_group_checkboxes).pack(side="left", padx=4)
         self.var_auto_members = ctk.BooleanVar(value=self.cfg.play_auto_register_members)
-        ctk.CTkCheckBox(row, text="启用时自动注册群成员为会员", variable=self.var_auto_members).pack(side="left", padx=8)
+        ctk.CTkCheckBox(row, text="启用时自动注册群成员为会员", variable=self.var_auto_members,
+                        command=self._save_auto_members).pack(side="left", padx=8)
         ctk.CTkLabel(row, text="（群号在「群管理」页维护，运行中勾选/取消即时生效）",
                      text_color="gray", font=ctk.CTkFont(size=11)).pack(side="left")
 
@@ -159,33 +151,62 @@ class PlayTab(ctk.CTkScrollableFrame):
         self._group_vars: dict[str, ctk.BooleanVar] = {}
         self._group_labels: dict[str, ctk.CTkLabel] = {}
 
+        # ---- 按钮行：当前群切换器 + 本局操作 ----
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=(2, 8))
-        ctk.CTkButton(row, text="启用玩法", width=100, command=self._enable_play).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(row, text="停止玩法（先结算）", width=140, command=self._stop_play).pack(side="left", padx=6)
-        ctk.CTkButton(row, text="开始本局", width=90, command=self._start_round).pack(side="left", padx=6)
-        ctk.CTkButton(row, text="结束本局", width=90, command=self._end_round).pack(side="left", padx=6)
-        self.btn_cont = ctk.CTkButton(row, text="连续开局", width=90, command=self._toggle_continuous)
-        self.btn_cont.pack(side="left", padx=6)
-        ctk.CTkButton(row, text="结算并上报", width=110, command=lambda: self._settle_groups(failed_only=False)).pack(side="left", padx=6)
-        ctk.CTkButton(row, text="重试未上报", width=110, command=lambda: self._settle_groups(failed_only=True)).pack(side="left", padx=6)
-        ctk.CTkLabel(row, text="玩法=Python 文件：handle_message(群号,QQ,昵称,发言) → 回复文本 / None，"
-                              "或 (回复,积分变动) / {reply,delta} 返回积分；结算上报总后台校验后入账（round_id 幂等）",
-                     text_color="gray", font=ctk.CTkFont(size=11), wraplength=430, justify="left").pack(
-            side="left", padx=8)
+        ctk.CTkLabel(row, text="当前群", font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(0, 6))
+        self.opt_group = ctk.CTkOptionMenu(row, values=["（无游戏群）"], width=160,
+                                           command=self._on_group_picked)
+        self.opt_group.pack(side="left", padx=(0, 12))
+        ctk.CTkButton(row, text="开始本局", width=90, command=self._start_round_cur).pack(side="left", padx=4)
+        self.btn_seal = ctk.CTkButton(row, text="停止下注", width=90, command=self._seal_round_cur)
+        self.btn_seal.pack(side="left", padx=4)
+        self.btn_settle = ctk.CTkButton(row, text="结算", width=80, command=self._settle_round_cur)
+        self.btn_settle.pack(side="left", padx=4)
+        self.btn_void = ctk.CTkButton(row, text="作废本局", width=90, command=self._void_round_cur)
+        self.btn_void.pack(side="left", padx=4)
+        ctk.CTkButton(row, text="更新玩法文件", width=110, command=self._reload_rule).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="重试未上报", width=110, command=self._retry_rp_pending_ui).pack(side="left", padx=4)
 
         # ---- 各群当前局状态 ----
         self.lbl_rounds = ctk.CTkLabel(self, text="", text_color="#2ecc71", anchor="w", justify="left",
                                        wraplength=900, font=ctk.CTkFont(size=12))
         self.lbl_rounds.pack(fill="x", padx=14, pady=(0, 4))
 
-        # ---- 日志 ----
-        card = ctk.CTkFrame(self)
-        card.pack(fill="both", expand=True, padx=4, pady=6)
-        ctk.CTkLabel(card, text="玩法日志（收到的发言 / 入局计分 / 结算上报结果）",
+        # ---- 下半区：左日志 / 右开奖表格 ----
+        lower = ctk.CTkFrame(self)
+        lower.pack(fill="both", expand=True, padx=4, pady=6)
+        lower.grid_columnconfigure(0, weight=1)
+        lower.grid_columnconfigure(1, weight=1)
+        card_l = ctk.CTkFrame(lower)
+        card_l.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+        card_r = ctk.CTkFrame(lower)
+        card_r.grid(row=0, column=1, sticky="nsew", padx=(3, 0))
+        ctk.CTkLabel(card_l, text="玩法日志（发言 / 开奖 / 上报结果）",
                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=10, pady=(6, 2))
-        self.txt_log = ctk.CTkTextbox(card, height=170, state="disabled", font=ctk.CTkFont(size=11))
+        self.txt_log = ctk.CTkTextbox(card_l, height=240, state="disabled",
+                                      font=ctk.CTkFont(size=11))
         self.txt_log.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        top_r = ctk.CTkFrame(card_r, fg_color="transparent")
+        top_r.pack(fill="x", padx=10, pady=(6, 2))
+        ctk.CTkLabel(top_r, text="本局开奖表（双击「抢到金额」可修改；下注不可改）｜ 当前群：",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
+        self.lbl_table_group = ctk.CTkLabel(top_r, text="", text_color="#2ecc71",
+                                            font=ctk.CTkFont(size=13, weight="bold"))
+        self.lbl_table_group.pack(side="left", padx=4)
+        table_frame = ctk.CTkFrame(card_r)
+        table_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        cols = ("nick", "bet", "amount", "pts", "result")
+        heads = ("昵称", "下注(积分)", "抢到金额(元)", "点数", "结算结果")
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=8)
+        for c, h in zip(cols, heads):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=70 if c != "nick" else 90, anchor="center")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", self._on_table_dclick)
+        self.lbl_table_tip = ctk.CTkLabel(card_r, text="", text_color="gray", anchor="w",
+                                          font=ctk.CTkFont(size=11), wraplength=480, justify="left")
+        self.lbl_table_tip.pack(fill="x", padx=10, pady=(0, 4))
 
         # 所有控件就绪后再重建群勾选列表（内部会刷新各群状态标签）
         self._refresh_group_checkboxes()
@@ -274,7 +295,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         self._msg_queue.put({"kind": "redpacket", "payload": data})
 
     def _worker_loop(self) -> None:
-        """消息 worker：过玩法引擎 → 入局记回放 → 需要回复时发回群里；事件满 soft 上限自动结算。"""
+        """消息 worker：过玩法引擎 → 需要回复时发回群里（复合玩法积分只经红包结算产生）。"""
         while not self._stop.is_set():
             try:
                 item = self._msg_queue.get(timeout=0.5)
@@ -303,7 +324,6 @@ class PlayTab(ctk.CTkScrollableFrame):
             return
         except Exception:
             pass
-        self._check_continuous()
         if not game.pending:
             return
         now = time.time()
@@ -316,105 +336,380 @@ class PlayTab(ctk.CTkScrollableFrame):
             self._mark_banned(e)
         except Exception as e:  # noqa: BLE001
             self.after(0, self._log, f"✗ 红包局重试异常: {e}")
-
-    # ================= 开始本局 / 结束本局 =================
-
-    def _toggle_continuous(self) -> None:
-        """连续开局开关：开启→循环自动开局；终止→作废局内数据并停止循环。"""
-        if self._continuous:
-            self._continuous = False
-            self._cont_next_at = None
-            self._log_sep()
-            self._log("连续开局已终止")
-            if self.rp_game is not None:
-                n = self.rp_game.cancel_rounds()
-                if n:
-                    self._log(f"已作废 {n} 个进行中的本局（数据不上报）")
-            self.btn_cont.configure(text="连续开局", fg_color="#3B8ED0", hover_color="#36719F")
-            self._rounds_refresh()
         else:
-            if not self.engine.is_active():
-                self._log("✗ 请先启用玩法再连续开局")
+            self.after(0, self._table_refresh)
+            self.after(0, self._rounds_refresh)
+
+    # ================= 操作台：当前群切换器 + 开奖表格 =================
+
+    def _cur_groups(self) -> list[str]:
+        """「当前群」可选值：已激活游戏群优先，其次配置的游戏群/监控群。"""
+        groups: list[str] = []
+        for g in list(self._active_groups) + self.cfg.play_group_list() \
+                 + self.cfg.watch_group_list():
+            if g not in groups:
+                groups.append(g)
+        return groups
+
+    def _refresh_group_optmenu(self) -> None:
+        groups = self._cur_groups()
+        self.opt_group.configure(values=groups or ["（无游戏群）"])
+        cur = self.cfg.play_group_current
+        if not cur or cur not in groups:
+            cur = groups[0] if groups else ""
+        self._set_cur_group(cur)
+
+    def _set_cur_group(self, gid: str) -> None:
+        if not gid:
+            self._cur_group = ""
+            self.opt_group.set("（无游戏群）")
+        else:
+            self._cur_group = gid
+            self.opt_group.set(gid)
+            if self.cfg.play_group_current != gid:
+                self.cfg.play_group_current = gid
+                self.save_config(self.cfg)
+        self.lbl_table_group.configure(text=self._cur_group or "（未选）")
+        self._table_refresh()
+        self._gate_buttons()
+
+    def _on_group_picked(self, choice: str) -> None:
+        if choice and not choice.startswith("（"):
+            self._set_cur_group(choice)
+
+    def _table_rows_for(self, gid: str) -> list[dict]:
+        """当前群表格行（live 数据 = 玩法 bet_snapshot + rpg claims 金额）。"""
+        if not (self.engine.is_active() and self.rp_game is not None):
+            return []
+        snap = self.engine.call_rule("bet_snapshot", gid) or []
+        if not snap and gid not in self.rp_game.announced:
+            return []  # 无局
+        ann = self.rp_game.announced.get(gid)
+        rows = []
+        for r in snap:
+            qq = str(r.get("qq") or "")
+            c = (ann or {}).get("claims", {}).get(qq) or {}
+            amount = c.get("amount")
+            rows.append({"qq": qq, "nickname": r.get("nickname") or qq,
+                         "bet": "坐庄" if r.get("boss") else str(r.get("amount")),
+                         "amount": amount, "pts": self._pts_preview(amount),
+                         "edited": bool(c.get("edited")), "boss": bool(r.get("boss")),
+                         "result": ""})
+        return rows
+
+    @staticmethod
+    def _pts_preview(amount) -> str:
+        """抢到金额 -> 点数预览（与玩法一致：(a+b)%10；无效显 ?）。"""
+        try:
+            a = float(amount or 0)
+        except (TypeError, ValueError):
+            return "?"
+        if not (0 < a <= 0.99):
+            return "?"
+        s = f"{a:.2f}"
+        return str((int(s[2]) + int(s[3])) % 10)
+
+    def _render_table(self, rows: list[dict]) -> None:
+        """把行渲染进 tree（覆盖旧行）；amount 为空显示「未抢」，结果列原样。"""
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        self.tree.tag_configure("warn", foreground="#c0392b")
+        for r in rows:
+            amt = r.get("amount")
+            tags = []
+            if not isinstance(amt, (int, float)) or not (0 < float(amt) <= 0.99):
+                tags.append("warn")
+            self.tree.insert("", "end", iid=r["qq"], values=(
+                r["nickname"], r["bet"],
+                "未抢" if not isinstance(amt, (int, float)) else f"{amt:.2f}",
+                r["pts"], r["result"]), tags=tags)
+
+    def _table_refresh(self) -> None:
+        """刷新当前群表格与状态提示行。
+
+        有活动本局 → 取 live 行并更新缓存；无活动本局 → 渲染上次缓存（结算后保留展示，
+        spec §2.1），直到「开始本局」清空。"""
+        gid = self._cur_group
+        if not gid or not hasattr(self, "tree"):
+            return
+        rows = self._table_rows_for(gid) if gid else []
+        if rows:
+            self._table_rows[gid] = rows
+            self._table_live.add(gid)
+        elif gid in self._table_rows and self._table_rows[gid]:
+            rows = self._table_rows[gid]
+            self._table_live.discard(gid)
+        else:
+            rows = []
+        self._render_table(rows)
+        self.lbl_table_tip.configure(text=self._cur_round_state_txt(gid))
+
+    def _cur_round_state_txt(self, gid: str) -> str:
+        """当前群局状态提示行（供表格下说明条；无局/无玩法给引导文案）。"""
+        if not (self.engine.is_active() and self.rp_game is not None):
+            return "玩法未激活"
+        if gid not in self.rp_game.announced:
+            if gid in self._table_rows and self._table_rows[gid]:
+                return "上一局已结束（结算结果如上）；点「开始本局」开新局"
+            return "无进行中本局：点「开始本局」开局（将 @全体 播报开始消息）"
+        info = self.engine.call_rule("seal_info", gid) or {}
+        phase = info.get("phase") or "idle"
+        rid = info.get("round_id") or ""
+        ann = self.rp_game.announced[gid]
+        fb = ann.get("first_bill")
+        need = int(info.get("claim_need") or 0)
+        n_bets = int(info.get("n_bets") or 0)
+        if phase == "betting":
+            fb_txt = f"｜首红包 {fb['total_num']}/{need} 份" if fb else ""
+            return f"下注期 ｜ 局 {rid} ｜ 已下注 {n_bets} 人，需开奖 {need} 人{fb_txt}"
+        if ann.get("ready_to_settle"):
+            return f"已封盘 ｜ 红包已领完 → 可点「结算」（也可先双击表格改/补开奖金额）"
+        if fb:
+            return (f"已封盘 ｜ 红包 {fb.get('total_num')} 份（需 {need}）"
+                    f"{fb.get('recv_num')} 人已领，领完即可结算；份数不足将自动作废")
+        return f"已封盘 ｜ 局 {rid}：等管理员发红包开奖（份数≥{need}，每份 0.01~0.99 元）"
+
+    def _on_table_dclick(self, event=None) -> None:
+        """双击表格：仅「抢到金额」列（#3）弹窗改值；未抢者=补值（视同抢到）。"""
+        gid = self._cur_group
+        if not gid or not (self.rp_game and gid in self.rp_game.announced):
+            self._log("✗ 当前群没有可编辑的本局（先「开始本局」）")
+            return
+        if not event or self.tree.identify_column(event.x) != "#3":
+            return
+        sel = self.tree.selection()
+        if not sel:
+            return
+        info = self.engine.call_rule("seal_info", gid) or {}
+        if info.get("phase") not in ("betting", "sealed"):
+            self._log("✗ 当前局不在下注/封盘期，不能改开奖")
+            return
+        qq = sel[0]
+        win = ctk.CTkToplevel(self)
+        win.title(f"改开奖金额 - {gid}")
+        win.geometry("340x150")
+        ctk.CTkLabel(win, text="新抢到金额（元，0.01~0.99，两位小数）：").pack(padx=12, pady=(12, 2))
+        entry = ctk.CTkEntry(win)
+        entry.pack(padx=12, fill="x")
+        ctk.CTkLabel(win, text="只改开奖金额（点数随之变化）；下注不可改；未抢者可在此补值",
+                     text_color="gray", font=ctk.CTkFont(size=11)).pack(padx=12, pady=(2, 6))
+
+        def ok() -> None:
+            v = entry.get().strip()
+            try:
+                fv = round(float(v), 2)
+            except ValueError:
+                self._log("✗ 金额需为数字")
                 return
-            self._continuous = True
-            self._cont_next_at = None
-            self._log_sep()
-            self._log("连续开局模式已开启：每局结束并播报统计后，60 秒自动开下一局")
-            self.btn_cont.configure(text="终止连续", fg_color="#c0392b", hover_color="#a93226")
-            active = (self.rp_game is not None and
-                      any(self.rp_game.has_active_round(g) for g in self._active_groups))
-            if active:
-                self._log("检测到进行中的本局，先继续当前局")
-            else:
-                self._start_round()
+            err = self.rp_game.set_claim_amount(gid, qq, fv)
+            if err:
+                self._log(f"✗ 改开奖失败：{err}")
+                return
+            nick = next((r["nickname"] for r in self._table_rows.get(gid, [])
+                         if r["qq"] == qq), qq)
+            self._log(f"管理员改开奖：群{gid} {nick}({qq}) → {fv:.2f}（点 {self._pts_preview(fv)}）")
+            win.destroy()
+            self._table_refresh()
 
-    def _check_continuous(self) -> None:
-        """worker 定时调用：连续模式下，局结束 60 秒后自动开下一局。"""
-        if not self._continuous:
-            return
-        if self._cont_next_at is None:
-            active = (self.rp_game is not None and
-                      any(self.rp_game.has_active_round(g) for g in self._active_groups))
-            if not active:
-                self._cont_next_at = time.time() + 60
-                self.after(0, self._log, "本局已结束，60 秒后自动开启下一局…")
-            return
-        if time.time() >= self._cont_next_at:
-            self._cont_next_at = None
-            self.after(0, self._start_round)
+        ctk.CTkButton(win, text="确定", width=120, command=ok).pack(pady=6)
+        entry.focus_set()
 
-    def _start_round(self) -> None:
-        """「开始本局」：为每个已勾选游戏群生成局号 → @全体公告 → 进入本局记录模式。"""
-        if not self.engine.is_active():
-            self._log("✗ 请先启用玩法再开始本局")
+    # ================= 本局操作按钮（当前群） =================
+
+    def _gate_buttons(self) -> None:
+        """按当前群局状态开关 停止下注/结算/作废。开始本局按钮随 rp 有无 active 局切换。"""
+        if not hasattr(self, "btn_seal"):
             return
-        self._cont_next_at = None  # 手动开始：取消挂起的自动开局
-        self._log_sep()
-        rule = self._selected_rule() or {}
-        intro = str(rule.get("description") or "").strip()
-        name = self.cfg.play_rule_name or "玩法"
-        seq = int(getattr(self.cfg, "game_round_seq", 0) or 0)
-        started = []
-        for gid in sorted(self._active_groups):
-            seq += 1
-            round_id = f"hongbaojifen_{seq:08d}"
-            if self.rp_game is not None:
-                self.rp_game.start_round(gid, round_id, name)
-            # 开局通知玩法（可选 handle_round_start(group_id, round_id)）：
-            # 大吃小等玩法借此进入下注期，并拿到局号用于回复「本局 {局号}，累计下注名单」
-            self.engine.notify_round_start(gid, round_id)
-            text = (f"游戏开始，游戏名称为{name}，"
-                    f"游戏介绍为{intro or '无'}"
-                    f"，游戏对局id为：{round_id}")
-            self._rp_send_announce(gid, text)
-            started.append(f"群{gid} 局号 {round_id}")
-            self._log(f"群{gid} 开始本局 {round_id}")
-        if not started:
-            self._log("✗ 没有已勾选的游戏群")
+        gid = self._cur_group
+        active = bool(gid and self.engine.is_active() and self.rp_game is not None)
+        info = self.engine.call_rule("seal_info", gid) if active else {}
+        phase = (info or {}).get("phase") or "idle"
+        has_ann = bool(active and self.rp_game and gid in self.rp_game.announced)
+        self.btn_seal.configure(state="normal" if (active and has_ann and phase == "betting") else "disabled")
+        self.btn_settle.configure(state="normal" if (active and has_ann and phase == "sealed") else "disabled")
+        self.btn_void.configure(state="normal" if (active and has_ann) else "disabled")
+
+    def _clear_round_display(self, gid: str) -> None:
+        """开局前清空上一局表格展示缓存。"""
+        self._table_rows.pop(gid, None)
+        self._table_live.discard(gid)
+
+    def _start_round_cur(self) -> None:
+        gid = self._cur_group
+        if not (gid and self.engine.is_active() and self.rp_game is not None):
+            self._log("✗ 玩法未激活或未选游戏群（先勾选群并等自动激活）")
             return
+        if self.rp_game.has_active_round(gid):
+            self._log(f"✗ 群{gid} 已有进行中的本局，先结算或作废")
+            return
+        self._clear_round_display(gid)
+        name = self.cfg.play_rule_name or "复合玩法"
+        desc = "大吃小×撑庄：发数字下注；发「撑」即可撑庄；封盘后管理员发红包定大小"
+        seq = int(getattr(self.cfg, "game_round_seq", 0) or 0) + 1
+        round_id = f"hongbaojifen_{seq:08d}"
         self.cfg.game_round_seq = seq
         self.save_config(self.cfg)
-        self._log("本局开始公告已发送：" + "；".join(started))
+        self.rp_game.start_round(gid, round_id, name)
+        text = self.engine.call_rule("handle_round_start", gid, round_id) or (
+            f"游戏开始，游戏名称为{name}，游戏介绍为{desc}，游戏对局id为：{round_id}")
+        self._rp_send_announce(gid, text)
+        self._log(f"群{gid} 开始本局 {round_id}")
+        self.after(0, self._table_refresh)
+        self.after(0, self._rounds_refresh)
 
-    def _end_round(self) -> None:
-        """「结束本局」：逐群统计（领取人数/总积分/事件数）→ 上报总后台 → @全体总结。"""
-        if not self.engine.is_active() or self.rp_game is None:
-            self._log("✗ 请先启用含红包协议的玩法")
+    def _seal_round_cur(self) -> None:
+        """停止下注：玩法 handle_seal 汇总 → rp.seal_round（A3 判定）→ 未作废则 @全体 汇总。"""
+        gid = self._cur_group
+        if not (gid and self.engine.is_active() and self.rp_game is not None):
             return
-        groups = [g for g in sorted(self._active_groups) if self.rp_game.has_active_round(g)]
-        if not groups:
-            self._log("没有进行中的本局（请先点「开始本局」）")
+        rate = int(getattr(self.cfg, "game_fee_rate", 20) or 20)
+        ann = self.rp_game.announced.get(gid)
+        if ann is None:
+            self._log(f"✗ 群{gid} 没有进行中的本局（先「开始本局」）")
             return
-        self._log_sep()
-        for gid in groups:
-            try:
-                self.rp_game.end_round(gid)
-            except (ExecutorBanned, OperatorDisabled) as e:
-                self._mark_banned(e)
+        res = self.engine.call_rule("handle_seal", gid, rate)
+        if not isinstance(res, dict):
+            self._log(f"✗ 群{gid} 停止下注失败：玩法无响应")
+            return
+        ann["rate_permille"] = rate
+        if not res.get("ok"):
+            # handle_seal 的 ok=False 有三义（rule_fuhe.handle_seal 文案为准）：
+            #  1) 含「无人下注」——玩法已复位（本局已作废）：播报作废并关局；
+            #  2) 含「没有进行中的本局」——玩法无局（热重载脱钩等）：同上播报作废并关局；
+            #  3) 含「已封盘」（「本局已封盘或不在下注期」）——状态保留（本局已封盘）：
+            #     只日志提示并刷新，不再 void/清表（双击「停止下注」/按钮重试期间再点
+            #     不会把刚封盘的局作废并播误导文案，幂等友好）。
+            text = str(res.get("text") or "本局已作废")
+            if "无人下注" in text or "没有进行中的本局" in text:
+                self._rp_send_announce(gid, text)
+                self.rp_game.void_round(gid, None)
+                self._clear_round_display(gid)
+                self.after(0, self._table_refresh)
+                self.after(0, self._rounds_refresh)
+            else:
+                self._log(f"群{gid} {text}")
+                self._table_refresh()
+                self._rounds_refresh()
+            return
+        self.rp_game.seal_round(gid)   # A3：封盘时首红包已知不足 → 内部直接作废播报
+        if gid not in self.rp_game.announced:  # 已被 seal_round 作废
+            self._clear_round_display(gid)
+            self.after(0, self._table_refresh)
+            self.after(0, self._rounds_refresh)
+            return
+        bc = res.get("banker_check")
+        if bc:
+            qq = str(bc.get("qq") or "")
+            need = int(bc.get("need") or 0)
+            balance = self._query_points(qq)  # 30s 缓存查询（spec 开放项默认接受）
+            if balance < need:
+                # 播报庄家余额不足详情（spec §2.2 模板）；handle_void 照调只用于复位玩法状态
+                # （该分支下规则状态必存在，handle_void 恒返回通用作废文案，不取用）
+                self.engine.call_rule("handle_void", gid)
+                self._rp_send_announce(gid, f"庄家 {bc.get('nickname') or qq} 余额不足"
+                                        f"（需 {need}，实际 {balance}），本局作废（积分未扣）")
+                self.rp_game.void_round(gid, None)
+                self._clear_round_display(gid)
+                self._log(f"群{gid} 庄家余额 {balance} < 需 {need}，本局作废")
+                self.after(0, self._table_refresh)
+                self.after(0, self._rounds_refresh)
                 return
-            except BackendError as e:
-                self._log(f"✗ 群{gid} 结束本局结算失败（事件保留可重试）: {e}")
+        self._rp_send_announce(gid, str(res.get("text") or ""))
+        self._log(f"群{gid} 已停止下注（封盘），等管理员发红包开奖")
+        self.after(0, self._table_refresh)
+        self.after(0, self._rounds_refresh)
+
+    def _settle_round_cur(self) -> None:
+        """结算（当前群）：未领完需二次确认（强结 = 未领者按 0 输光，spec D3）。"""
+        gid = self._cur_group
+        if not (gid and self.engine.is_active() and self.rp_game is not None):
+            return
+        info = self.engine.call_rule("seal_info", gid) or {}
+        if info.get("phase") != "sealed":
+            self._log(f"✗ 群{gid} 未封盘，不能结算（先「停止下注」）")
+            return
+        ann = self.rp_game.announced.get(gid)
+        if ann is None:
+            self._log(f"✗ 群{gid} 没有本局会话")
+            return
+        need = int(info.get("claim_need") or 0)
+        fb = ann.get("first_bill")
+        if not ann.get("ready_to_settle"):
+            if not fb:
+                # 尚未见到红包事件：手动补值已齐（=需开奖人数）→ 与「未领完」同款二次确认后
+                # 放行结算；否则只引导「作废/等红包」，不再承诺补值可结算（除非补满）。
+                # 已确认（_force_ok）且补满 → 落空穿过 fb 逻辑，直接放行到下方结算。
+                if len(ann.get("claims") or {}) >= need:
+                    if not ann.get("_force_ok"):  # 第一次点：警告 + 放行标志
+                        ann["_force_ok"] = True
+                        self._log(f"⚠ 群{gid} 尚未见到红包事件（手动补值 {len(ann['claims'])}/{need} 已齐），"
+                                  f"未补者将按 0 结算（输光）；确认则再点一次「结算」")
+                        return
+                else:
+                    self._log(f"⚠ 群{gid} 尚未见到红包事件，不能结算：可先「作废本局」或等待红包到达"
+                              f"（或双击表格把开奖金额补满 {need} 人后再结算）")
+                    return
+            else:
+                fb_n = int(fb.get("total_num") or 0)
+                if fb_n < need:
+                    self._log(f"✗ 群{gid} 红包 {fb_n} 份 < 需开奖 {need} 人，本局应作废（不能结算）")
+                    return
+                if not ann.get("_force_ok"):  # 第一次点：警告 + 放行标志
+                    ann["_force_ok"] = True
+                    self._log(f"⚠ 群{gid} 红包未领完（{fb.get('recv_num')}/{fb_n}），"
+                              f"未领者将按 0 结算（输光）；确认则再点一次「结算」")
+                    return
+        self._log_sep()
+        self._table_refresh()   # 结算前定格当前开奖表（供结算成功后展示）
+        self._set_busy(True)
+
+        def run() -> None:
+            try:
+                r = self.rp_game.settle_round_now(gid)
+            except (ExecutorBanned, OperatorDisabled) as e:
+                self.after(0, self._mark_banned, e)
+                return
+            except Exception as e:  # noqa: BLE001
+                r = {"ok": False, "error": str(e)}
+            if r.get("ok"):
+                self.after(0, self._after_settle_ok, gid, r.get("results") or [])
+            else:
+                self.after(0, self._log,
+                           f"✗ 群{gid} 结算失败：{r.get('error')}（可「重试未上报」）")
+                self.after(0, self._rounds_refresh)
+            self.after(0, self._set_busy, False)
+
+        threading.Thread(target=run, name="play-settle-cur", daemon=True).start()
+
+    def _after_settle_ok(self, gid: str, results: list[dict]) -> None:
+        """结算成功：把 delta 填进缓存行（结果列），表格保留展示到下次开局（spec §2.1）。"""
+        dmap = {r["qq"]: r for r in results}
+        rows = []
+        for r in self._table_rows.get(gid, []):
+            dr = dmap.get(r["qq"])
+            r = dict(r)
+            r["result"] = "" if dr is None else (f"{dr['delta']:+d}" if dr["delta"] else "平")
+            rows.append(r)
+        self._table_rows[gid] = rows
+        self._log(f"✓ 群{gid} 本局结算成功并已播报，结果保留在开奖表（下次开局清空）")
+        self._table_refresh()
         self._rounds_refresh()
+
+    def _void_round_cur(self) -> None:
+        """作废本局（当前群）：玩法 handle_void 文案 → @全体 播报 → 关局，不上报。"""
+        gid = self._cur_group
+        if not (gid and self.engine.is_active() and self.rp_game is not None):
+            return
+        if not self.rp_game.has_active_round(gid):
+            self._log("当前群没有进行中的本局")
+            return
+        text = self.engine.call_rule("handle_void", gid) or f"本局 {gid} 已作废（积分未扣）"
+        self._rp_send_announce(gid, text)
+        self.rp_game.void_round(gid, None)
+        self._clear_round_display(gid)
+        self._log(f"群{gid} 本局已作废（不上报）")
+        self.after(0, self._table_refresh)
+        self.after(0, self._rounds_refresh)
 
     # ================= 基础玩法（监控群常驻） =================
 
@@ -448,7 +743,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         if m:
             return f"{m.group(1)}{m.group(2)}申请已提交，等待管理员审批"
         if re.match(r"^(压|下注|投注|押)\s*\d+", t):
-            return "不在游戏局内，无法下注（请等管理员发「开始游戏」）"
+            return "不在游戏局内，无法下注（请等管理员在玩法面板点「开始本局」）"
         now = time.time()
         if now - self._base_cooldown.get(gid, 0.0) >= 10:
             self._base_cooldown[gid] = now
@@ -482,9 +777,15 @@ class PlayTab(ctk.CTkScrollableFrame):
             payload["member_count"] = int(data.get("member_count") or 0)
         except Exception:
             payload["member_count"] = 0
+        had = gid in game.announced
         try:
             game.retry_pending()
             game.handle_claim(payload)
+            if had and gid not in game.announced:
+                # 局中作废（A3 红包份数不足 / retry 补结算成功清局）：清掉本局表格展示缓存
+                self._clear_round_display(gid)
+            self.after(0, self._table_refresh)
+            self.after(0, self._rounds_refresh)
         except (ExecutorBanned, OperatorDisabled) as e:
             self._mark_banned(e)
         except Exception as e:  # noqa: BLE001 — 单包事件异常不影响后续
@@ -583,6 +884,7 @@ class PlayTab(ctk.CTkScrollableFrame):
                 get_admin_qqs=self._rp_admin_qqs,
                 get_bettors=lambda gid: self.engine.rule_bettors(gid),
                 query_abort=lambda gid: self.engine.query_round_abort(gid),
+                claim_need=lambda gid: int(self.engine.call_rule("claim_need", gid) or 0),
                 on_log=lambda msg: self.after(0, self._log, msg),
                 on_round_end=lambda gid: self.engine.notify_round_end(gid),
             )
@@ -705,7 +1007,7 @@ class PlayTab(ctk.CTkScrollableFrame):
             return
         self.after(0, self._settle_result_ui, res)
 
-    # ================= 玩法启停 / 结算 =================
+    # ================= 配置 / 群管理 / 激活 =================
 
     def _client(self) -> HbjfClient:
         """总后台客户端（带执行器 token：群/会员/对局上报都据此校验执行器）。"""
@@ -742,9 +1044,6 @@ class PlayTab(ctk.CTkScrollableFrame):
                          text_color="gray").pack(anchor="w", padx=4, pady=4)
         self._rounds_refresh()
 
-    def _checked_groups(self) -> list[str]:
-        return [g for g, v in self._group_vars.items() if v.get()]
-
     def _push_play_groups(self) -> None:
         """把当前激活的游戏群全量推给插件转发（运行中增减群后调用）。"""
         try:
@@ -756,7 +1055,7 @@ class PlayTab(ctk.CTkScrollableFrame):
             pass
 
     def _on_group_toggled(self, gid: str) -> None:
-        """勾选/取消（运行中即时生效：加群或先结算再退群）。"""
+        """勾选/取消（运行中即时生效：加群或退群）。"""
         var = self._group_vars.get(gid)
         if var is None:
             return
@@ -767,23 +1066,15 @@ class PlayTab(ctk.CTkScrollableFrame):
             self._push_play_groups()
             self._log(f"已加入游戏群 {gid}")
         else:
-            # 退群前先结算该群未上报对局；失败则恢复勾选并提示
-            if self.session and gid in self.session.pending_groups():
-                try:
-                    self.session.settle(gid)
-                except (ExecutorBanned, OperatorDisabled) as e:
-                    var.set(True)
-                    self._mark_banned(e)
-                    return
-                except BackendError as e:
-                    var.set(True)
-                    self._log(f"⚠ 群{gid} 有未结算对局且结算失败（已保留勾选）: {e}")
-                    return
             self._active_groups.discard(gid)
             self._push_play_groups()
             self._log(f"已退出游戏群 {gid}")
+        # 勾选/取消即时落盘（重启 _auto_restore 按 play_group_list 恢复转发名单）
+        self.cfg.play_group_id = ",".join(sorted(self._active_groups))
+        self.save_config(self.cfg)
         self._apply_state()
         self._rounds_refresh()
+        self._refresh_group_optmenu()
 
     def _save_fee_rate(self) -> None:
         """保存游戏费率（千分比）并立即上报总后台执行器。"""
@@ -823,54 +1114,10 @@ class PlayTab(ctk.CTkScrollableFrame):
         self.save_config(self.cfg)
         self._log(f"最小下注已保存：{v} 积分")
 
-    def _refresh_rules(self) -> None:
-        self.after(0, self._set_busy, True)
-        self.after(0, self._log, f"刷新玩法列表 ← {self.cfg.backend_base} …")
-
-        def run() -> None:
-            try:
-                rows = self._client().list_rules()
-            except BackendError as e:
-                self.after(0, self._log, f"✗ 拉取玩法列表失败: {e}")
-                self.after(0, self._set_busy, False)
-                return
-            self._rules_rows = rows or []
-            displays = [f"{r.get('name') or ('玩法#' + str(r.get('id')))}"
-                        f"@{r.get('version') or '?'}　(#{r.get('id')})" for r in self._rules_rows]
-            self.after(0, self._apply_rules_ui, displays)
-
-        threading.Thread(target=run, name="play-refresh", daemon=True).start()
-
-    def _apply_rules_ui(self, displays: list[str]) -> None:
-        self.opt_rule.configure(values=displays or ["（无启用的玩法，去总后台玩法页上传）"])
-        if displays:
-            self.opt_rule.set(displays[0])
-            self._selected_rule_id = int(self._rules_rows[0]["id"])
-        else:
-            self.opt_rule.set("（无启用的玩法，去总后台玩法页上传）")
-            self._selected_rule_id = None
-        self.lbl_rules.configure(text=f"共 {len(self._rules_rows)} 个启用玩法")
-        self._set_busy(False)
-
-    def _on_rule_picked(self, choice: str) -> None:
-        if choice.startswith("（"):
-            self._selected_rule_id = None
-            return
-        for r in self._rules_rows:
-            if str(r.get("id")) in choice and (r.get("name") or "") in choice:
-                self._selected_rule_id = int(r["id"])
-                return
-        # 兜底：按尾部的 (#id)
-        try:
-            self._selected_rule_id = int(choice.rsplit("#", 1)[1].rstrip("）").strip())
-        except (ValueError, IndexError):
-            self._selected_rule_id = None
-
-    def _selected_rule(self) -> dict | None:
-        for r in self._rules_rows:
-            if r.get("id") == self._selected_rule_id:
-                return r
-        return None
+    def _save_auto_members(self) -> None:
+        """自动注册群成员开关：勾选即时持久化（下次激活玩法时生效）。"""
+        self.cfg.play_auto_register_members = bool(self.var_auto_members.get())
+        self.save_config(self.cfg)
 
     def _backend_banned_groups(self, client: HbjfClient) -> set[str]:
         """总后台里 status=banned 的群（封禁群停玩：不允许再启用该群玩法）。"""
@@ -879,99 +1126,6 @@ class PlayTab(ctk.CTkScrollableFrame):
         except BackendError:
             return set()  # 拉不到群列表不阻塞（首次对接/无群库时允许）
         return {str(g.get("group_id")) for g in rows if str(g.get("status")) == "banned"}
-
-    def _enable_play(self) -> None:
-        self._log_sep()
-        if self._busy:
-            self._log("上一个操作还没完成，请稍候")
-            return
-        rule = self._selected_rule()
-        if rule is None:
-            self._log("✗ 请先「刷新玩法列表」并选中一个玩法")
-            return
-        groups = self._checked_groups()
-        if not groups:
-            self._log("✗ 请先勾选游戏群（群号在「群管理」页维护）")
-            return
-        if self.engine.is_active():
-            self._log("✗ 已有玩法在运行：请先「停止玩法（先结算）」")
-            return
-        if self.session and self.session.pending_count() and not self.engine.is_active():
-            # 上次停摆残留的未上报局：必须先处理，避免换玩法丢局
-            self._log("✗ 还有上次未上报的对局（执行器被封禁/停用时留下），请先「重试未上报」")
-            return
-        rule_id = int(rule["id"])
-        rule_name = str(rule.get("name") or f"玩法#{rule_id}")
-        version = str(rule.get("version") or "?")
-        auto_members = bool(self.var_auto_members.get())
-        self.cfg.play_auto_register_members = auto_members
-        self._set_busy(True)
-        self._banned_reason = ""
-        self._log(f"启用玩法 {rule_name}@{version}，游戏群 {','.join(groups)} …")
-
-        def run() -> None:
-            client = self._client()
-            banned = self._backend_banned_groups(client)
-            if banned & set(groups):
-                self.after(0, self._log,
-                           f"✗ 游戏群 {','.join(sorted(banned & set(groups)))} 已被总后台封禁"
-                           f"（封禁群停玩），本次启用取消")
-                self.after(0, self._set_busy, False)
-                return
-            try:
-                # 1) 下载玩法文件（覆盖 = 总后台重传后自动取最新）
-                dest = self.cfg.plays_dir() / f"rule_{rule_id}.py"
-                client.download_rule(rule_id, str(dest))
-            except BackendError as e:
-                self.after(0, self._log, f"✗ 下载玩法失败: {e}")
-                self.after(0, self._set_busy, False)
-                return
-            # 2) 打开插件转发（失败则中止，避免本地跑了但收不到消息）
-            callback = f"http://127.0.0.1:{int(self.cfg.play_callback_port or 6101)}/play/msg"
-            try:
-                r = requests.post(self.cfg.plugin_api("play/config"),
-                                  json={"enabled": True, "groups": groups,
-                                        "callback": callback}, timeout=5)
-                r.raise_for_status()
-            except requests.RequestException as e:
-                self.after(0, self._log, f"✗ 通知插件转发失败（NapCat 插件未就绪?）: {e}")
-                self.after(0, self._set_busy, False)
-                return
-            # 3) 本地引擎激活
-            err = self.engine.activate(rule_id, f"{rule_name}@{version}", str(dest))
-            if err:
-                self.after(0, self._log, f"✗ 玩法加载失败，已停用: {err}")
-                try:
-                    requests.post(self.cfg.plugin_api("play/config"),
-                                  json={"enabled": False}, timeout=3)
-                except requests.RequestException:
-                    pass
-                self.after(0, self._set_busy, False)
-                return
-            # 4) 建对局会话（各群独立 round_id，结算时带 token 上报总后台）
-            self.session = RoundSession(client=self._client(), play_name=rule_name, play_id=rule_id)
-            self._active_groups = set(groups)
-            # 4.5) 红包计分玩法会话（勾选开关时启用）
-            self._rp_build(rule_id, rule_name)
-            # 5) 记录配置（重启自动恢复）
-            self.cfg.play_rule_id = rule_id
-            self.cfg.play_rule_name = f"{rule_name}@{version}"
-            self.cfg.play_group_id = ",".join(groups)
-            self.cfg.play_enabled = True
-            self.save_config(self.cfg)
-            self.after(0, self._log,
-                       f"✓ 玩法已启用：{self.cfg.play_rule_name} ｜ 游戏群 {','.join(groups)}"
-                       f"（有回复或积分变动的发言自动入局记回放，机器人自己发言不会触发）")
-            # 6) 可选：把各游戏群成员注册为会员（幂等；已有会员只拉积分不动余额）
-            if auto_members:
-                for gid in groups:
-                    if not self._sync_members_quiet(client, gid):
-                        break  # 封禁异常已内部处理并停摆
-            self.after(0, self._apply_state)
-            self.after(0, self._rounds_refresh)
-            self.after(0, self._set_busy, False)
-
-        threading.Thread(target=run, name="play-enable", daemon=True).start()
 
     def _sync_members_quiet(self, client: HbjfClient, gid: str) -> bool:
         """把一个游戏群成员同步为会员（幂等）。停摆异常 → 上抛给 _mark_banned 处理，返回 False。"""
@@ -992,54 +1146,6 @@ class PlayTab(ctk.CTkScrollableFrame):
         except BackendError as e:
             log(f"⚠ 群 {gid} 会员同步失败（不阻断玩法）: {e}")
             return True
-
-    def _settle_groups(self, failed_only: bool) -> None:
-        """结算并上报 / 重试未上报（后台线程逐群结算，单个失败不影响其它群）。"""
-        if self._busy:
-            self._log("上一个操作还没完成，请稍候")
-            return
-        if self.session is None or not self.session.pending_count():
-            self._log("当前没有待结算的对局" if not failed_only else "当前没有未上报的对局")
-            return
-        pending = self.session.pending_groups()
-        if failed_only:
-            pending = [g for g in pending if not self._last_settle.get(g, {}).get("ok")]
-            if not pending:
-                self._log("没有失败待重试的对局")
-                return
-        self._log_sep()
-        self._set_busy(True)
-        self._log(("结算并上报 " if not failed_only else "重试未上报 ") +
-                  f"{len(pending)} 个群的对局 …")
-
-        def run() -> None:
-            session = self.session
-            session.client = self._client()  # 结算时刻最新 token（防止后台换了 token 后旧值一直失败）
-            banned_hit = False
-            for gid in pending:
-                if banned_hit:
-                    break  # 已停摆：其余群的结算必然同错，事件全部保留待解封
-                try:
-                    res = session.settle(gid)
-                except (ExecutorBanned, OperatorDisabled) as e:
-                    self._mark_banned(e)
-                    banned_hit = True
-                    continue
-                except BackendError as e:
-                    self._last_settle[gid] = {"ok": False, "error": str(e),
-                                              "time": datetime.now().strftime("%H:%M:%S")}
-                    self.after(0, self._log,
-                               f"✗ 群{gid} 结算失败（事件保留，可「重试未上报」）: {e}")
-                    continue
-                self._last_settle[gid] = {"ok": not res.get("empty") and res.get("server") is not None,
-                                          "error": "" if res.get("server") is not None else "empty",
-                                          "time": datetime.now().strftime("%H:%M:%S")}
-                self.after(0, self._settle_result_ui, res)
-            self.after(0, self._apply_state)
-            self.after(0, self._rounds_refresh)
-            self.after(0, self._set_busy, False)
-
-        threading.Thread(target=run, name="play-settle", daemon=True).start()
 
     def _settle_result_ui(self, res: dict) -> None:
         """结算单群结果的 UI 回显（须在 UI 线程）。res 来自 RoundSession.settle。"""
@@ -1064,72 +1170,28 @@ class PlayTab(ctk.CTkScrollableFrame):
         self._log(line + (f"；详情: {warn}" if warn else ""))
         self._rounds_refresh()
 
-    def _stop_play(self) -> None:
-        """停止玩法：先结算未上报局（成功才清局），再关插件转发/引擎/配置。"""
-        if self._busy:
-            self._log("上一个操作还没完成，请稍候")
-            return
-        if not self.engine.is_active() and not (self.session and self.session.pending_count()):
-            self._log("玩法未在运行")
-            self._apply_state()
+    def _retry_rp_pending_ui(self) -> None:
+        """「重试未上报」：重试红包玩法结算失败事件（网络/封禁恢复后补结算）。"""
+        game = self.rp_game
+        if game is None or not self.engine.is_active():
+            self._log("✗ 玩法未激活（无红包玩法会话）")
             return
         self._set_busy(True)
-        self._log("停止玩法：先结算未上报的对局 …")
 
         def run() -> None:
-            failed = False
-            if self.session:
-                self.session.client = self._client()
-                for gid in self.session.pending_groups():
-                    try:
-                        res = self.session.settle(gid)
-                        if res.get("server") is not None:
-                            self.after(0, self._settle_result_ui, res)
-                    except (ExecutorBanned, OperatorDisabled) as e:
-                        self._mark_banned(e)  # 事件保留在 session，解封后「重试未上报」
-                        self.after(0, self._set_busy, False)
-                        self.after(0, self._apply_state)
-                        return
-                    except BackendError as e:
-                        failed = True
-                        self._last_settle[gid] = {"ok": False, "error": str(e),
-                                                  "time": datetime.now().strftime("%H:%M:%S")}
-                        self.after(0, self._log,
-                                   f"✗ 群{gid} 停止前结算失败（事件保留，可「重试未上报」）: {e}")
-                        break
-            if failed:
-                # 结算未成功就停 = 丢局：取消停止，保持玩法运行，网络恢复后重试或再停
-                self.after(0, self._log,
-                           "停止取消：请先把未上报对局结算成功（可「重试未上报」），再点「停止玩法」")
-                self.after(0, self._apply_state)
+            try:
+                game.retry_pending()
+            except (ExecutorBanned, OperatorDisabled) as e:
+                self.after(0, self._mark_banned, e)
                 self.after(0, self._set_busy, False)
                 return
-            self.engine.deactivate()
-            self.session = None
-            self.rp_game = None
-            self._active_groups = set()
-            self._continuous = False
-            self._cont_next_at = None
-            if hasattr(self, "btn_cont"):
-                self.btn_cont.configure(text="连续开局", fg_color="#3B8ED0", hover_color="#36719F")
-            self.cfg.game_round_seq = int(getattr(self.cfg, "game_round_seq", 0) or 0)
-            self._banned_reason = ""
-            self._last_settle = {}
-            try:
-                requests.post(self.cfg.plugin_api("play/config"), json={"enabled": False}, timeout=3)
-            except requests.RequestException as e:
-                self._log(f"（插件转发关闭失败，可忽略）: {e}")
-            self.cfg.play_enabled = False
-            self.cfg.play_rule_id = 0
-            self.cfg.play_rule_name = ""
-            self.cfg.play_group_id = ""
-            self.save_config(self.cfg)
-            self.after(0, self._log, "✓ 玩法已停止")
-            self.after(0, self._apply_state)
+            except Exception as e:  # noqa: BLE001
+                self.after(0, self._log, f"✗ 重试未上报失败: {e}")
             self.after(0, self._rounds_refresh)
+            self.after(0, self._table_refresh)
             self.after(0, self._set_busy, False)
 
-        threading.Thread(target=run, name="play-stop", daemon=True).start()
+        threading.Thread(target=run, name="play-retry", daemon=True).start()
 
     def _mark_banned(self, reason) -> None:
         """执行器被封禁/操作员被停用 → 玩法停摆：引擎停、插件转发关、事件保留待重试。
@@ -1147,13 +1209,17 @@ class PlayTab(ctk.CTkScrollableFrame):
                 self.cfg.play_enabled = False
                 self.save_config(self.cfg)
             self.rp_game = None
-            self._continuous = False
-            self._cont_next_at = None
+            self._cur_group = ""
+            self._table_rows.clear()
+            self._table_live.clear()
+            if hasattr(self, "tree"):
+                self._render_table([])
             self._banned_reason = str(reason)
             self._active_groups = set()
             self._log(f"✗ 玩法停摆：{reason}。未上报对局已保留在本地，"
                       f"待总后台解封/停用解除后「重试未上报」或重新启用玩法")
             self._apply_state()
+            self._gate_buttons()
 
         try:
             self.after(0, on_ui)
@@ -1161,59 +1227,103 @@ class PlayTab(ctk.CTkScrollableFrame):
             pass  # 关窗竞态时忽略
 
     def _auto_restore(self) -> None:
-        """GUI 启动后自动恢复上次启用的玩法（多群）。"""
-        groups = self.cfg.play_group_list()
-        if not (self.cfg.play_enabled and self.cfg.play_rule_id and groups):
-            self._apply_state()
-            return
-        self._log(f"自动恢复上次玩法：{self.cfg.play_rule_name or ('#' + str(self.cfg.play_rule_id))}"
-                  f" ｜ 游戏群 {','.join(groups)}")
+        """启动后自动激活唯一玩法（复合玩法）：拉总后台 active 玩法列表 → 挑名字含「复合」的
+        玩法（没有则取第一条）→ 下载到 plays/rule_{id}.py → 插件转发配置（若有游戏群）→ 激活。
+        其余行为（封禁预检/插件推送/成员同步/UI 刷新）与原 _auto_restore 逐行保持一致。"""
+        # 与复选框默认态对齐（_refresh_group_checkboxes：玩法群为空时默认勾选监控群）
+        groups = self.cfg.play_group_list() or self.cfg.watch_group_list()
+        self._log("自动激活唯一玩法（复合玩法）…")
 
         def run() -> None:
-            rule_id = int(self.cfg.play_rule_id)
-            rule_name = self.cfg.play_rule_name or f"玩法#{rule_id}"
             client = self._client()
             banned = self._backend_banned_groups(client)
             if banned & set(groups):
                 self.after(0, self._log,
-                           f"✗ 自动恢复取消：群 {','.join(sorted(banned & set(groups)))} 已被总后台封禁")
+                           f"✗ 自动激活取消：群 {','.join(sorted(banned & set(groups)))} 已被总后台封禁")
                 self.after(0, self._apply_state)
                 return
+            rule_id = int(getattr(self.cfg, "play_rule_id", 0) or 0)
+            rule_name = str(self.cfg.play_rule_name or "")
+            rows: list[dict] = []
             try:
-                dest = self.cfg.plays_dir() / f"rule_{rule_id}.py"
-                client.download_rule(rule_id, str(dest))
+                rows = client.list_rules() or []
             except BackendError as e:
-                self.after(0, self._log, f"✗ 自动恢复失败（下载玩法）: {e}")
+                self.after(0, self._log, f"⚠ 拉取玩法列表失败: {e}（按上次配置激活）")
+            if rows:
+                for r in rows:
+                    if "复合" in str(r.get("name") or ""):
+                        rule_id, rule_name = int(r["id"]), str(r.get("name") or f"玩法#{r['id']}")
+                        break
+                if not rule_id:
+                    r = rows[0]
+                    rule_id, rule_name = int(r["id"]), str(r.get("name") or f"玩法#{r['id']}")
+            if not rule_id:
+                self.after(0, self._log, "✗ 无可用玩法：请先在总后台「玩法管理」上传/启用复合玩法")
                 self.after(0, self._apply_state)
                 return
-            callback = f"http://127.0.0.1:{int(self.cfg.play_callback_port or 6101)}/play/msg"
-            try:
-                requests.post(self.cfg.plugin_api("play/config"),
-                              json={"enabled": True, "groups": groups,
-                                    "callback": callback}, timeout=5)
-            except requests.RequestException as e:
-                self.after(0, self._log, f"✗ 自动恢复失败（插件转发）: {e}")
+            dest = self.cfg.plays_dir() / f"rule_{rule_id}.py"
+            if rows:
+                try:
+                    client.download_rule(rule_id, str(dest))
+                except BackendError as e:
+                    self.after(0, self._log, f"✗ 下载玩法失败: {e}")
+                    self.after(0, self._apply_state)
+                    return
+            if not dest.is_file():
+                self.after(0, self._log, f"✗ 玩法文件缺失（本地缓存也没有）: #{rule_id}")
                 self.after(0, self._apply_state)
                 return
-            err = self.engine.activate(rule_id, rule_name, str(dest))
+            if groups:
+                callback = f"http://127.0.0.1:{int(self.cfg.play_callback_port or 6101)}/play/msg"
+                try:
+                    requests.post(self.cfg.plugin_api("play/config"),
+                                  json={"enabled": True, "groups": groups,
+                                        "callback": callback}, timeout=5)
+                except requests.RequestException as e:
+                    self.after(0, self._log, f"✗ 插件转发配置失败: {e}")
+                    self.after(0, self._apply_state)
+                    return
+            err = self.engine.activate(rule_id, rule_name or f"玩法#{rule_id}", str(dest))
             if err:
-                self.after(0, self._log, f"✗ 自动恢复失败（玩法加载）: {err}")
+                self.after(0, self._log, f"✗ 玩法激活失败: {err}")
             else:
-                name = str(rule_name)
-                self.session = RoundSession(client=self._client(), play_name=name, play_id=rule_id)
+                name = rule_name or f"玩法#{rule_id}"
                 self._active_groups = set(groups)
                 self._rp_build(rule_id, name)
+                self.cfg.play_rule_id = rule_id
+                self.cfg.play_rule_name = name
+                self.cfg.play_enabled = True
+                self.save_config(self.cfg)
                 self.after(0, self._log,
-                           f"✓ 已恢复：{self.cfg.play_rule_name} ｜ 游戏群 {','.join(groups)}")
-                if self.cfg.play_auto_register_members:
+                           f"✓ 复合玩法已自动激活（#{rule_id} {name}）"
+                           + (f"｜ 游戏群 {','.join(groups)}" if groups
+                              else "｜ 未配置游戏群：在玩法页勾选群后自动转发"))
+                if groups and self.cfg.play_auto_register_members:
                     for gid in groups:
                         if not self._sync_members_quiet(client, gid):
                             break
             self.after(0, self._refresh_group_checkboxes)
+            self.after(0, self._refresh_group_optmenu)
             self.after(0, self._apply_state)
             self.after(0, self._rounds_refresh)
 
-        threading.Thread(target=run, name="play-restore", daemon=True).start()
+        threading.Thread(target=run, name="play-autoload", daemon=True).start()
+
+    def _reload_rule(self) -> None:
+        """更新玩法文件：从总后台重新下载当前激活玩法（引擎 mtime 热重载生效）。"""
+        if not self.engine.is_active():
+            self._log("✗ 玩法未激活")
+            return
+        rid = int(self.engine.active_rule_id)
+
+        def run() -> None:
+            try:
+                self._client().download_rule(rid, str(self.cfg.plays_dir() / f"rule_{rid}.py"))
+                self.after(0, self._log, "✓ 玩法文件已更新（热重载自动生效）")
+            except BackendError as e:
+                self.after(0, self._log, f"✗ 下载玩法失败: {e}")
+
+        threading.Thread(target=run, name="play-reload", daemon=True).start()
 
     # ================= 群成员 provider（会员同步用） =================
 
@@ -1237,44 +1347,44 @@ class PlayTab(ctk.CTkScrollableFrame):
     # ================= 状态 / 日志 =================
 
     def _rounds_refresh(self) -> None:
-        """各游戏群当前局状态行（UI 线程；有局更新/结算后调用）。"""
+        """各游戏群本局状态总览行（UI 线程；本局有变化后调用）。"""
         if not hasattr(self, "lbl_rounds"):
             return  # 控件尚未构建完成时忽略
         lines = []
-        if self.session and self.engine.is_active():
-            for info in self.session.all_rounds():
-                gid = str(info["group_id"])
-                last = self._last_settle.get(gid)
-                tail = f"｜ 上次结算 {last['time']} " if last else ""
-                if last:
-                    tail += ("成功" if last.get("ok") else "失败")
-                lines.append(
-                    f"群{gid}：局 {info['label']}（{info['round_id']}）｜ "
-                    f"事件 {info['event_count']}/{HARD_LIMIT} ｜ 净变动 {info['total_delta']:+d}"
-                    f"{tail if last else '｜ 未结算'}")
-        elif self.session and self.session.pending_count():
-            for info in self.session.all_rounds():
-                lines.append(f"群{info['group_id']}：局 {info['label']} 未上报（事件保留，待「重试未上报」）")
+        if self.engine.is_active() and self.rp_game is not None:
+            for gid in sorted(self._active_groups):
+                if gid not in self.rp_game.announced:
+                    continue
+                info = self.engine.call_rule("seal_info", gid) or {}
+                phase = info.get("phase") or "idle"
+                rid = info.get("round_id") or ""
+                ann = self.rp_game.announced[gid]
+                fb = ann.get("first_bill")
+                if phase == "betting":
+                    tail = f"｜已下注 {info.get('n_bets')} 人" if int(info.get("n_bets") or 0) else ""
+                    tail += f"｜首红包 {fb['total_num']} 份" if fb else ""
+                    lines.append(f"群{gid}：{rid} 下注期{tail}")
+                elif fb and int(fb.get("total_num") or 0) > 0:
+                    st = "领完可结算" if ann.get("ready_to_settle") else \
+                        f"已领 {fb.get('recv_num')}/{fb.get('total_num')}"
+                    lines.append(f"群{gid}：{rid} 封盘｜{st}（红包不足自动作废）")
+                else:
+                    lines.append(f"群{gid}：{rid} 封盘｜等管理员发红包开奖")
         if lines:
             self.lbl_rounds.configure(text="\n".join(lines), text_color="#2ecc71")
         else:
             self.lbl_rounds.configure(text="", text_color="gray")
-
-        # 每行勾选框旁的状态文字（局/事件/净积分）
         for g, lbl in getattr(self, "_group_labels", {}).items():
-            info = None
-            if self.session and self.engine.is_active():
-                info = self.session.round_info(g)
             if self.engine.is_active() and g in self._active_groups:
-                if info:
-                    lbl.configure(text=f"局 {info['label']}｜事件 {info['event_count']}｜净积分 {info['total_delta']:+d}",
-                                  text_color="#2ecc71")
+                if g in (self.rp_game.announced if self.rp_game else {}):
+                    lbl.configure(text="本局中", text_color="#2ecc71")
                 else:
                     lbl.configure(text="待开局", text_color="gray")
             elif self.engine.is_active():
                 lbl.configure(text="未参与", text_color="gray")
             else:
                 lbl.configure(text="", text_color="gray")
+        self._gate_buttons()
 
     def _apply_state(self) -> None:
         if self._server_error:
@@ -1290,10 +1400,13 @@ class PlayTab(ctk.CTkScrollableFrame):
             groups = ",".join(sorted(self._active_groups)) or str(self.cfg.play_group_id or "")
             self.lbl_state.configure(
                 text=(f"运行中 ｜ 玩法 {self.engine.rule_summary()} ｜ 游戏群 {groups}"
-                      f"（结算=「结算并上报」，幂等可重复）"),
+                      f"（多群各开各局：按钮与开奖表只作用于「当前群」）"),
                 text_color="green")
         else:
-            self.lbl_state.configure(text="未启用玩法（勾选游戏群后点「启用玩法」）", text_color="gray")
+            self.lbl_state.configure(text="未激活玩法（等待自动激活唯一复合玩法；勾选游戏群后自动转发）",
+                                     text_color="gray")
+        self._gate_buttons()
+        self._refresh_group_optmenu()
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -1327,7 +1440,7 @@ class PlayTab(ctk.CTkScrollableFrame):
 
     def shutdown(self) -> None:
         """关窗清理：停 worker + 回调服务（防残留 daemon 线程）。未上报局仍在内存，关窗即丢 ——
-        建议关窗前「结算并上报」；被封禁期间的残留局请先解封再结算。"""
+        建议关窗前「结算」或「重试未上报」；被封禁期间的残留局请先解封再结算。"""
         self._stop.set()
         try:
             if self._server:
