@@ -26,7 +26,7 @@ from .query_export import write_query_csv
 from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
 from integration.member_sync import group_create_time_str, run_member_sync
 
-APP_VERSION = "2026.09.06-9"
+APP_VERSION = "2026.09.06-10"
 
 HELP_TEXT = """【开箱步骤】
 1. 双击「agent.exe」，软件自动启动 QQ 环境（约半分钟）
