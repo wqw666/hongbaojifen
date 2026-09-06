@@ -2,27 +2,32 @@ package com.hbjf.api.controller;
 
 import com.hbjf.api.exception.ApiException;
 import com.hbjf.api.exception.ErrorCode;
+import com.hbjf.api.service.AdminUserService;
 import com.hbjf.api.service.AuthService;
 import com.hbjf.api.service.OperationLogService;
 import com.hbjf.api.util.MapBuilder;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
 
 /**
- * 管理员登录
+ * 管理员登录 + 修改自己的密码
  */
 @RestController
 @RequestMapping("/api/auth")
 public class AuthController {
 
     private final AuthService authService;
+    private final AdminUserService adminUserService;
     private final OperationLogService operationLogService;
 
-    public AuthController(AuthService authService, OperationLogService operationLogService) {
+    public AuthController(AuthService authService, AdminUserService adminUserService,
+                          OperationLogService operationLogService) {
         this.authService = authService;
+        this.adminUserService = adminUserService;
         this.operationLogService = operationLogService;
     }
 
@@ -32,6 +37,19 @@ public class AuthController {
         Map<String, Object> result = authService.login(body.get("username"), body.get("password"));
         operationLogService.log(body.get("username"), "登录", "系统", "管理员登录成功", clientIp(request));
         return ResponseEntity.ok(MapBuilder.of("code", 0, "data", result));
+    }
+
+    /** 当前登录用户修改自己的密码（须原密码正确；登录态保持） */
+    @PutMapping("/password")
+    public ResponseEntity<Map<String, Object>> changeOwnPassword(@RequestBody Map<String, String> body,
+                                                                 Authentication auth, HttpServletRequest request) {
+        if (auth == null) {
+            throw new ApiException(ErrorCode.NOT_LOGGED_IN, "未登录");
+        }
+        String username = auth.getName();
+        adminUserService.changeOwnPassword(username, body.get("old_password"), body.get("new_password"));
+        operationLogService.log(username, "修改密码", username, "", clientIp(request));
+        return ResponseEntity.ok(MapBuilder.of("code", 0, "message", "密码已更新"));
     }
 
     /** token 校验 */
