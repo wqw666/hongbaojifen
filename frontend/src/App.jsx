@@ -1,13 +1,15 @@
 import React, { useEffect, useState } from 'react'
-import { Layout, Menu, Dropdown, Avatar, message, Modal, Form, Input } from 'antd'
+import { Layout, Menu, Dropdown, Avatar, message, Modal, Form, Input, Button } from 'antd'
 import {
   UserOutlined, HistoryOutlined, TeamOutlined, CrownOutlined,
   BookOutlined, ThunderboltOutlined, GiftOutlined, PlayCircleOutlined,
-  LogoutOutlined, SafetyOutlined, KeyOutlined
+  LogoutOutlined, SafetyOutlined, KeyOutlined, BarChartOutlined,
+  WarningOutlined
 } from '@ant-design/icons'
 import { Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-dom'
 import api from './api'
 import Login from './components/Login'
+import Report from './components/Report'
 import MemberManager from './components/MemberManager'
 import OperationLogs from './components/OperationLogs'
 import QqAccountManager from './components/QqAccountManager'
@@ -20,8 +22,18 @@ import AdminUsers from './components/AdminUsers'
 
 const { Sider, Header, Content } = Layout
 
+/**
+ * 报表（增值服务）开关：当前隐藏菜单、不上客户页面（代码/路由保留，随时可开）。
+ * 后续按增值服务收费后，把这里改为 true 并重新构建前端即可放出菜单；
+ * 已登录用户也可通过 URL /report 直达（不删路由，只藏入口）。
+ */
+const REPORT_MENU_ENABLED = false
+
 const MENU = [
   { key: '/members', icon: <UserOutlined />, label: '会员管理' },
+  ...(REPORT_MENU_ENABLED
+    ? [{ key: '/report', icon: <BarChartOutlined />, label: '报表' }]
+    : []),
   { key: '/qq-groups', icon: <TeamOutlined />, label: 'QQ群管理' },
   { key: '/operators', icon: <CrownOutlined />, label: '操作员管理' },
   { key: '/dicts', icon: <BookOutlined />, label: '配置管理' },
@@ -39,6 +51,8 @@ function App() {
   const [username, setUsername] = useState('')
   const [pwdOpen, setPwdOpen] = useState(false)
   const [pwdForm] = Form.useForm()
+  const [disOpen, setDisOpen] = useState(false)
+  const [disText, setDisText] = useState('')
   const navigate = useNavigate()
   const location = useLocation()
 
@@ -50,6 +64,13 @@ function App() {
       localStorage.removeItem('at')
       setToken(null)
     })
+    // 登录免责声明：字典 key=disclaimer_text（配置管理可编辑；值非空才弹，确认后关闭）
+    api.get('/api/admin/dicts', { params: { key: 'disclaimer_text' } })
+      .then(res => {
+        const row = (res.data?.data || []).find(r => r.key === 'disclaimer_text')
+        if (row?.value) { setDisText(row.value); setDisOpen(true) }
+      })
+      .catch(() => { /* 读取失败不弹，不挡使用 */ })
   }, [token])
 
   const logout = () => {
@@ -82,6 +103,7 @@ function App() {
   if (!token) return <Login onSuccess={() => setToken(localStorage.getItem('at'))} />
 
   return (
+    <>
     <Layout style={{ minHeight: '100vh' }}>
       <Sider width={220} theme="dark" style={{ background: '#1f1f1f' }}>
         <div style={{ height: 60, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 16, fontWeight: 600 }}>
@@ -109,6 +131,7 @@ function App() {
           <Routes>
             <Route path="/" element={<Navigate to="/members" replace />} />
             <Route path="/members" element={<MemberManager />} />
+            <Route path="/report" element={<Report />} />
             <Route path="/logs" element={<OperationLogs />} />
             <Route path="/operators" element={<QqAccountManager />} />
             <Route path="/qq-groups" element={<QqGroupManager />} />
@@ -148,7 +171,23 @@ function App() {
           </Form.Item>
         </Form>
       </Modal>
+
+    {/* 免责声明：登录后弹窗（只读字典文本；唯一确认按钮关闭，不可跳过） */}
+    <Modal
+      title={<span><WarningOutlined style={{ color: '#cf1322' }} /> 免责声明</span>}
+      open={disOpen}
+      closable={false}
+      maskClosable={false}
+      keyboard={false}
+      width={680}
+      footer={<Button type="primary" onClick={() => setDisOpen(false)}>我已阅读并确认</Button>}
+    >
+      <div style={{ whiteSpace: 'pre-wrap', maxHeight: '55vh', overflow: 'auto', lineHeight: 1.9 }}>
+        {disText}
+      </div>
+    </Modal>
     </Layout>
+    </>
   )
 }
 

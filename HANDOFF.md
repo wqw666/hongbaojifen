@@ -84,8 +84,8 @@
 ## 结构速览
 
 - `src/main/java/com/hbjf/api/` — controller（admin 管理端 + open 开放端）/ service（含 RetentionCleanupService 定时清理）/ security / dao（RowMapMapper）/ util（MapBuilder）
-- `src/main/resources/db/migration/` — V1__init.sql（9 表）+ V1.0.1(executor_commands)/V1.0.2(玩法种子)/V1.0.3(群封禁·执行器操作员·游戏记录)/V1.0.4(biz_no 加宽)/V1.0.7(红包玩法种子)/V1.0.8(游戏记录回放明细)/V1.0.9(保留天数配置)/V1.0.10(执行器费率)/V1.0.11(删旧玩法种子只留复合玩法)；5/6 号跳号未用。玩法内置种子在 `src/main/resources/seed_rules/rule_fuhe.py`（启动 ensureSeedRules 兜底落盘 data/rules）
-- `frontend/src/App.jsx` — 9 菜单：会员管理 / QQ群管理 / 操作员管理 / 配置管理 / 执行器管理 / 会员玩法管理 / 游戏记录 / 操作记录 / 用户管理（仅内置超级管理员 admin 可见可管，`AdminUsers.jsx` 增删用户/重置密码）；组件在 `components/`（QqGroupManager 有封禁状态、QqAccountManager 有禁手动、ExecutorManager 有封禁按钮、GameRecordManager 回放）
+- `src/main/resources/db/migration/` — V1__init.sql（9 表）+ V1.0.1(executor_commands)/V1.0.2(玩法种子)/V1.0.3(群封禁·执行器操作员·游戏记录)/V1.0.4(biz_no 加宽)/V1.0.7(红包玩法种子)/V1.0.8(游戏记录回放明细)/V1.0.9(保留天数配置)/V1.0.10(执行器费率)/V1.0.11(删旧玩法种子只留复合玩法)/V1.0.12(登录免责声明字典种子 disclaimer_text)；5/6 号跳号未用。玩法内置种子在 `src/main/resources/seed_rules/rule_fuhe.py`（启动 ensureSeedRules 兜底落盘 data/rules）
+- `frontend/src/App.jsx` — 9 菜单（报表默认隐藏：增值服务开关 `REPORT_MENU_ENABLED=false` 在文件顶部，改 true + 重新构建即放出菜单，路由保留可 /report 直达）；**登录免责声明弹窗**：登录后读字典 `disclaimer_text`（`GET /api/admin/dicts?key=`，值非空才弹、不可跳过、确认按钮「我已阅读并确认」关闭；配置管理可编辑，删除行则不再弹）：会员管理 / 报表（`Report.jsx` 只读经营总览：今日手动上分/下分与玩法赢/输四口径分开 + 抽水局数、近7日趋势**今天在最上**、执行器与群展开明细（含未绑定群）、5 个玩家榜 Top10、右侧「当前部署信息」卡（overview.deployment：服务器IP/系统/JDK/端口/环境 + DB 地址与版本）+ 顶部「下载报表」按钮（前端 Blob 生成当日 HTML 日报，文件名带日期），接口 `GET /api/admin/report/overview` → `ReportService`（trend 降序返回、deployment() 读 DataSource metadata + VERSION()））/ QQ群管理 / 操作员管理 / 配置管理 / 执行器管理 / 会员玩法管理 / 游戏记录 / 操作记录 / 用户管理（仅内置超级管理员 admin 可见可管，`AdminUsers.jsx` 增删用户/重置密码）；组件在 `components/`（QqGroupManager 有封禁状态、QqAccountManager 有禁手动、ExecutorManager 有封禁按钮、GameRecordManager 回放）
 - `agent/` — 执行器（README + docs/代码架构说明.md + docs/玩法v2结算与上报设计.md 见 agent 侧）；integration/ 对接包独立于 GUI
 - `data/rules/` — 玩法文件存储（运行时自动创建）
 - `tools/e2e_full.py` — 全链路 E2E（本机）

@@ -11,6 +11,9 @@ export default function DictManager() {
   const [editOpen, setEditOpen] = useState(false)
   const [editRow, setEditRow] = useState(null)
   const [form] = Form.useForm()
+  // 免责声明等长文本 key：编辑框加高，便于多行条款修改
+  const editKey = Form.useWatch('key', form)
+  const isLongText = (editKey || '').includes('disclaimer')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -81,8 +84,9 @@ export default function DictManager() {
           <Form.Item name="key" label="Key" rules={[{ required: true, message: '请输入Key' }]}>
             <Input disabled={!!editRow} placeholder="如：game_prompt、redpacket_config" />
           </Form.Item>
-          <Form.Item name="value" label="值" rules={[{ required: true, message: '请输入值' }]}>
-            <Input.TextArea rows={4} placeholder="配置内容" />
+          <Form.Item name="value" label="值" rules={[{ required: true, message: '请输入值' }]}
+                     extra={isLongText ? '免责声明文案：登录后弹窗展示（保留换行），编辑保存后下次登录生效' : undefined}>
+            <Input.TextArea rows={isLongText ? 14 : 4} placeholder="配置内容" />
           </Form.Item>
           <Form.Item name="description" label="描述"><Input placeholder="用途说明" /></Form.Item>
         </Form>
