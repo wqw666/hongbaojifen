@@ -292,19 +292,20 @@ def handle_seal(group_id: int, rate_permille: int = 20) -> dict:
     rate = max(0, min(int(rate_permille or 20), 1000))
     fee = pool * rate // 1000
     s["pool"], s["fee"] = pool, fee
-    need = claim_need(gid)
-    need_tail = (f"，庄家 {s['boss']['nickname']} 需另留 1 份" if s.get("boss") else "")
-    table = _table_text(["序号", "用户名称", "下注积分"],
-                        [[i, b["nickname"], b["amount"]] for i, b in enumerate(bets, 1)],
-                        right=(0, 2))
-    text = (f"停止下注，合计{pool}分：\n{table}"
-            + f"\n管理员请发红包开奖{need_tail}（每份 0.01~0.99 元，份数不少于 {need} 份）。")
+    # 同一份结构化表格数据：text（纯文本降级兜底）与 img（GUI 渲染成图片发群）
+    headers = ["序号", "用户名称", "下注积分"]
+    cells = [[i, b["nickname"], b["amount"]] for i, b in enumerate(bets, 1)]
+    table = _table_text(headers, cells, right=(0, 2))
+    text = f"停止下注，合计{pool}分：\n{table}"
     s["sealed_msg"] = text
     bc = None
     if s.get("boss"):
         bc = {"qq": s["boss"]["qq"], "nickname": s["boss"]["nickname"],
               "need": pool + fee}
-    return {"ok": True, "text": text, "banker_check": bc}
+    return {"ok": True, "text": text,
+            "img": {"caption": f"停止下注，合计{pool}分",
+                    "headers": headers, "rows": cells, "right": [0, 2]},
+            "banker_check": bc}
 
 
 # ---------- 红包领取（agent 编排层逐包回调；本文件不存金额，结算时再取） ----------
@@ -456,14 +457,15 @@ def _settle_dcxx(gid: int, s: dict, amt_of: dict[str, float],
                            "delta": int(deltas[i])})
     # 汇总表：按点数降序（-点数 升序），同点数按下注顺序（先下注在前）；不含抽水
     ordered = sorted(range(n), key=lambda i: (-_pts_of(rows[i]["key"]), i))
-    table = _table_text(
-        ["序号", "用户名称", "下注积分", "点数", "结算"],
-        [[i + 1, rows[ri]["nickname"], rows[ri]["stake"],
-          str(_pts_of(rows[ri]["key"])), f"{deltas[ri]:+d}"]
-         for i, ri in enumerate(ordered)],
-        right=(0, 2, 3, 4))
+    headers = ["序号", "用户名称", "下注积分", "点数", "结算"]
+    cells = [[i + 1, rows[ri]["nickname"], rows[ri]["stake"],
+              str(_pts_of(rows[ri]["key"])), f"{deltas[ri]:+d}"]
+             for i, ri in enumerate(ordered)]
+    table = _table_text(headers, cells, right=(0, 2, 3, 4))
     announce = f"本局结果，总分{pool}分：\n{table}"
-    return {"events": events, "announce": announce}
+    return {"events": events, "announce": announce,
+            "img": {"caption": f"本局结果，总分{pool}分",
+                    "headers": headers, "rows": cells, "right": [0, 2, 3, 4]}}
 
 
 def _settle_qzz(gid: int, s: dict, amt_of: dict[str, float],
@@ -502,17 +504,19 @@ def _settle_qzz(gid: int, s: dict, amt_of: dict[str, float],
         events.append({"qq": r["qq"], "nickname": r["nickname"], "delta": int(d)})
     boss_d = lose_sum - win_sum - fee
     events.append({"qq": boss["qq"], "nickname": boss["nickname"], "delta": int(boss_d)})
-    # 汇总表：挑战者按点数降序（-点数 升序），同点数按下注顺序；庄家单列；不含抽水
+    # 汇总表：挑战者按点数降序（-点数 升序），同点数按下注顺序；庄家单列（footer）；不含抽水
     ordered = sorted(range(len(rows)), key=lambda i: (-_pts_of(c_keys[i]), i))
-    table = _table_text(
-        ["序号", "用户名称", "下注积分", "点数", "结算"],
-        [[i + 1, rows[ri]["nickname"], rows[ri]["amount"],
-          str(_pts_of(c_keys[ri])), f"{deltas[ri]:+d}"]
-         for i, ri in enumerate(ordered)],
-        right=(0, 2, 3, 4))
-    announce = (f"本局结果，总分{pool}分：\n{table}"
-                f"\n庄家 {boss['nickname']}（点{_pts_of(b_key)}）：净得 {boss_d:+d}")
-    return {"events": events, "announce": announce}
+    headers = ["序号", "用户名称", "下注积分", "点数", "结算"]
+    cells = [[i + 1, rows[ri]["nickname"], rows[ri]["amount"],
+              str(_pts_of(c_keys[ri])), f"{deltas[ri]:+d}"]
+             for i, ri in enumerate(ordered)]
+    table = _table_text(headers, cells, right=(0, 2, 3, 4))
+    footer = f"庄家 {boss['nickname']}（点{_pts_of(b_key)}）：净得 {boss_d:+d}"
+    announce = f"本局结果，总分{pool}分：\n{table}\n{footer}"
+    return {"events": events, "announce": announce,
+            "img": {"caption": f"本局结果，总分{pool}分",
+                    "headers": headers, "rows": cells, "right": [0, 2, 3, 4],
+                    "footer": footer}}
 
 
 # ---------- 自测（验收向量 = spec §1.3/1.4；python play_rules/rule_fuhe.py） ----------
@@ -569,6 +573,10 @@ def _selftest() -> int:
     check("封盘文案：合计+3列表格", seal["text"].startswith("停止下注，合计130分：")
           and "用户名称" in seal["text"] and "下注积分" in seal["text"],
           str(seal["text"])[:150])
+    check("封盘文案已去「发红包开奖」尾巴", "请发红包开奖" not in seal["text"], str(seal["text"])[:150])
+    check("封盘 img 结构化（标题/表头/行数）", seal["img"]["caption"] == "停止下注，合计130分"
+          and seal["img"]["headers"] == ["序号", "用户名称", "下注积分"]
+          and len(seal["img"]["rows"]) == 3, str(seal["img"])[:200])
     r = bet(101, "13", "己", 5)
     check("封盘后下注被拦", r and "封盘" in r, str(r))
     r = handle_redpacket(101, 22, "戊", 0.77)
@@ -609,6 +617,8 @@ def _selftest() -> int:
     check("announce：总分表+庄家行，无抽水", "本局结果，总分500分" in res["announce"]
           and "庄家" in res["announce"] and "净得" in res["announce"]
           and "抽水" not in res["announce"], res["announce"])
+    check("qzz img 庄家净得进 footer", "净得" in res["img"]["footer"]
+          and len(res["img"]["rows"]) == 4, str(res["img"])[:200])
     check("Σ玩家=-fee", sum(deltas.values()) == -10, str(deltas))
     _reset(102)
 
@@ -636,6 +646,9 @@ def _selftest() -> int:
           str(pos))
     check("dcxx announce 总分无抽水", res["announce"].startswith("本局结果，总分400分")
           and "抽水" not in res["announce"], res["announce"][:80])
+    check("dcxx img 5列表无 footer", len(res["img"]["headers"]) == 5
+          and res["img"]["caption"] == "本局结果，总分400分"
+          and "footer" not in res["img"], str(res["img"])[:200])
     _reset(103)
 
     # --- 同点组内按注序消化（spec 向量：X200/Y100 同点最低，上名次吃250+抽水30） ---

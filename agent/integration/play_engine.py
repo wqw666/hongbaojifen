@@ -303,9 +303,9 @@ class RuleEngine:
     def notify_round_start(self, group_id: int | str, round_id: str = "") -> None:
         """「开始本局」→ 玩法可选 handle_round_start(group_id, round_id)：开局进入可玩状态（下注期等）。
 
-        round_id 为本局局号（GUI 生成，如 hongbaojifen_00000001），玩法若要回复「本局 局号」需
-        收下并保存；玩法函数只声明 (group_id) 一个参数时兼容调用（不传局号）。
-        无返回值；玩法未定义该函数或未激活时为 no-op。调用失败只记 last_error。"""
+        round_id 为本局局号（GUI 生成，纯数字递增如 0000001，R7 起不带玩法名前缀），
+        玩法若要回复「本局 局号」需收下并保存；玩法函数只声明 (group_id) 一个参数时兼容调用
+        （不传局号）。无返回值；玩法未定义该函数或未激活时为 no-op。调用失败只记 last_error。"""
         self._notify_optional("handle_round_start", group_id, round_id)
 
     def notify_round_end(self, group_id: int | str) -> None:

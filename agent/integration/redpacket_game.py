@@ -459,10 +459,18 @@ class RedPacketGame:
             c["edited"] = True
             if nickname:
                 c["name"] = nickname
+            name = str(c.get("name") or f"用户{qq_s}")
         else:
-            ann["claims"][qq_s] = {"qq": qq_s, "name": nickname or f"用户{qq_s}",
+            name = nickname or f"用户{qq_s}"
+            ann["claims"][qq_s] = {"qq": qq_s, "name": name,
                                    "amount": round(amt, 2), "delta": 0,
                                    "reply": "", "edited": True}
+        # 回放记录管理员改/补开奖：delta=0 只进时间线，不产生积分流水也不触发 warning（R7-5）
+        if len(ann["events"]) < 2000:
+            msg = (f"管理员改开奖金额：{old:.2f}→{amt:.2f} 元" if old is not None
+                   else f"管理员补值开奖：{amt:.2f} 元")
+            ann["events"].append({"qq": qq_s, "nickname": name, "msg": msg,
+                                  "reply": "", "delta": 0, "ts": _now_full()})
         self._log(f"[红包玩法] 群{gid} 管理员改开奖：{qq_s} "
                   + (f"{old:.2f}→{amt:.2f}" if old is not None else f"补值 {amt:.2f}"))
         return None
@@ -540,10 +548,11 @@ class RedPacketGame:
         claims = list(ann["claims"].values())
         if not self.send_announce:
             return
-        # 玩法自定义播报文本（大吃小等）优先
+        # 玩法自定义播报文本（大吃小等）优先；规则带 img 键时一并交给播报（图片化表格）
         if ann.get("announce_text"):
             try:
-                self.send_announce(ann["group_id"], str(ann["announce_text"]))
+                self.send_announce(ann["group_id"], str(ann["announce_text"]),
+                                   ann.get("announce_img") or None)
             except Exception:
                 pass
             return
@@ -575,6 +584,8 @@ class RedPacketGame:
             return
         if result.get("announce"):
             ann["announce_text"] = str(result["announce"])
+        if isinstance(result.get("img"), dict):
+            ann["announce_img"] = result["img"]
         for ev in result.get("events") or []:
             qq = str(ev.get("qq") or "")
             if not qq or qq == self.self_uin or qq == "announce":
@@ -725,7 +736,7 @@ def _selftest() -> int:
     game = RedPacketGame(play_name="复合玩法", play_id=77,
                          rule_handler=rule, rule_handler_batch=batch_rule,
                          send_reply=lambda g, q, t: replies.append((g, q, t)),
-                         send_announce=lambda g, t: announces.append((g, t)),
+                         send_announce=lambda g, t, img=None: announces.append((g, t)),
                          settle=settle,
                          get_admin_qqs=lambda g: admins.get(g, set()),
                          get_bettors=lambda g: {"111", "222"},
@@ -755,6 +766,10 @@ def _selftest() -> int:
     check("超范围拒绝", err is not None)
     err = game.set_claim_amount(G, "222", 0.55, "乙")
     check("未抢补值合法", err is None, str(err))
+    edit_msgs = [e["msg"] for e in game.announced[G]["events"]]
+    check("改/补开奖进回放事件（delta0）",
+          any("管理员改开奖金额" in m for m in edit_msgs)
+          and any("管理员补值开奖" in m for m in edit_msgs), str(edit_msgs))
     # 3) 结算第一次上报失败 → 保留待重试、不播报不清局
     r = game.settle_round_now(G)
     check("首次结算失败 ok=False", r["ok"] is False and r.get("error"), str(r))

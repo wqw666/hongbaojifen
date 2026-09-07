@@ -19,7 +19,9 @@
 """
 from __future__ import annotations
 
+import glob
 import json
+import os
 import queue
 import re
 import threading
@@ -501,12 +503,12 @@ class PlayTab(ctk.CTkScrollableFrame):
             except ValueError:
                 self._log("✗ 金额需为数字")
                 return
-            err = self.rp_game.set_claim_amount(gid, qq, fv)
+            nick = next((r["nickname"] for r in self._table_rows.get(gid, [])
+                         if r["qq"] == qq), qq)
+            err = self.rp_game.set_claim_amount(gid, qq, fv, nick)
             if err:
                 self._log(f"✗ 改开奖失败：{err}")
                 return
-            nick = next((r["nickname"] for r in self._table_rows.get(gid, [])
-                         if r["qq"] == qq), qq)
             self._log(f"管理员改开奖：群{gid} {nick}({qq}) → {fv:.2f}（点 {self._pts_preview(fv)}）")
             win.destroy()
             self._table_refresh()
@@ -546,7 +548,8 @@ class PlayTab(ctk.CTkScrollableFrame):
         name = self.cfg.play_rule_name or "复合玩法"
         desc = "大吃小×撑庄：发数字下注；发「撑」即可撑庄；封盘后管理员发红包定大小"
         seq = int(getattr(self.cfg, "game_round_seq", 0) or 0) + 1
-        round_id = f"hongbaojifen_{seq:08d}"
+        # 局号纯数字递增（0000001…），不带玩法名前缀；后端 round_id 只是 ≤96 幂等键
+        round_id = f"{seq:07d}"
         self.cfg.game_round_seq = seq
         self.save_config(self.cfg)
         self.rp_game.start_round(gid, round_id, name)
@@ -575,13 +578,21 @@ class PlayTab(ctk.CTkScrollableFrame):
         if not res.get("ok"):
             # handle_seal 的 ok=False 有三义（rule_fuhe.handle_seal 文案为准）：
             #  1) 含「无人下注」——玩法已复位（本局已作废）：播报作废并关局；
-            #  2) 含「没有进行中的本局」——玩法无局（热重载脱钩等）：同上播报作废并关局；
+            #  2) 含「没有进行中的本局」——玩法无局（热重载脱钩等）：只本地日志并关局清表，
+            #     不发群（这是 agent 侧状态问题，群成员无需看到「无法停止下注」噪音，
+            #     真实原因在玩法日志可见）；
             #  3) 含「已封盘」（「本局已封盘或不在下注期」）——状态保留（本局已封盘）：
             #     只日志提示并刷新，不再 void/清表（双击「停止下注」/按钮重试期间再点
             #     不会把刚封盘的局作废并播误导文案，幂等友好）。
             text = str(res.get("text") or "本局已作废")
-            if "无人下注" in text or "没有进行中的本局" in text:
+            if "无人下注" in text:
                 self._rp_send_announce(gid, text)
+                self.rp_game.void_round(gid, None)
+                self._clear_round_display(gid)
+                self.after(0, self._table_refresh)
+                self.after(0, self._rounds_refresh)
+            elif "没有进行中的本局" in text:
+                self._log(f"群{gid} {text}（本地关局清表，不发群）")
                 self.rp_game.void_round(gid, None)
                 self._clear_round_display(gid)
                 self.after(0, self._table_refresh)
@@ -614,7 +625,7 @@ class PlayTab(ctk.CTkScrollableFrame):
                 self.after(0, self._table_refresh)
                 self.after(0, self._rounds_refresh)
                 return
-        self._rp_send_announce(gid, str(res.get("text") or ""))
+        self._rp_send_announce(gid, str(res.get("text") or ""), res.get("img"))
         self._log(f"群{gid} 已停止下注（封盘），等管理员发红包开奖")
         self.after(0, self._table_refresh)
         self.after(0, self._rounds_refresh)
@@ -803,17 +814,65 @@ class PlayTab(ctk.CTkScrollableFrame):
         except requests.RequestException as e:
             self.after(0, self._log, f"✗ 红包回复发送失败: {e}")
 
-    def _rp_send_announce(self, gid: str, text: str) -> None:
-        """@全体 播报红包结算结果。"""
+    def _rp_send_announce(self, gid: str, text: str, img: dict | None = None) -> None:
+        """@全体 播报红包结算结果。
+
+        img（玩法规则返回的 img 键）可用时：文字段只发 caption 短句 + 表格图片；
+        渲染失败/行数超限/无字体 → 降级整段纯文本表格；图片发送被拒 → 自动改发纯文本。"""
+        payload = {"group_id": gid, "text": str(text or "")}
+        if isinstance(img, dict) and img.get("rows"):
+            try:
+                from .table_image import render_table_png
+                png = render_table_png(img)
+                if png:
+                    path = self._announce_img_file(gid)
+                    with open(path, "wb") as f:
+                        f.write(png)
+                    payload["text"] = str(img.get("caption") or text or "")
+                    payload["image_file"] = str(path)
+            except Exception as e:  # noqa: BLE001 — 图片链路任何异常都降级纯文本
+                payload.pop("image_file", None)
+                payload["text"] = str(text or "")
+                self.after(0, self._log, f"⚠ 表格图片渲染失败，降级纯文本: {e}")
         try:
             r = requests.post(self.cfg.plugin_api("play/announce"),
-                              json={"group_id": gid, "text": text}, timeout=5)
+                              json=payload, timeout=10)
             if r.ok:
-                self.after(0, self._log, f"✓ 已@全体播报红包结算（群 {gid}）")
-            else:
-                self.after(0, self._log, f"✗ @全体播报失败 HTTP {r.status_code}")
+                tag = "（带表格图片）" if payload.get("image_file") else ""
+                self.after(0, self._log, f"✓ 已@全体播报红包结算（群 {gid}）{tag}")
+                return
+            self.after(0, self._log,
+                       f"✗ @全体播报失败 HTTP {r.status_code}: {r.text[:120]}")
+            # 图片发送被插件拒绝（路径不可读等）→ 改发纯文本兜底，公告不丢
+            if payload.get("image_file"):
+                r2 = requests.post(self.cfg.plugin_api("play/announce"),
+                                   json={"group_id": gid, "text": str(text or "")},
+                                   timeout=5)
+                if r2.ok:
+                    self.after(0, self._log, "✓ 图片被拒，已改发纯文本公告")
+                else:
+                    self.after(0, self._log,
+                               f"✗ 纯文本公告也失败 HTTP {r2.status_code}")
         except requests.RequestException as e:
             self.after(0, self._log, f"✗ @全体播报失败: {e}")
+
+    def _announce_img_file(self, gid: str) -> str:
+        """表格图片临时 PNG（唯一文件名；顺手清掉 10 分钟前的旧公告图防堆积）。
+
+        agent 与 NapCat 同机同用户运行，插件直接读本地绝对路径发图。"""
+        import tempfile
+        d = tempfile.gettempdir()
+        try:
+            now = time.time()
+            for old in glob.glob(os.path.join(d, "hbjf_ann_*.png")):
+                try:
+                    if now - os.path.getmtime(old) > 600:
+                        os.remove(old)
+                except OSError:
+                    pass
+        except Exception:  # noqa: BLE001 — 清理失败不影响发送
+            pass
+        return os.path.join(d, f"hbjf_ann_{gid}_{int(time.time() * 1000)}.png")
 
     def _rp_settle(self, round_id: str, gid: str, events: list[dict]) -> None:
         """红包局上报总后台（round_id=红包单号，幂等）。"""

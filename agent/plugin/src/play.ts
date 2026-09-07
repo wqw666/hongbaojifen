@@ -203,22 +203,27 @@ export function registerPlayRoutes(ctx: NapCatPluginContext) {
     }
   });
 
-  // agent 玩法引擎 @全体 播报（红包领完结算等）
+  // agent 玩法引擎 @全体 播报（红包领完结算等；可带 image_file 本地图片路径 = 表格图公告）
   router.postNoAuth('/play/announce', async (req: any, res: any) => {
     try {
       if (!config.playEnabled) return fail(res, '玩法已停用');
       const body = req.body || {};
       const groupId = String(body.group_id ?? '');
       const text = String(body.text ?? '').trim();
-      if (!groupId || !text) return fail(res, '缺少 group_id/text');
+      const imageFile = typeof body.image_file === 'string' ? body.image_file.trim() : '';
+      if (!groupId || (!text && !imageFile)) return fail(res, '缺少 group_id/text');
       if (config.playGroups.length && !config.playGroups.includes(groupId)) {
         return fail(res, '群不在玩法名单');
       }
-      // 优先 @全体；被内核拒绝（如频率限制/权限）时降级为普通文本发送，保证公告一定送达
-      const attempts: any[][] = [
-        [{ type: 'at', data: { qq: 'all' } }, { type: 'text', data: { text: ' ' + text } }],
-        [{ type: 'text', data: { text: '@全体成员 ' + text } }],
-      ];
+      // 优先 @全体；被内核拒绝（如频率限制/权限）时降级为普通文本发送，保证公告一定送达。
+      // 公告 = @全体 + 文字短句 + 可选表格图片（agent 与 NapCat 同机，直接给本地 PNG 路径）
+      const withAt: any[] = [{ type: 'at', data: { qq: 'all' } }];
+      if (text) withAt.push({ type: 'text', data: { text: ' ' + text } });
+      if (imageFile) withAt.push({ type: 'image', data: { file: imageFile } });
+      const plain: any[] = [];
+      if (text) plain.push({ type: 'text', data: { text: '@全体成员 ' + text } });
+      if (imageFile) plain.push({ type: 'image', data: { file: imageFile } });
+      const attempts: any[][] = [withAt, plain];
       let sent = false;
       let lastErr = '';
       for (const message of attempts) {
@@ -237,8 +242,9 @@ export function registerPlayRoutes(ctx: NapCatPluginContext) {
         }
       }
       if (!sent) return fail(res, lastErr, -1, 500);
-      ctx.logger?.info?.(`[玩法] 群 ${groupId} @全体: ${text.slice(0, 60)}`);
-      ok(res, { sent: true, group_id: groupId, text });
+      ctx.logger?.info?.(`[玩法] 群 ${groupId} @全体: ${text.slice(0, 60)}`
+        + (imageFile ? ` [图 ${imageFile}]` : ''));
+      ok(res, { sent: true, group_id: groupId, text, image_file: imageFile });
     } catch (e) {
       fail(res, String(e), -1, 500);
     }
