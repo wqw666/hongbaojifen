@@ -45,18 +45,19 @@ class SeedPlayRuleTest {
         byte[] b = new ClassPathResource("seed_rules/rule_fuhe.py").getInputStream().readAllBytes();
         assertThat(b).isNotEmpty();
         assertThat(new String(b, StandardCharsets.UTF_8)).contains("handle_message");
-        assertThat(b.length).isEqualTo(30521); // 与 agent/play_rules/rule_fuhe.py 字节数一致
+        assertThat(b.length).isEqualTo(32707); // 与 agent/play_rules/rule_fuhe.py 字节数一致
     }
 
     @Test
     void seedFilesAreLaidDownAndDownloadable() throws Exception {
-        // Bean 构造时 @PostConstruct 已把种子文件落盘到 rules-dir（target/test-rules）
+        // Bean 构造时 @PostConstruct 已把种子落盘；盘上文件可能残留旧构建 → 先删，ensureSeedRules 会重落新内容
         File f = new File("target/test-rules/seed_rule_fuhe.py");
-        assertThat(f).exists();
+        java.nio.file.Files.deleteIfExists(f.toPath());
         byte[] expected = new ClassPathResource("seed_rules/rule_fuhe.py").getInputStream().readAllBytes();
 
-        // @BeforeEach 已 TRUNCATE，再触发 ensureSeedRules 让兜底插入「复合玩法」元数据行
+        // @BeforeEach 已 TRUNCATE，再触发 ensureSeedRules 让兜底插入「复合玩法」元数据行并落盘新文件
         playRuleService.ensureSeedRules();
+        assertThat(f).exists();
         Long id = jdbc.queryForObject("SELECT MAX(id) FROM play_rule_files", Long.class);
         assertThat(jdbc.queryForObject("SELECT name FROM play_rule_files WHERE id=?", String.class, id))
                 .isEqualTo("复合玩法");
