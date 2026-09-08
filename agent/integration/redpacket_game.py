@@ -1,4 +1,4 @@
-"""红包计分玩法：管理员发红包 → 成员领取按玩法规则计分 → 领完 @全体 结算。
+"""红包计分玩法：管理员发红包 → 成员领取按玩法规则计分 → 领完群内播报结算。
 
 积分规则由**总后台玩法文件**决定（handle_redpacket 协议，见 play_rules/rule_fuhe.py），
 本模块只做玩法无关的编排：
@@ -9,15 +9,15 @@
 - 一局 = 一个红包（bill_no）。领完判定：插件汇总 recv_num>=total_num，
   或领取人数 >= 总份数，或领取人数 >= 群人数 → 自动结算：
     1) settle 上报总后台（round_id=bill_no 幂等，逐条入账）
-    2) send_announce @全体 播报：用户X 领取A元，获得B积分 …
+    2) send_announce 群内播报：用户X 领取A元，获得B积分 …
 - 机器人自己领的不计；同人同包幂等（去重）；结算失败事件保留在 pending，
   下次事件到达或 retry_pending() 自动重试；上报成功后才播报（保证「说出口=已入账」）
 - 开始本局模式（announced）= **手动结算驱动**：红包事件记入当前局，只认第 1 个管理员
   红包（D6）；封盘后红包份数 < 需开奖人数 → 立即作废（A3，积分未扣）；「结算」由 GUI
-  按钮调 settle_round_now（玩法批量结算 → 上报成功才 @全体 播报并清局）；「作废本局」
-  调 void_round（@全体 公告 → 关局，不上报不结算）
+  按钮调 settle_round_now（玩法批量结算 → 上报成功才群内播报并清局）；「作废本局」
+  调 void_round（群公告 → 关局，不上报不结算）
 - 下注期手动「结束本局」= **提前终止**：玩法可选 handle_round_abort(group_id)（query_abort
-  注入）返回终止公告文本 → 只 @全体 播报「本局已终止（积分已退还，不抽水）」并作废本局、
+  注入）返回终止公告文本 → 只群内播报「本局已终止（积分已退还，不抽水）」并作废本局、
   不上报（玩法下注期从未扣分，退还即无操作）；返回 None → 走正常结算上报收尾
 
 线程纪律：本类不做任何线程处理，由调用方（play_tab worker 单线程）串行调用。
@@ -289,7 +289,7 @@ class RedPacketGame:
             pass  # 播报失败不阻塞
 
     def _finalize(self, r: dict) -> None:
-        """领完 → 上报总后台 → 成功才 @全体 播报。失败入 pending 待重试。"""
+        """领完 → 上报总后台 → 成功才 播报。失败入 pending 待重试。"""
         r["ended"] = True
         if not self.settle:
             return
@@ -337,7 +337,7 @@ class RedPacketGame:
         })
 
     def end_round(self, group_id: str) -> None:
-        """「结束本局」：统计（领取人数/总积分/事件数）→ 上报（round_id=局号）→ @全体总结。
+        """「结束本局」：统计（领取人数/总积分/事件数）→ 上报（round_id=局号）→ 群内播报总结。
         上报成功才播报；失败保留 pending_announced 待重试。"""
         gid = str(group_id)
         ann = self.announced.get(gid)
@@ -348,7 +348,7 @@ class RedPacketGame:
             return
         # 提前终止：还没到领完收尾（claim_done/batch_done 均未置位）就手动「结束本局」→
         # 先问玩法能否按终止收（大吃小下注期终止：积分退还、不抽水、本局不上报）。
-        # 玩法返回公告文本 → 只 @全体 播报并作废本局；返回 None → 走下方正常结算收尾。
+        # 玩法返回公告文本 → 只群内播报并作废本局；返回 None → 走下方正常结算收尾。
         if not ann.get("claim_done") and not ann.get("batch_done"):
             abort_text = self._query_abort_text(gid)
             if abort_text:
@@ -478,7 +478,7 @@ class RedPacketGame:
     def settle_round_now(self, group_id: str) -> dict:
         """「结算」：合并表格改值/补值的 claims → 玩法批量结算（batch_applied 防重）→ 上报。
 
-        上报成功才 @全体 播报总结并清局（说出口=已入账）；失败 ann 保留（ended 回滚）、
+        上报成功才 播报总结并清局（说出口=已入账）；失败 ann 保留（ended 回滚）、
         进 pending_announced 待「重试未上报」。返回 {ok:True, results} 或 {ok:False, error}。
         results = 批量结算产出的 [{qq,nickname,delta}]（含 0/平局行），供 GUI 表格展示。"""
         gid = str(group_id)
@@ -489,8 +489,10 @@ class RedPacketGame:
             return {"ok": False, "error": "本局已结束/收尾中，请勿重复结算"}
         ann["ended"] = True  # 防重入；任一步失败回滚
         if not ann.get("batch_applied"):
+            # edited（管理员改/补值）标记随 claims 带给玩法：结算表行标（代填）
             claims = [{"qq": c["qq"], "nickname": c.get("name") or "",
-                       "amount": c.get("amount") or 0}
+                       "amount": c.get("amount") or 0,
+                       "edited": bool(c.get("edited"))}
                       for c in ann["claims"].values()]
             n0 = len(ann["events"])
             self._apply_batch_settle(gid, ann, claims)
@@ -526,7 +528,7 @@ class RedPacketGame:
         return {"ok": True, "results": ann.get("settle_results") or []}
 
     def void_round(self, group_id: str, announce_text: str | None = None) -> None:
-        """作废本局（红包不足/庄家余额不足/手动）：@全体 公告 → 关局，不上报不结算。
+        """作废本局（红包不足/庄家余额不足/手动）：群公告 → 关局，不上报不结算。
 
         同时清掉同局待重试记录（若有）。幂等：本局不在 announced 则 no-op。"""
         gid = str(group_id)
@@ -544,7 +546,7 @@ class RedPacketGame:
         self._notify_round_end(gid)
 
     def _announce_round_summary(self, ann: dict) -> None:
-        """@全体 总结语：领取人逐行 + 统计。"""
+        """总结语：领取人逐行 + 统计。"""
         claims = list(ann["claims"].values())
         if not self.send_announce:
             return

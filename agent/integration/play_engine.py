@@ -26,7 +26,7 @@
 红包领完自动收尾时调用。需要"整局状态"的玩法（如大吃小需要开局进入下注期）应在此重置。
 handle_round_abort 由引擎在「结束本局」进入结算收尾**前**问询玩法（大吃小在下注期点
 结束本局 = 提前终止）：返回非空文本 → agent 按「本局已终止（积分已退还，不抽水）」
-只 @全体 播报并作废本局、不上报；返回 None → 按正常结算上报收尾。
+只群内播报并作废本局、不上报；返回 None → 按正常结算上报收尾。
 以上 handle_seal/handle_void/claim_need/bet_snapshot/seal_info（复合玩法 fuhe 首批使用）
 是"要返回值"的协议；带返回值的可选协议一律经 engine.call_rule(fn_name, group_id, *args)
 调用：引擎不解析返回值协议类型，原样返回（GUI 经 call_rule 读取后自行按需解析）。
@@ -338,7 +338,7 @@ class RuleEngine:
         """玩法可选 handle_round_abort(group_id) → 终止公告文本（str）或 None。
 
         「结束本局」在下注期被点下、尚未进入收尾结算前，引擎先问玩法能否按「提前终止
-        （积分已退还，不抽水）」收尾：玩法返回文本 → agent 只 @全体 播报并作废本局、
+        （积分已退还，不抽水）」收尾：玩法返回文本 → agent 只群内播报并作废本局、
         不上报；返回 None → 走正常结算上报。玩法未提供/未激活/调用异常都返回 None
         （此时按正常收尾处理，玩法 bug 只记 last_error）。"""
         module = self._current_module()

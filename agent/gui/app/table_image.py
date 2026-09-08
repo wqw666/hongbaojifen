@@ -1,11 +1,11 @@
 """群公告表格图片渲染（Pillow）：封盘/结算播报把纯文本表格渲染成整齐的表格图（R7-3/4）。
 
 img 协议（玩法规则返回的 img 键，与文本表格同源的结构化数据）：
-  {"caption": "停止下注，合计500分",      # 图片外标题行（GUI 作为公告文字段随图发出）
+  {"caption": "————停结————\n本局玩法：撑庄（庄家：甲）\n合计 500 分",  # 图片外标题行（多行 = 公告文字段，GUI 随图发出）
    "headers": ["序号", "用户名称", "下注积分"],
    "rows":    [[1, "甲", 100], ...],      # 单元格按 str() 展示
    "right":   [0, 2],                     # 右对齐列下标（数值列）
-   "footer":  "庄家 甲（点4）：净得 +80"}  # 可选表尾行（如撑庄的庄家净得）
+   "footer":  "撑 甲（红包0.40 点4）：结算 -10"}  # 可选表尾行（撑庄结算紧凑行；庄未抢 = 红包0.00 点0）
 
 渲染失败（无 Pillow / 无可用中文字体 / 数据异常 / 行数超限）返回 None，
 调用方降级为整段纯文本表格。表格行数超过 TABLE_IMAGE_MAX_ROWS 时图片过长不整齐，也走降级。
@@ -159,7 +159,7 @@ def render_table_png(img: dict) -> bytes | None:
         for w in widths:
             gx += w
             d.line((gx, top, gx, bottom), fill=_GRID, width=1)
-        # 表尾（如庄家净得）带顶部分隔线
+        # 表尾（如撑庄结算紧凑行）带顶部分隔线
         if footer:
             d.line((_MARGIN, y, _MARGIN + sum(widths), y), fill=_GRID, width=1)
             asc_f, desc_f = f_foot.getmetrics()

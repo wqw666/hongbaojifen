@@ -8,7 +8,7 @@
 - 开奖表（右侧半宽可编辑）：双击「抢到金额」修改或补填 0.01~0.99（点数随之重算）；
   下注列不可改；结算成功后结果保留展示到下次开局
 - 管理员发红包开奖：红包领取事件进玩法判定（首红包/领完即「可结算」），份数不足自动作废；
-  「结算」= 玩法批量结算 → 上报总后台（round_id 幂等）→ 成功才 @全体 播报
+  「结算」= 玩法批量结算 → 上报总后台（round_id 幂等）→ 成功才 播报
 - 玩法协议 v2：handle_message(group_id, qq, nickname, text) 可返回
   None / 回复文本 / (回复, delta) / {"reply":…, "delta":…}（str 单返回=旧协议 delta=0）
 - 执行器被封禁（40310）/操作员停用（40311）→ 玩法停摆红字，待解封后重试上报
@@ -453,7 +453,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         if gid not in self.rp_game.announced:
             if gid in self._table_rows and self._table_rows[gid]:
                 return "上一局已结束（结算结果如上）；点「开始本局」开新局"
-            return "无进行中本局：点「开始本局」开局（将 @全体 播报开始消息）"
+            return "无进行中本局：点「开始本局」开局（将播报开始消息）"
         info = self.engine.call_rule("seal_info", gid) or {}
         phase = info.get("phase") or "idle"
         rid = info.get("round_id") or ""
@@ -561,7 +561,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         self.after(0, self._rounds_refresh)
 
     def _seal_round_cur(self) -> None:
-        """停止下注：玩法 handle_seal 汇总 → rp.seal_round（A3 判定）→ 未作废则 @全体 汇总。"""
+        """停止下注：玩法 handle_seal 汇总 → rp.seal_round（A3 判定）→ 未作废则 汇总。"""
         gid = self._cur_group
         if not (gid and self.engine.is_active() and self.rp_game is not None):
             return
@@ -707,7 +707,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         self._rounds_refresh()
 
     def _void_round_cur(self) -> None:
-        """作废本局（当前群）：玩法 handle_void 文案 → @全体 播报 → 关局，不上报。"""
+        """作废本局（当前群）：玩法 handle_void 文案 → 播报 → 关局，不上报。"""
         gid = self._cur_group
         if not (gid and self.engine.is_active() and self.rp_game is not None):
             return
@@ -815,7 +815,7 @@ class PlayTab(ctk.CTkScrollableFrame):
             self.after(0, self._log, f"✗ 红包回复发送失败: {e}")
 
     def _rp_send_announce(self, gid: str, text: str, img: dict | None = None) -> None:
-        """@全体 播报红包结算结果。
+        """群公告播报（R8 起普通消息，不带 @全体成员）。
 
         img（玩法规则返回的 img 键）可用时：文字段只发 caption 短句 + 表格图片；
         渲染失败/行数超限/无字体 → 降级整段纯文本表格；图片发送被拒 → 自动改发纯文本。"""
@@ -839,10 +839,10 @@ class PlayTab(ctk.CTkScrollableFrame):
                               json=payload, timeout=10)
             if r.ok:
                 tag = "（带表格图片）" if payload.get("image_file") else ""
-                self.after(0, self._log, f"✓ 已@全体播报红包结算（群 {gid}）{tag}")
+                self.after(0, self._log, f"✓ 已播报群公告（群 {gid}）{tag}")
                 return
             self.after(0, self._log,
-                       f"✗ @全体播报失败 HTTP {r.status_code}: {r.text[:120]}")
+                       f"✗ 群公告播报失败 HTTP {r.status_code}: {r.text[:120]}")
             # 图片发送被插件拒绝（路径不可读等）→ 改发纯文本兜底，公告不丢
             if payload.get("image_file"):
                 r2 = requests.post(self.cfg.plugin_api("play/announce"),
@@ -854,7 +854,7 @@ class PlayTab(ctk.CTkScrollableFrame):
                     self.after(0, self._log,
                                f"✗ 纯文本公告也失败 HTTP {r2.status_code}")
         except requests.RequestException as e:
-            self.after(0, self._log, f"✗ @全体播报失败: {e}")
+            self.after(0, self._log, f"✗ 群公告播报失败: {e}")
 
     def _announce_img_file(self, gid: str) -> str:
         """表格图片临时 PNG（唯一文件名；顺手清掉 10 分钟前的旧公告图防堆积）。

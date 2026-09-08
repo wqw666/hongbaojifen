@@ -54,6 +54,8 @@ export default function GameRecords() {
 
   const deltaColor = v => v > 0 ? '#52c41a' : v < 0 ? '#ff4d4f' : '#999'
   const deltaText = v => v > 0 ? `+${v}` : `${v}`
+  // R8：净变动列改为「抽水」——每局玩家净变动合计 = -抽水，展示取正值绿色（如 -40 → +40）
+  const rakeText = v => `+${Math.abs(v || 0)}`
 
   const columns = [
     { title: '局号', dataIndex: 'round_id', width: 190, ellipsis: true },
@@ -63,8 +65,8 @@ export default function GameRecords() {
     { title: '操作员QQ', dataIndex: 'operator_qq', width: 110, render: v => v || '—' },
     { title: '结算人数', dataIndex: 'member_count', width: 90 },
     {
-      title: '净变动', dataIndex: 'total_delta', width: 90,
-      render: v => <Text strong style={{ color: deltaColor(v) }}>{v === 0 ? '0' : deltaText(v)}</Text>,
+      title: '抽水', dataIndex: 'total_delta', width: 90,
+      render: v => <Text strong style={{ color: '#52c41a' }}>{rakeText(v)}</Text>,
     },
     { title: '事件数', dataIndex: 'event_count', width: 80 },
     {
@@ -113,9 +115,7 @@ export default function GameRecords() {
                 <Text type="secondary">局号 {rec.round_id}</Text>
                 <Tag>群 {rec.group_id || '—'}</Tag>
                 <Tag color="volcano">{rec.executor_name}（操作员 {rec.operator_qq || '—'}）</Tag>
-                <Tag color={rec.total_delta > 0 ? 'green' : rec.total_delta < 0 ? 'red' : 'default'}>
-                  净变动 {deltaText(rec.total_delta)}
-                </Tag>
+                <Tag color="green">抽水 {rakeText(rec.total_delta)}</Tag>
                 <Tag>结算 {rec.member_count} 人 / {rec.event_count} 事件</Tag>
                 <Text type="secondary">{rec.created_at}</Text>
               </Space>
