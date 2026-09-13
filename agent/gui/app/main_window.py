@@ -26,7 +26,16 @@ from .query_export import write_query_csv
 from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
 from integration.member_sync import group_create_time_str, run_member_sync
 
-APP_VERSION = "2026.09.08-01"
+APP_VERSION = "2026.09.13-01"
+
+
+def _stat_text(total, recent) -> str:
+    """群统计单元格：累计值（括号内为近 30 天值）；无数据留空。"""
+    if total is None or total == "":
+        return ""
+    if recent is None or recent == "":
+        return str(total)
+    return f"{total}（近30天 {recent}）"
 
 HELP_TEXT = """【开箱步骤】
 1. 双击「agent.exe」，软件自动启动 QQ 环境（约半分钟）
@@ -802,21 +811,25 @@ class MainWindow(ctk.CTk):
 
         tip = ctk.CTkLabel(
             f,
-            text="可多选（Ctrl/Shift 点击）。群号只需在这里维护一次：监控、会员、游戏玩法都从这里选。",
+            text="可多选（Ctrl/Shift 点击）。群号只需在这里维护一次：监控、会员、游戏玩法都从这里选。"
+                 "积分剩余/累计抽水/总对局数来自总后台，括号内为近 30 天值。",
             text_color="gray", font=ctk.CTkFont(size=11),
         )
         tip.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 2))
 
         frame = tk.Frame(f, highlightthickness=1, highlightbackground="#CBD5E1")
         frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
-        cols = ("gid", "name", "count", "watch", "ctime")
+        cols = ("gid", "name", "count", "pts", "rake", "games", "watch", "ctime")
         self.tree_groups = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
         for c, w, t in [
             ("gid", 120, "群号"),
-            ("name", 180, "群名"),
-            ("count", 70, "人数"),
+            ("name", 140, "群名"),
+            ("count", 60, "人数"),
+            ("pts", 100, "积分剩余"),
+            ("rake", 130, "累计抽水"),
+            ("games", 130, "总对局"),
             ("watch", 80, "监控"),
-            ("ctime", 150, "创建时间"),
+            ("ctime", 130, "创建时间"),
         ]:
             self.tree_groups.heading(c, text=t)
             self.tree_groups.column(c, width=w)
@@ -862,6 +875,12 @@ class MainWindow(ctk.CTk):
                             "member_count": g.get("member_count") or "",
                             "create_time": g.get("create_time") or "",
                             "status": g.get("status") or "",
+                            # 总后台群列表带回的经营数据（累计 + 近30天 + 群内会员积分合计）
+                            "points_total": g.get("points_total"),
+                            "rake_total": g.get("rake_total"),
+                            "rake_total_30d": g.get("rake_total_30d"),
+                            "game_count": g.get("game_count"),
+                            "game_count_30d": g.get("game_count_30d"),
                         }
                 except BackendError as e:
                     self.after(0, lambda e=e: self.lbl_groups_info.configure(
@@ -887,6 +906,9 @@ class MainWindow(ctk.CTk):
                 gid,
                 r.get("group_name") or "（未上报）",
                 r.get("member_count") or "",
+                _stat_text(r.get("points_total"), None),
+                _stat_text(r.get("rake_total"), r.get("rake_total_30d")),
+                _stat_text(r.get("game_count"), r.get("game_count_30d")),
                 "● 监控中" if gid in watch else "—",
                 r.get("create_time") or "",
             ), tags=tags)

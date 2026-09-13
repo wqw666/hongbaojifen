@@ -185,7 +185,11 @@ export default function MemberManager() {
                  { title: '变动', dataIndex: 'delta', width: 90, render: v =>
                      <span style={{ color: v > 0 ? '#52c41a' : '#ff4d4f', fontWeight: 600 }}>{v > 0 ? '+' : ''}{v}</span> },
                  { title: '类型', dataIndex: 'type', width: 90, render: v =>
-                     <Tag color={v === 'INCOME' ? 'green' : 'red'}>{v === 'INCOME' ? '上分' : '下分'}</Tag> },
+                     <Tag color={v === 'INCOME' ? 'green' : v === 'OUTCOME' ? 'red' : 'blue'}>
+                       {v === 'INCOME' ? '上分' : v === 'OUTCOME' ? '下分' : '流水'}
+                     </Tag> },
+                 { title: '流水', dataIndex: 'flow_amount', width: 80,
+                   render: (v, row) => (v && v !== row.delta) ? v : '—' },
                  { title: '原因', dataIndex: 'reason', ellipsis: true },
                  { title: '操作人', dataIndex: 'operator', width: 110 },
                  { title: '业务单号', dataIndex: 'biz_no', width: 140, ellipsis: true },

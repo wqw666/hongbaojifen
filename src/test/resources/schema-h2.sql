@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS point_records (
     member_id BIGINT DEFAULT 0, delta BIGINT NOT NULL, type VARCHAR(16) NOT NULL,
     reason VARCHAR(255) DEFAULT '', operator VARCHAR(64) DEFAULT '',
     biz_no VARCHAR(128) DEFAULT NULL, created_at VARCHAR(19) DEFAULT '',
+    flow_amount BIGINT DEFAULT 0,
     CONSTRAINT uk_records_bizno UNIQUE (biz_no)
 );
 CREATE TABLE IF NOT EXISTS qq_accounts (
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS qq_groups (
     admin_qqs VARCHAR(512) DEFAULT '', member_count INT DEFAULT 0,
     status VARCHAR(16) DEFAULT 'active', note VARCHAR(255) DEFAULT '',
     ban_reason VARCHAR(255) DEFAULT '', executor_id BIGINT DEFAULT 0,
+    game_count BIGINT DEFAULT 0, rake_total BIGINT DEFAULT 0,
     created_at VARCHAR(19) DEFAULT '', updated_at VARCHAR(19) DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS dict_items (
@@ -90,6 +92,7 @@ CREATE TABLE IF NOT EXISTS game_record_events (
     id BIGINT AUTO_INCREMENT PRIMARY KEY, record_id BIGINT NOT NULL,
     qq VARCHAR(32) DEFAULT '', nickname VARCHAR(64) DEFAULT '',
     msg VARCHAR(512) DEFAULT '', reply VARCHAR(512) DEFAULT '',
-    delta BIGINT DEFAULT 0, ev_time VARCHAR(19) DEFAULT '', created_at VARCHAR(19) DEFAULT ''
+    delta BIGINT DEFAULT 0, flow_amount BIGINT DEFAULT 0,
+    ev_time VARCHAR(19) DEFAULT '', created_at VARCHAR(19) DEFAULT ''
 );
 

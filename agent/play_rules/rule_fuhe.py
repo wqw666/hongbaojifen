@@ -7,6 +7,11 @@
 
 积分只经红包结算产生：handle_message/handle_redpacket 均返回 delta 0。
 
+流水（flow，结算事件里与 delta 并列下发）：撑庄按「下注半额」记流水（恒正，奇数向下取整）；
+挑战者各记 amount//2、庄家记挑战者之和 → 两侧严格对等（Σflow = 2 × 庄家流水，
+奇数下注时与下注总额有 1 分以内的舍入差）；平局 delta=0 也记流水。
+积分仍按 delta 全额结算，流水只用于核算，不影响积分。大吃小不带 flow（后端按 flow=delta 兜底，即全额）。
+
 注意：本文件会被引擎热重载，import 即清空 ROUNDS —— 更新玩法文件前请先结束进行中的局。
 
 比大小（两种模式共用，金额取 f"{amount:.2f}" 两位 cents 数字 (a,b)）：
@@ -481,7 +486,7 @@ def _settle_qzz(gid: int, s: dict, amt_of: dict[str, float],
     b_key = _pt_key(b_claim)
     events = []
     deltas, c_keys, c_edits = [], [], []
-    win_sum = lose_sum = 0
+    win_sum = lose_sum = flow_sum = 0
     for r in rows:
         c_claim, c_edit = amt_of.get(r["qq"], (0.0, False))
         c_key = _pt_key(c_claim)
@@ -502,9 +507,15 @@ def _settle_qzz(gid: int, s: dict, amt_of: dict[str, float],
         else:
             d = 0
         deltas.append(d)
-        events.append({"qq": r["qq"], "nickname": r["nickname"], "delta": int(d)})
+        # 流水额：下注半额（恒正，奇数向下取整）；下过注就记流水 —— 平局 delta=0 也照记
+        flow = int(r["amount"]) // 2
+        flow_sum += flow
+        events.append({"qq": r["qq"], "nickname": r["nickname"],
+                       "delta": int(d), "flow": flow})
     boss_d = lose_sum - win_sum - fee
-    events.append({"qq": boss["qq"], "nickname": boss["nickname"], "delta": int(boss_d)})
+    # 庄家流水 = 各挑战者流水之和（取整以玩家侧为准，保证两侧严格对等：Σflow = 2×庄家流水）
+    events.append({"qq": boss["qq"], "nickname": boss["nickname"],
+                   "delta": int(boss_d), "flow": flow_sum})
     # 汇总表：挑战者按点数降序（-点数 升序），同点数按下注顺序；庄家单列（footer）；不含抽水。
     # R8 加「红包金额」列（改/补值行带（代填））
     ordered = sorted(range(len(rows)), key=lambda i: (-_pts_of(c_keys[i]), i))
@@ -629,6 +640,17 @@ def _selftest() -> int:
           and len(res["img"]["headers"]) == 6 and len(res["img"]["rows"]) == 4,
           str(res["img"])[:200])
     check("Σ玩家=-fee", sum(deltas.values()) == -10, str(deltas))
+    # 流水：下注半额（乙20→10、丙80→40、丁300→150、戊100→50），庄家=50+40+150+50=250
+    flows = {e["qq"]: e.get("flow") for e in res["events"]}
+    check("qzz 流水=下注半额且恒正",
+          flows.get("41") == 10 and flows.get("42") == 40
+          and flows.get("43") == 150 and flows.get("44") == 50, str(flows))
+    check("qzz 庄家流水=各挑战者之和（两侧对等）",
+          flows.get("40") == 250 and sum(flows.values()) == 500, str(flows))
+    check("qzz 平局也记流水（丁 delta 0 但流水 150）",
+          deltas.get("43") == 0 and flows.get("43") == 150, str(flows))
+    check("qzz 流水不影响积分（Σdelta 仍为 -fee）",
+          sum(deltas.values()) == -10 and sum(flows.values()) == 500, str(res["events"]))
     _reset(102)
 
     # --- 大吃小验收向量（spec §1.3：100/20/80/200 A>B>C>D -> +100/+20/+72/-200 fee8） ---
@@ -652,6 +674,8 @@ def _selftest() -> int:
     check("C +72（吃80 抽水8）", deltas.get("53") == 72, str(deltas))
     check("D -200（被吃满）", deltas.get("54") == -200, str(deltas))
     check("Σ玩家=-fee", sum(deltas.values()) == -8, str(deltas))
+    check("大吃小不带 flow（后端按 delta 兜底=全额）",
+          all("flow" not in e for e in res["events"]), str(res["events"]))
     body = res["announce"].splitlines()
     pos = {n: next(i for i, l in enumerate(body) if n in l) for n in ("A", "B", "C", "D")}
     check("结果表按点数降序（同点按注序 A 先）", pos["A"] < pos["B"] < pos["C"] < pos["D"],

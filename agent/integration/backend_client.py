@@ -178,7 +178,8 @@ class HbjfClient:
                           events: list[dict], play_id: int | str = "",
                           executor_token: str | None = None) -> dict:
         """上报一局游戏结算（总后台校验后逐条入账；round_id 幂等，重复上报返回 duplicate）。
-        events 元素: {qq, nickname?, msg?, reply?, delta}；delta=该玩家本事件的积分变动。
+        events 元素: {qq, nickname?, msg?, reply?, delta, flow?}；delta=该玩家本事件的积分变动，
+        flow=流水额（撑庄=下注半额；不带则后端按 flow=delta 记流水，即全额）。
         返回 {round_id, duplicate, member_count, total_delta, event_count, warning_count, warning}；
         warning 非空表示部分事件未入账（未知会员/会员停用/余额不足），回放里照记。"""
         body = {

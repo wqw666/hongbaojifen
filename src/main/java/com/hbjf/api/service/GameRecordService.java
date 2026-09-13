@@ -26,6 +26,9 @@ import java.util.Set;
  * - 自动结算不受“禁止手动上下分”权限限制（那是给人手调的开关），但执行器被封禁/操作员停用时拒绝上报
  * - 入账通过直接 SQL 落账（member/point_records 同事务），不复用 MemberService.adjustPoints
  *   （本事务内逐事件 catch-and-continue 会触发 Spring rollback-only）
+ * - 积分与流水分离：事件可带 flow（流水额，缺省 = delta）；积分按 delta 变动，流水按 flow 落库
+ *   （撑庄模式：挑战者全额结算半额记流水，庄家记净额与半额流水；平局 delta=0 但 flow≠0 仍记流水）
+ * - 首次入账同时累加群累计统计（qq_groups.game_count/rake_total）；重复上报走幂等提前返回，不会重复计数
  */
 @Service
 public class GameRecordService {
@@ -47,7 +50,7 @@ public class GameRecordService {
     /**
      * 上报一局游戏并结算入账
      * @param body {executor_token, round_id, play_id, play_name, group_id,
-     *              events:[{qq, nickname, msg, reply, delta}]}
+     *              events:[{qq, nickname, msg, reply, delta, flow?}]} flow=流水额，缺省=delta
      */
     @Transactional
     public Map<String, Object> reportRound(Map<String, Object> body) {
@@ -92,6 +95,7 @@ public class GameRecordService {
         String operatorQq = String.valueOf(ex.get("admin_qq"));
 
         // 先插局（UK round_id 兜底并发重复；重复则整体回滚）
+        String gid = groupId.length() > 32 ? groupId.substring(0, 32) : groupId;
         long recordId;
         try {
             jdbc.update("INSERT INTO game_records (round_id, play_id, play_name, group_id, executor_id, executor_name,"
@@ -99,7 +103,7 @@ public class GameRecordService {
                             + " VALUES (?,?,?,?,?,?,?,0,0,?,?,?)",
                     roundId, playId.isEmpty() ? 0 : Long.parseLong(playId),
                     playName.length() > 128 ? playName.substring(0, 128) : playName,
-                    groupId.length() > 32 ? groupId.substring(0, 32) : groupId,
+                    gid,
                     Long.parseLong(String.valueOf(ex.get("id"))),
                     executorName.length() > 64 ? executorName.substring(0, 64) : executorName,
                     operatorQq.length() > 32 ? operatorQq.substring(0, 32) : operatorQq,
@@ -125,26 +129,29 @@ public class GameRecordService {
             if (!qq.matches("\\d{5,12}")) {
                 // 未知格式异常：一股脑记下来（时间线照记 + 完整异常进 warning）
                 addWarning(warnings, "非法QQ:" + cut(qq, 32) + " 事件未入账");
-                jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, ev_time, created_at)"
-                                + " VALUES (?,?,?,?,?,?,?,?)",
+                jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, flow_amount, ev_time, created_at)"
+                                + " VALUES (?,?,?,?,?,?,?,?,?)",
                         recordId, cut(qq, 32), cut(str(ev.get("nickname")), 64),
                         "原始事件:" + cut(String.valueOf(ev), 480),
-                        cut(str(ev.get("reply")), 512), 0, evTime, now);
+                        cut(str(ev.get("reply")), 512), 0, 0, evTime, now);
                 continue;
             }
             String nickname = cut(str(ev.get("nickname")), 64);
             String msg = cut(str(ev.get("msg")), 512);
             String reply = cut(str(ev.get("reply")), 512);
             long delta;
+            long flow;
             try {
                 delta = ev.get("delta") == null ? 0 : Long.parseLong(String.valueOf(ev.get("delta")));
+                // 流水额（玩法可选下发）：撑庄模式 delta 全额结算、flow 半额记流水；缺省 = delta（旧口径）
+                flow = ev.get("flow") == null ? delta : Long.parseLong(String.valueOf(ev.get("flow")));
             } catch (NumberFormatException e) {
                 addWarning(warnings, qq + " 积分delta非法 事件未入账");
-                jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, ev_time, created_at)"
-                                + " VALUES (?,?,?,?,?,?,?,?)",
+                jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, flow_amount, ev_time, created_at)"
+                                + " VALUES (?,?,?,?,?,?,?,?,?)",
                         recordId, qq, cut(str(ev.get("nickname")), 64),
                         "原始事件:" + cut(String.valueOf(ev), 480),
-                        cut(str(ev.get("reply")), 512), 0, evTime, now);
+                        cut(str(ev.get("reply")), 512), 0, 0, evTime, now);
                 continue;
             }
 
@@ -156,39 +163,45 @@ public class GameRecordService {
                 addWarning(warnings, "会员已停用:" + qq + " 未入账");
             }
             if (member == null || !"active".equals(member.get("status"))) {
-                jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, ev_time, created_at)"
-                                + " VALUES (?,?,?,?,?,?,?,?)",
-                        recordId, qq, nickname, msg, reply, 0, evTime, now);
+                jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, flow_amount, ev_time, created_at)"
+                                + " VALUES (?,?,?,?,?,?,?,?,?)",
+                        recordId, qq, nickname, msg, reply, 0, 0, evTime, now);
                 continue;
             }
 
             long current = member.get("points") == null ? 0 : ((Number) member.get("points")).longValue();
             long applied = 0;
+            long flowApplied = 0;
             // 下分余额校验：不足则该事件不入账（不出现负余额）
             if (current + delta < 0) {
                 addWarning(warnings, qq + " 余额不足(当前" + current + ") 未入账");
-            } else if (delta != 0) {
+            } else if (delta != 0 || flow != 0) {
+                // 流水与积分分离：delta 决定积分（撑庄全额、庄家净额），flow 只记流水额（撑庄半额）；
+                // 平局 delta=0 但下过注 → flow≠0，照样落一条流水（type=FLOW，不动积分）
                 long memberId = ((Number) member.get("id")).longValue();
-                long abs = Math.abs(delta);
-                jdbc.update("UPDATE members SET points=points+?, total_income=total_income+?,"
-                                + " total_outcome=total_outcome+?, updated_at=? WHERE id=?",
-                        delta, delta > 0 ? abs : 0, delta < 0 ? abs : 0, now, memberId);
+                if (delta != 0) {
+                    long abs = Math.abs(delta);
+                    jdbc.update("UPDATE members SET points=points+?, total_income=total_income+?,"
+                                    + " total_outcome=total_outcome+?, updated_at=? WHERE id=?",
+                            delta, delta > 0 ? abs : 0, delta < 0 ? abs : 0, now, memberId);
+                }
                 // biz_no = game:{round_id}:{qq}:{事件序号} —— 同一玩家一局内可有多次增减，各自留痕；
                 // 整局幂等已由 game_records.round_id 唯一键保证（事件级不会真重复）
-                jdbc.update("INSERT INTO point_records (qq, member_id, delta, type, reason, operator, biz_no, created_at)"
-                                + " VALUES (?,?,?,?,?,?,?,?)",
-                        qq, memberId, delta, delta > 0 ? "INCOME" : "OUTCOME",
+                jdbc.update("INSERT INTO point_records (qq, member_id, delta, flow_amount, type, reason, operator, biz_no, created_at)"
+                                + " VALUES (?,?,?,?,?,?,?,?,?)",
+                        qq, memberId, delta, flow, delta > 0 ? "INCOME" : (delta < 0 ? "OUTCOME" : "FLOW"),
                         "玩法:" + (playName.isEmpty() ? "游戏" : playName) + " 结算",
                         "executor:" + executorName,
                         "game:" + roundId + ":" + qq + ":" + evIndex, now);
                 applied = delta;
+                flowApplied = flow;
                 totalDelta += delta;
             }
 
-            // 事件时间线（完整过程日志，供回放；delta 为实际入账值）
-            jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, ev_time, created_at)"
-                            + " VALUES (?,?,?,?,?,?,?,?)",
-                    recordId, qq, nickname, msg, reply, applied, evTime, now);
+            // 事件时间线（完整过程日志，供回放；delta/flow 为实际入账值）
+            jdbc.update("INSERT INTO game_record_events (record_id, qq, nickname, msg, reply, delta, flow_amount, ev_time, created_at)"
+                            + " VALUES (?,?,?,?,?,?,?,?,?)",
+                    recordId, qq, nickname, msg, reply, applied, flowApplied, evTime, now);
 
             if (settledQqs.add(qq)) memberCount++;
         }
@@ -201,6 +214,13 @@ public class GameRecordService {
         jdbc.update("UPDATE game_records SET member_count=?, total_delta=?, warning=?, warning_count=?, warning_detail=? WHERE id=?",
                 memberCount, totalDelta, warningText, warnings.size(), warningDetail, recordId);
 
+        // 群累计统计：只在这一条首次入账路径上累加（重复上报前面已提前返回，不会重复计数）；
+        // 群未登记（agent 未上报过该群）→ 0 行受影响，不报错
+        if (!gid.isEmpty()) {
+            jdbc.update("UPDATE qq_groups SET game_count=game_count+1, rake_total=rake_total-? WHERE group_id=?",
+                    totalDelta, gid);
+        }
+
         return MapBuilder.of("round_id", roundId, "duplicate", false,
                 "member_count", memberCount, "total_delta", totalDelta,
                 "event_count", events.size(), "warning_count", warnings.size(),
@@ -209,7 +229,7 @@ public class GameRecordService {
 
     // ========== 查询（管理端回放） ==========
 
-    /** 游戏记录分页列表（可过滤群号/玩法名） */
+    /** 游戏记录分页列表（可过滤群号/玩法名；顺带返回当前筛选下的总抽水） */
     public Map<String, Object> list(String groupId, String playName, int page, int size) {
         StringBuilder where = new StringBuilder(" WHERE 1=1");
         List<Object> args = new ArrayList<>();
@@ -221,14 +241,19 @@ public class GameRecordService {
             where.append(" AND play_name LIKE ?");
             args.add("%" + playName + "%");
         }
-        int total = jdbc.queryForObject("SELECT COUNT(*) FROM game_records" + where, Integer.class, args.toArray());
+        // 总数与总抽水同一次查询算出（抽水 = Σ(-total_delta)，与 R8 口径一致）
+        Map<String, Object> agg = jdbc.queryForObject(
+                "SELECT COUNT(*) AS c, COALESCE(SUM(-total_delta),0) AS rake FROM game_records" + where,
+                new RowMapMapper(), args.toArray());
+        long total = agg == null || agg.get("c") == null ? 0 : ((Number) agg.get("c")).longValue();
+        long rakeTotal = agg == null || agg.get("rake") == null ? 0 : ((Number) agg.get("rake")).longValue();
         int offset = Math.max(0, (page - 1) * size);
         List<Map<String, Object>> rows = jdbc.query(
                 "SELECT id, round_id, play_id, play_name, group_id, executor_id, executor_name, operator_qq,"
                         + " member_count, total_delta, event_count, warning, warning_count, created_at FROM game_records" + where
                         + " ORDER BY id DESC LIMIT " + size + " OFFSET " + offset,
                 new RowMapMapper(), args.toArray());
-        return MapBuilder.of("total", total, "page", page, "size", size, "list", rows);
+        return MapBuilder.of("total", total, "rake_total", rakeTotal, "page", page, "size", size, "list", rows);
     }
 
     /** 局详情（含事件时间线，供回放） */
@@ -254,7 +279,7 @@ public class GameRecordService {
             }
         }
         List<Map<String, Object>> events = jdbc.query(
-                "SELECT id, qq, nickname, msg, reply, delta, ev_time, created_at FROM game_record_events"
+                "SELECT id, qq, nickname, msg, reply, delta, flow_amount, ev_time, created_at FROM game_record_events"
                         + " WHERE record_id=? ORDER BY id ASC",
                 new RowMapMapper(), id);
         return MapBuilder.of("record", record, "events", events);

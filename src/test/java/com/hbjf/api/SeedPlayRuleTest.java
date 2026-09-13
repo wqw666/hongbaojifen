@@ -45,7 +45,14 @@ class SeedPlayRuleTest {
         byte[] b = new ClassPathResource("seed_rules/rule_fuhe.py").getInputStream().readAllBytes();
         assertThat(b).isNotEmpty();
         assertThat(new String(b, StandardCharsets.UTF_8)).contains("handle_message");
-        assertThat(b.length).isEqualTo(32707); // 与 agent/play_rules/rule_fuhe.py 字节数一致
+        // 四份副本必须逐字节一致：后端 jar 内置种子 / 运行期存储 / agent 自带 / agent 下载落盘位
+        // （曾用写死的字节数，改玩法文件就失效；改为对副本直接比对，任一侧单边改动即失败）
+        for (String path : new String[]{
+                "data/rules/seed_rule_fuhe.py", "agent/play_rules/rule_fuhe.py", "agent/plays/rule_1.py"}) {
+            File copy = new File(path);
+            assertThat(copy).as(path + " 应存在（四副本同步纪律）").exists();
+            assertThat(java.nio.file.Files.readAllBytes(copy.toPath())).as(path + " 应与内置种子逐字节一致").isEqualTo(b);
+        }
     }
 
     @Test

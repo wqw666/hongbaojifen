@@ -596,12 +596,17 @@ class RedPacketGame:
             reply_text = str(ev.get("reply") or "")
             nickname = str(ev.get("nickname") or "")
             if len(ann["events"]) < 2000:
-                ann["events"].append({
+                item = {
                     "qq": qq, "nickname": nickname,
                     "msg": "玩法结算",
                     "reply": reply_text,
                     "delta": delta, "ts": _now_full(),
-                })
+                }
+                # 流水额与积分分离：玩法给了 flow 才下发（撑庄=下注半额）；
+                # 不给（大吃小）时不带该键，后端按 flow=delta 兜底，避免被 0 覆盖
+                if ev.get("flow") is not None:
+                    item["flow"] = int(ev.get("flow"))
+                ann["events"].append(item)
             if reply_text and self.send_reply:
                 try:
                     self.send_reply(gid, qq, reply_text)
@@ -711,7 +716,8 @@ def _selftest() -> int:
         return f"已记录 {amt:.2f} 元", 0
 
     def batch_rule(gid, claims, rate):
-        """模拟玩法 settle_redpacket：delta = 点数（改值 0.77 → 4 可断言参与）。"""
+        """模拟玩法 settle_redpacket：delta = 点数（改值 0.77 → 4 可断言参与）。
+        仅 qq=111 下发 flow（= delta*2），用于验证流水额透传且不给时不带该键。"""
         events = []
         for c in claims or []:
             try:
@@ -722,8 +728,11 @@ def _selftest() -> int:
             if 0 < amt <= 0.99:
                 s = f"{amt:.2f}"
                 pts = (int(s[2]) + int(s[3])) % 10
-            events.append({"qq": str(c["qq"]), "nickname": str(c.get("nickname") or c["qq"]),
-                           "reply": f"结算点{pts}", "delta": pts})
+            ev = {"qq": str(c["qq"]), "nickname": str(c.get("nickname") or c["qq"]),
+                  "reply": f"结算点{pts}", "delta": pts}
+            if str(c["qq"]) == "111":
+                ev["flow"] = pts * 2
+            events.append(ev)
         return {"events": events, "announce": "结算详情（模拟）"}
 
     replies, announces, settled, logs, ended = [], [], [], [], []
@@ -784,6 +793,12 @@ def _selftest() -> int:
     check("重试后通知玩法", ended and ended[-1] == G, str(ended))
     check("改值 0.77 参与结算", settled and any(
         ev["delta"] == 4 for ev in settled[-1][2]), str(settled))
+    # 流水额透传：玩法给 flow 才上传该键，不给则不带（后端按 delta 兜底，不被 0 覆盖）
+    evs = settled[-1][2]
+    check("玩法下发 flow → 事件透传流水额",
+          any(e.get("flow") == 8 and e["delta"] == 4 for e in evs), str(evs))
+    check("玩法未给 flow → 事件不带该键",
+          all("flow" not in e for e in evs if e.get("qq") != "111"), str(evs))
     r = game.settle_round_now(G)
     check("已结束局再结算被拒", r["ok"] is False, str(r))
     # 5) 封盘后首红包不足 → 立即作废（A3；total=1 < need=2）

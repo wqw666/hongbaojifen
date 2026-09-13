@@ -44,6 +44,7 @@ class GameReportTest {
         jdbc.update("TRUNCATE TABLE game_record_events");
         jdbc.update("TRUNCATE TABLE game_records");
         jdbc.update("TRUNCATE TABLE point_records");
+        jdbc.update("TRUNCATE TABLE qq_groups");
         jdbc.update("TRUNCATE TABLE members");
         jdbc.update("TRUNCATE TABLE qq_accounts");
 
@@ -114,6 +115,9 @@ class GameReportTest {
         String operator = jdbc.queryForObject("SELECT operator FROM point_records WHERE qq='30001' ORDER BY id DESC",
                 String.class);
         assertThat(operator).contains("executor:");
+        // 事件不带 flow → 流水额 = delta（旧口径：谁下注谁记全额；+10+5-5）
+        assertThat(jdbc.queryForObject("SELECT COALESCE(SUM(flow_amount),0) FROM point_records", Integer.class))
+                .isEqualTo(10);
 
         // 局记录带 warning，能查到完整时间线
         Long recordId = jdbc.queryForObject("SELECT id FROM game_records WHERE round_id='R1-20260903-001'", Long.class);
@@ -226,5 +230,103 @@ class GameReportTest {
         // 未鉴权访问被拒
         mvc.perform(get("/api/admin/game-records"))
                 .andExpect(status().isUnauthorized());
+    }
+
+    /**
+     * 撑庄口径：积分按 delta（挑战者全额、庄家净额），流水按 flow（下注半额、恒正、两侧对等）；
+     * 平局 delta=0 但 flow≠0 也记一条流水；群累计统计（局数/抽水）只在首次入账累加。
+     */
+    @Test
+    void flowSplitsFromPointsAndGroupStatsAccumulate() throws Exception {
+        // 本局：甲下注100赢(+80/流水50)、乙下注50平(0/流水25)、庄家净额(-90/流水75)
+        // 积分面 Σdelta = -10 = -抽水；流水面 Σflow = 150 = 下注总额
+        jdbc.update("INSERT INTO qq_groups (group_id, group_name, status, game_count, rake_total, created_at, updated_at)"
+                + " VALUES ('70001','撑庄群','active',0,0,'2026-09-13 10:00:00','2026-09-13 10:00:00')");
+        jdbc.update("UPDATE members SET points=100, group_id='70001' WHERE qq='30001'"); // 庄家需有余额可下
+        jdbc.update("UPDATE members SET group_id='70001' WHERE qq='30002'");
+
+        String body = "{\"executor_token\":\"" + exeToken + "\",\"round_id\":\"R1-QZZ-001\",\"play_name\":\"撑庄\","
+                + "\"group_id\":\"70001\",\"events\":["
+                + "{\"qq\":\"30001\",\"nickname\":\"张三\",\"delta\":80,\"flow\":50},"
+                + "{\"qq\":\"30002\",\"nickname\":\"李四\",\"delta\":0,\"flow\":25},"
+                + "{\"qq\":\"30001\",\"nickname\":\"张三\",\"delta\":-90,\"flow\":75}]}";
+        mvc.perform(post("/api/open/games/report").header("X-Api-Key", "test-open-key")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.duplicate").value(false))
+                .andExpect(jsonPath("$.data.total_delta").value(-10))
+                .andExpect(jsonPath("$.data.member_count").value(2))
+                .andExpect(jsonPath("$.data.warning_count").value(0));
+
+        // 积分只按 delta 走：庄家 100+80-90=90，平局者不动
+        assertThat(jdbc.queryForObject("SELECT points FROM members WHERE qq='30001'", Integer.class)).isEqualTo(90);
+        assertThat(jdbc.queryForObject("SELECT points FROM members WHERE qq='30002'", Integer.class)).isZero();
+
+        // 流水按 flow 落库
+        assertThat(flowOf("game:R1-QZZ-001:30001:1")).isEqualTo(50);
+        assertThat(flowOf("game:R1-QZZ-001:30001:3")).isEqualTo(75);
+        Integer tieFlow = flowOf("game:R1-QZZ-001:30002:2");
+        assertThat(tieFlow).isEqualTo(25);
+        assertThat(jdbc.queryForObject("SELECT delta FROM point_records WHERE biz_no='game:R1-QZZ-001:30002:2'",
+                Integer.class)).isZero();
+        assertThat(jdbc.queryForObject("SELECT type FROM point_records WHERE biz_no='game:R1-QZZ-001:30002:2'",
+                String.class)).isEqualTo("FLOW");
+        // 回放时间线同样带流水额（平局行 delta=0/flow=25）
+        assertThat(jdbc.queryForObject(
+                "SELECT flow_amount FROM game_record_events WHERE record_id=(SELECT id FROM game_records"
+                        + " WHERE round_id='R1-QZZ-001') AND qq='30002'", Integer.class)).isEqualTo(25);
+
+        // 群累计统计：首次入账 game_count+1、rake_total += -total_delta
+        assertThat(groupStat("game_count")).isEqualTo(1);
+        assertThat(groupStat("rake_total")).isEqualTo(10);
+
+        // 重复上报：幂等，不重复计数
+        mvc.perform(post("/api/open/games/report").header("X-Api-Key", "test-open-key")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.duplicate").value(true));
+        assertThat(groupStat("game_count")).isEqualTo(1);
+        assertThat(groupStat("rake_total")).isEqualTo(10);
+
+        // 游戏记录列表：总抽水跟随当前筛选
+        mvc.perform(get("/api/admin/game-records").param("group_id", "70001")
+                        .header("Authorization", "Bearer " + adminToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.total").value(1))
+                .andExpect(jsonPath("$.data.rake_total").value(10));
+        mvc.perform(get("/api/admin/game-records").param("group_id", "99999")
+                        .header("Authorization", "Bearer " + adminToken))
+                .andExpect(jsonPath("$.data.rake_total").value(0));
+
+        // 群列表（管理端与 agent 开放接口同一读路径）：累计 + 近30天 + 群积分剩余
+        mvc.perform(get("/api/admin/qq-groups").header("Authorization", "Bearer " + adminToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].game_count").value(1))
+                .andExpect(jsonPath("$.data[0].rake_total").value(10))
+                .andExpect(jsonPath("$.data[0].game_count_30d").value(1))
+                .andExpect(jsonPath("$.data[0].rake_total_30d").value(10))
+                .andExpect(jsonPath("$.data[0].points_total").value(90));
+        mvc.perform(get("/api/open/groups").header("X-Api-Key", "test-open-key"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].game_count").value(1))
+                .andExpect(jsonPath("$.data[0].rake_total_30d").value(10))
+                .andExpect(jsonPath("$.data[0].points_total").value(90));
+
+        // 会员列表按来源群过滤（群管理点群名看成员）
+        mvc.perform(get("/api/admin/members").param("group_id", "70001")
+                        .header("Authorization", "Bearer " + adminToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.length()").value(2));
+        mvc.perform(get("/api/admin/members").param("group_id", "99999")
+                        .header("Authorization", "Bearer " + adminToken))
+                .andExpect(jsonPath("$.data.length()").value(0));
+    }
+
+    private Integer flowOf(String bizNo) {
+        return jdbc.queryForObject("SELECT flow_amount FROM point_records WHERE biz_no=?", Integer.class, bizNo);
+    }
+
+    private Integer groupStat(String col) {
+        return jdbc.queryForObject("SELECT " + col + " FROM qq_groups WHERE group_id='70001'", Integer.class);
     }
 }

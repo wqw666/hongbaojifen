@@ -30,6 +30,8 @@ ssh ubuntu@<IP> /opt/hongbaojifen/deploy.sh
 
 服务器上管理：`./start.sh` 启动 / `./stop.sh` 停止（日志 `logs/app.log`，健康检查 `http://localhost:8892/health`）。
 
+> `start.sh` 启动前会**自动检查 8892 端口占用**：被旧实例/残留 java 进程占用时先结束占用进程（TERM 最多 15s → KILL）并等端口释放，再启动新进程——不会出现「Port already in use 启动失败」，可当幂等重启用（重复执行 `./start.sh` 即重启）。
+
 生产环境注意：
 - `application-prod.yml` 中改 `app.jwt.secret` 为强随机值、`app.open.api-key` 为执行器共享密钥
 - 玩法文件目录默认 `/opt/hongbaojifen/data/rules/`（自动创建），确认进程有写权限

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { Card, Input, Button, Space, Tag, Typography, Drawer, Timeline, Alert, Tooltip } from 'antd'
+import { Card, Input, Button, Space, Tag, Typography, Drawer, Timeline, Alert, Tooltip, Statistic } from 'antd'
 import { SearchOutlined, ReloadOutlined, PlayCircleOutlined } from '@ant-design/icons'
 import api from '../api'
 import ResizableTable from './ResizableTable'
@@ -9,11 +9,13 @@ const { Text } = Typography
 /**
  * 游戏记录：agent 上报的对局列表 + 回放（事件时间线）
  * 列表 GET /api/admin/game-records?group_id=&play_name=&page=&size=
- * 详情 GET /api/admin/game-records/{id} → {record, events}
+ *      → {total, rake_total(当前筛选下总抽水), page, size, list}
+ * 详情 GET /api/admin/game-records/{id} → {record, events(含 flow_amount 流水额)}
  */
 export default function GameRecords() {
   const [list, setList] = useState([])
   const [total, setTotal] = useState(0)
+  const [rakeTotal, setRakeTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
   const [groupId, setGroupId] = useState('')
@@ -32,6 +34,7 @@ export default function GameRecords() {
       })
       setList(res.data?.data?.list || [])
       setTotal(res.data?.data?.total || 0)
+      setRakeTotal(res.data?.data?.rake_total || 0)
       setPage(res.data?.data?.page || p || page)
     } finally {
       setLoading(false)
@@ -99,6 +102,12 @@ export default function GameRecords() {
         <Text type="secondary" style={{ fontSize: 12 }}>agent 每局游戏结算后自动上报，默认保留 30 天（可在「字典」调整 game_record_retention_days）</Text>
       </Space>
 
+      {/* 总抽水跟随当前筛选（群号/玩法名），与列表同一次查询算出 */}
+      <Space size={32} wrap style={{ marginBottom: 16 }}>
+        <Statistic title="总抽水（当前筛选）" value={rakeTotal} valueStyle={{ color: '#52c41a' }} />
+        <Statistic title="对局数（当前筛选）" value={total} />
+      </Space>
+
       <ResizableTable rowKey="id" size="middle" columns={columns} dataSource={list} loading={loading}
              pagination={{
                current: page, total, pageSize: 20,
@@ -116,6 +125,8 @@ export default function GameRecords() {
                 <Tag>群 {rec.group_id || '—'}</Tag>
                 <Tag color="volcano">{rec.executor_name}（操作员 {rec.operator_qq || '—'}）</Tag>
                 <Tag color="green">抽水 {rakeText(rec.total_delta)}</Tag>
+                {eventRows.reduce((s, e) => s + (e.flow_amount || 0), 0) > 0 &&
+                  <Tag color="blue">本局流水 {eventRows.reduce((s, e) => s + (e.flow_amount || 0), 0)}</Tag>}
                 <Tag>结算 {rec.member_count} 人 / {rec.event_count} 事件</Tag>
                 <Text type="secondary">{rec.created_at}</Text>
               </Space>
@@ -141,6 +152,9 @@ export default function GameRecords() {
                           <Text type="secondary">{e.qq}</Text>
                           {e.delta !== 0 &&
                             <Text strong style={{ color: deltaColor(e.delta) }}>{deltaText(e.delta)}</Text>}
+                          {/* 撑庄流水额与积分分离：只在两者不同时显示（旧记录 flow=delta 不显示） */}
+                          {e.flow_amount && e.flow_amount !== e.delta &&
+                            <Text type="secondary" style={{ fontSize: 12 }}>流水 {e.flow_amount}</Text>}
                         </Space>
                         {e.msg && <div style={{ color: '#555', marginTop: 2 }}>{e.msg}</div>}
                         {e.reply && <div style={{ color: '#8a5a00', marginTop: 2 }}>→ {e.reply}</div>}

@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react'
-import { Card, Input, Select, Button, Space, Modal, Form, message, Popconfirm, Tag, Tooltip } from 'antd'
+import { Card, Input, Select, Button, Space, Modal, Form, message, Popconfirm, Tag, Tooltip,
+         Drawer, Table, Statistic } from 'antd'
 import { PlusOutlined, SearchOutlined, ReloadOutlined, EditOutlined, DeleteOutlined,
          StopOutlined, CheckCircleOutlined } from '@ant-design/icons'
 import api from '../api'
@@ -16,6 +17,11 @@ export default function QqGroupManager() {
   const [banRow, setBanRow] = useState(null)
   const [banForm] = Form.useForm()
   const [form] = Form.useForm()
+  // 群成员抽屉：点群名称打开（成员按来源群过滤）
+  const [memberOpen, setMemberOpen] = useState(false)
+  const [memberRow, setMemberRow] = useState(null)
+  const [members, setMembers] = useState([])
+  const [memberLoading, setMemberLoading] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -59,13 +65,60 @@ export default function QqGroupManager() {
     load()
   }
 
+  const openMembers = async row => {
+    setMemberRow(row)
+    setMemberOpen(true)
+    setMemberLoading(true)
+    setMembers([])
+    try {
+      const res = await api.get('/api/admin/members', { params: { group_id: row.group_id } })
+      setMembers(res.data?.data || [])
+    } finally {
+      setMemberLoading(false)
+    }
+  }
+
+  const memberColumns = [
+    { title: 'QQ号', dataIndex: 'qq', width: 120 },
+    { title: '昵称', dataIndex: 'nickname', ellipsis: true, render: v => v || '—' },
+    { title: '当前积分', dataIndex: 'points', width: 100 },
+    { title: '累计上分', dataIndex: 'total_income', width: 100 },
+    { title: '累计下分', dataIndex: 'total_outcome', width: 100 },
+    {
+      title: '状态', dataIndex: 'status', width: 90,
+      render: v => v === 'active' ? <Tag color="green">正常</Tag> : <Tag color="red">停用</Tag>,
+    },
+    { title: '注册时间', dataIndex: 'created_at', width: 160, render: v => v || '—' },
+  ]
+
   const columns = [
     { title: '群号', dataIndex: 'group_id', width: 110 },
-    { title: '群名称', dataIndex: 'group_name', ellipsis: true },
+    {
+      title: '群名称', dataIndex: 'group_name', ellipsis: true,
+      render: (v, row) => <a onClick={() => openMembers(row)}>{v || '—'}</a>,
+    },
     { title: '群创建时间', dataIndex: 'create_time', width: 160, render: v => v || '—' },
     { title: '群主QQ', dataIndex: 'owner_qq', width: 100, render: v => v || '—' },
     { title: '管理员QQ', dataIndex: 'admin_qqs', width: 140, ellipsis: true, render: v => v || '—' },
     { title: '群人数', dataIndex: 'member_count', width: 80 },
+    {
+      // 群积分剩余 = 该群会员当前积分合计（实时聚合）
+      title: '积分剩余', dataIndex: 'points_total', width: 100, render: v => v ?? 0,
+    },
+    {
+      // 累计抽水：结算入账时累加，不随 30 天记录清理减少；悬浮看近 30 天
+      title: '累计抽水', dataIndex: 'rake_total', width: 110,
+      render: (v, row) => (
+        <Tooltip title={`近30天：${row.rake_total_30d ?? 0}`}>
+          <span style={{ color: '#52c41a' }}>{v ?? 0}</span>
+        </Tooltip>
+      ),
+    },
+    {
+      // 累计对局数：同上，悬浮看近 30 天
+      title: '总对局数', dataIndex: 'game_count', width: 100,
+      render: (v, row) => <Tooltip title={`近30天：${row.game_count_30d ?? 0}`}>{v ?? 0}</Tooltip>,
+    },
     {
       title: '状态', dataIndex: 'status', width: 110,
       render: (v, row) => v === 'banned'
@@ -133,6 +186,21 @@ export default function QqGroupManager() {
           </Form.Item>
         </Form>
       </Modal>
+
+      {/* 群成员（点群名称打开）：头部是群统计，表内是成员明细 */}
+      <Drawer title={`群成员 — ${memberRow?.group_name || ''}（${memberRow?.group_id || ''}）`}
+              width={880} open={memberOpen} onClose={() => setMemberOpen(false)}>
+        <Space size={32} wrap style={{ marginBottom: 20 }}>
+          <Statistic title="群积分剩余" value={memberRow?.points_total ?? 0} />
+          <Statistic title="累计抽水" value={memberRow?.rake_total ?? 0}
+                     valueStyle={{ color: '#52c41a' }} />
+          <Statistic title="总对局数" value={memberRow?.game_count ?? 0} />
+          <Statistic title="近30天抽水" value={memberRow?.rake_total_30d ?? 0} />
+          <Statistic title="近30天对局" value={memberRow?.game_count_30d ?? 0} />
+        </Space>
+        <Table rowKey="id" size="small" columns={memberColumns} dataSource={members} loading={memberLoading}
+               pagination={{ pageSize: 10, showTotal: t => `共 ${t} 人` }} />
+      </Drawer>
     </Card>
   )
 }

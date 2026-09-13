@@ -32,8 +32,8 @@ public class MemberService {
 
     // ========== 会员管理 ==========
 
-    /** 列表（QQ/昵称模糊 + 状态过滤） */
-    public List<Map<String, Object>> list(String keyword, String status) {
+    /** 列表（QQ/昵称模糊 + 状态过滤 + 来源群过滤） */
+    public List<Map<String, Object>> list(String keyword, String status, String groupId) {
         StringBuilder sql = new StringBuilder(
                 "SELECT id, qq, nickname, points, total_income, total_outcome, group_id, status, note, registrar_qq, created_at, updated_at FROM members WHERE 1=1");
         List<Object> args = new java.util.ArrayList<>();
@@ -45,6 +45,10 @@ public class MemberService {
         if (status != null && !status.isEmpty()) {
             sql.append(" AND status = ?");
             args.add(status);
+        }
+        if (groupId != null && !groupId.isEmpty()) {
+            sql.append(" AND group_id = ?");
+            args.add(groupId);
         }
         sql.append(" ORDER BY points DESC, id DESC");
         return jdbc.query(sql.toString(), new RowMapMapper(), args.toArray());
@@ -170,7 +174,7 @@ public class MemberService {
         int total = jdbc.queryForObject("SELECT COUNT(*) FROM point_records" + where, Integer.class, args.toArray());
         int offset = Math.max(0, (page - 1) * size);
         List<Map<String, Object>> rows = jdbc.query(
-                "SELECT id, qq, delta, type, reason, operator, biz_no, created_at FROM point_records" + where +
+                "SELECT id, qq, delta, flow_amount, type, reason, operator, biz_no, created_at FROM point_records" + where +
                 " ORDER BY id DESC LIMIT " + size + " OFFSET " + offset,
                 new RowMapMapper(), args.toArray());
         return MapBuilder.of("total", total, "page", page, "size", size, "list", rows);

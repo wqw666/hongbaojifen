@@ -25,11 +25,12 @@ public class MemberController {
         this.operationLogService = operationLogService;
     }
 
-    /** 列表 */
+    /** 列表（可按来源群过滤：群管理点群名看成员用） */
     @GetMapping
     public ResponseEntity<Map<String, Object>> list(@RequestParam(required = false) String keyword,
-                                                    @RequestParam(required = false) String status) {
-        return ResponseEntity.ok(MapBuilder.of("code", 0, "data", memberService.list(keyword, status)));
+                                                    @RequestParam(required = false) String status,
+                                                    @RequestParam(value = "group_id", required = false) String groupId) {
+        return ResponseEntity.ok(MapBuilder.of("code", 0, "data", memberService.list(keyword, status, groupId)));
     }
 
     /** 统计 */
