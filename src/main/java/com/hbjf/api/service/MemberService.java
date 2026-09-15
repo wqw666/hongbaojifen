@@ -18,9 +18,19 @@ import java.util.Map;
  * - 会员以 QQ 号为唯一标识；上分/下分写积分流水（事务）
  * - bizNo 幂等：同一业务单号重复提交不会重复加减
  * - 上分时会员不存在自动建档；下分时不存在直接报错
+ * - 积分来源（source）：manual 后台手动 / approve 群内审批 / game 玩法结算 —— 「操作改分」与
+ *   「游戏结算改分」分开记录，会员列表与流水按来源聚合统计；本服务的入口只写 manual/approve，
+ *   game 由 GameRecordService 对局结算写入
  */
 @Service
 public class MemberService {
+
+    /** 来源：后台手动上下分 */
+    public static final String SOURCE_MANUAL = "manual";
+    /** 来源：群内审批通过（agent 积分审批） */
+    public static final String SOURCE_APPROVE = "approve";
+    /** 来源：玩法结算 */
+    public static final String SOURCE_GAME = "game";
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
@@ -32,7 +42,7 @@ public class MemberService {
 
     // ========== 会员管理 ==========
 
-    /** 列表（QQ/昵称模糊 + 状态过滤 + 来源群过滤） */
+    /** 列表（QQ/昵称模糊 + 状态过滤 + 来源群过滤）；每行附带按来源拆分的积分/流水合计 */
     public List<Map<String, Object>> list(String keyword, String status, String groupId) {
         StringBuilder sql = new StringBuilder(
                 "SELECT id, qq, nickname, points, total_income, total_outcome, group_id, status, note, registrar_qq, created_at, updated_at FROM members WHERE 1=1");
@@ -51,7 +61,55 @@ public class MemberService {
             args.add(groupId);
         }
         sql.append(" ORDER BY points DESC, id DESC");
-        return jdbc.query(sql.toString(), new RowMapMapper(), args.toArray());
+        List<Map<String, Object>> rows = jdbc.query(sql.toString(), new RowMapMapper(), args.toArray());
+        attachPointBreakdown(rows);
+        return rows;
+    }
+
+    /**
+     * 按「会员 × 来源」聚合积分与流水额，合并进会员列表行。
+     * point_records 永久保留（不随保留策略清理）→ 实时聚合永远精确，故不落冗余计数列（避免计数漂移）。
+     */
+    private void attachPointBreakdown(List<Map<String, Object>> members) {
+        if (members == null || members.isEmpty()) return;
+        Map<String, Map<String, Object>> agg = new java.util.HashMap<>();
+        for (Map<String, Object> r : jdbc.query(
+                "SELECT member_id AS mid, COALESCE(source,'manual') AS src,"
+                        + " COALESCE(SUM(CASE WHEN delta > 0 THEN delta END),0) AS inc,"
+                        + " COALESCE(SUM(CASE WHEN delta < 0 THEN -delta END),0) AS outc,"
+                        + " COALESCE(SUM(flow_amount),0) AS flow"
+                        + " FROM point_records GROUP BY member_id, COALESCE(source,'manual')",
+                new RowMapMapper())) {
+            agg.put(str(r.get("mid")) + "|" + str(r.get("src")), r);
+        }
+        for (Map<String, Object> m : members) {
+            String mid = str(m.get("id"));
+            long[] manual = sumOf(agg, mid, SOURCE_MANUAL);
+            long[] approve = sumOf(agg, mid, SOURCE_APPROVE);
+            long[] game = sumOf(agg, mid, SOURCE_GAME);
+            m.put("manual_income", manual[0]);
+            m.put("manual_outcome", manual[1]);
+            m.put("approve_income", approve[0]);
+            m.put("approve_outcome", approve[1]);
+            m.put("game_income", game[0]);
+            m.put("game_outcome", game[1]);
+            m.put("game_flow", game[2]);
+        }
+    }
+
+    /** agg 取值：[上分, 下分, 流水额] */
+    private long[] sumOf(Map<String, Map<String, Object>> agg, String memberId, String source) {
+        Map<String, Object> r = agg.get(memberId + "|" + source);
+        if (r == null) return new long[]{0, 0, 0};
+        return new long[]{num(r.get("inc")), num(r.get("outc")), num(r.get("flow"))};
+    }
+
+    private static String str(Object v) {
+        return v == null ? "" : String.valueOf(v);
+    }
+
+    private static long num(Object v) {
+        return v == null ? 0 : ((Number) v).longValue();
     }
 
     /** 查单个会员（按 QQ） */
@@ -114,10 +172,21 @@ public class MemberService {
      */
     @Transactional
     public Map<String, Object> adjustPoints(String qq, long delta, String reason, String operator, String bizNo) {
+        return adjustPoints(qq, delta, reason, operator, bizNo, SOURCE_MANUAL);
+    }
+
+    /**
+     * 调整积分（带来源）
+     * @param source 来源：manual 后台手动 / approve 群内审批（game 只能由对局结算写，这里会归一到 manual）
+     */
+    @Transactional
+    public Map<String, Object> adjustPoints(String qq, long delta, String reason, String operator, String bizNo,
+                                            String source) {
         if (qq == null || qq.trim().isEmpty()) throw new ApiException(ErrorCode.PARAM_INVALID, "QQ号不能为空");
         qq = qq.trim();
         if (delta == 0) throw new ApiException(ErrorCode.PARAM_INVALID, "积分变动不能为0");
         if (reason == null || reason.trim().isEmpty()) throw new ApiException(ErrorCode.PARAM_INVALID, "原因不能为空");
+        String src = SOURCE_APPROVE.equals(source) ? SOURCE_APPROVE : SOURCE_MANUAL;
 
         // 幂等：bizNo 已存在则直接返回已处理结果，不重复加减
         if (bizNo != null && !bizNo.isEmpty()) {
@@ -150,17 +219,23 @@ public class MemberService {
 
         jdbc.update("UPDATE members SET points=points+?, total_income=total_income+?, total_outcome=total_outcome+?, updated_at=? WHERE id=?",
                 delta, delta > 0 ? abs : 0, delta < 0 ? abs : 0, now, memberId);
-        jdbc.update("INSERT INTO point_records (qq, member_id, delta, type, reason, operator, biz_no, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                qq, Long.parseLong(memberId), delta, type, reason, operator == null ? "" : operator,
-                bizNo == null || bizNo.isEmpty() ? null : bizNo, now);
+        jdbc.update("INSERT INTO point_records (qq, member_id, delta, flow_amount, type, reason, operator, biz_no, source, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                qq, Long.parseLong(memberId), delta, delta, type, reason, operator == null ? "" : operator,
+                bizNo == null || bizNo.isEmpty() ? null : bizNo, src, now);
 
-        return MapBuilder.of("qq", qq, "delta", delta, "points", current + delta, "bizNo", bizNo == null ? "" : bizNo);
+        return MapBuilder.of("qq", qq, "delta", delta, "points", current + delta,
+                "bizNo", bizNo == null ? "" : bizNo, "source", src);
     }
 
     // ========== 积分流水 ==========
 
-    /** 流水查询（QQ/类型过滤 + 分页） */
+    /** 流水查询（QQ/类型/来源过滤 + 分页）；附该 QQ 的按来源合计（全量口径，不随筛选变化） */
     public Map<String, Object> records(String qq, String type, int page, int size) {
+        return records(qq, type, null, page, size);
+    }
+
+    /** 流水查询（带来源过滤：manual 后台手动 / approve 群内审批 / game 玩法结算） */
+    public Map<String, Object> records(String qq, String type, String source, int page, int size) {
         StringBuilder where = new StringBuilder(" WHERE 1=1");
         List<Object> args = new java.util.ArrayList<>();
         if (qq != null && !qq.isEmpty()) {
@@ -171,13 +246,51 @@ public class MemberService {
             where.append(" AND type = ?");
             args.add(type);
         }
+        if (source != null && !source.isEmpty()) {
+            where.append(" AND COALESCE(source,'manual') = ?");
+            args.add(source);
+        }
         int total = jdbc.queryForObject("SELECT COUNT(*) FROM point_records" + where, Integer.class, args.toArray());
         int offset = Math.max(0, (page - 1) * size);
         List<Map<String, Object>> rows = jdbc.query(
-                "SELECT id, qq, delta, flow_amount, type, reason, operator, biz_no, created_at FROM point_records" + where +
+                "SELECT id, qq, delta, flow_amount, COALESCE(source,'manual') AS source, type, reason, operator, biz_no, created_at"
+                        + " FROM point_records" + where +
                 " ORDER BY id DESC LIMIT " + size + " OFFSET " + offset,
                 new RowMapMapper(), args.toArray());
-        return MapBuilder.of("total", total, "page", page, "size", size, "list", rows);
+        return MapBuilder.of("total", total, "page", page, "size", size, "list", rows, "summary", summary(qq));
+    }
+
+    /** 按来源合计（会员流水抽屉的合计卡）：手动/审批各自的上分下分、玩法得分失分与玩法流水额 */
+    private Map<String, Object> summary(String qq) {
+        boolean byQq = qq != null && !qq.isEmpty();
+        long manualIn = 0, manualOut = 0, approveIn = 0, approveOut = 0;
+        long gameIn = 0, gameOut = 0, gameFlow = 0;
+        for (Map<String, Object> r : jdbc.query(
+                "SELECT COALESCE(source,'manual') AS src,"
+                        + " COALESCE(SUM(CASE WHEN delta > 0 THEN delta END),0) AS inc,"
+                        + " COALESCE(SUM(CASE WHEN delta < 0 THEN -delta END),0) AS outc,"
+                        + " COALESCE(SUM(flow_amount),0) AS flow"
+                        + " FROM point_records" + (byQq ? " WHERE qq = ?" : "")
+                        + " GROUP BY COALESCE(source,'manual')",
+                new RowMapMapper(), byQq ? new Object[]{qq} : new Object[]{})) {
+            String src = str(r.get("src"));
+            long inc = num(r.get("inc")), outc = num(r.get("outc")), flow = num(r.get("flow"));
+            if (SOURCE_APPROVE.equals(src)) {
+                approveIn = inc;
+                approveOut = outc;
+            } else if (SOURCE_GAME.equals(src)) {
+                gameIn = inc;
+                gameOut = outc;
+                gameFlow = flow;
+            } else {
+                manualIn = inc;
+                manualOut = outc;
+            }
+        }
+        return MapBuilder.of(
+                "manual_income", manualIn, "manual_outcome", manualOut,
+                "approve_income", approveIn, "approve_outcome", approveOut,
+                "game_income", gameIn, "game_outcome", gameOut, "game_flow", gameFlow);
     }
 
     /** 统计概览 */

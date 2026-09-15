@@ -20,12 +20,14 @@ public class PointRecordController {
         this.memberService = memberService;
     }
 
-    /** 流水：?qq=&type=INCOME/OUTCOME&page=&size= */
+    /** 流水：?qq=&type=INCOME/OUTCOME&source=manual/approve/game&page=&size= */
     @GetMapping
     public ResponseEntity<Map<String, Object>> records(@RequestParam(required = false) String qq,
                                                        @RequestParam(required = false) String type,
+                                                       @RequestParam(required = false) String source,
                                                        @RequestParam(defaultValue = "1") int page,
                                                        @RequestParam(defaultValue = "20") int size) {
-        return ResponseEntity.ok(MapBuilder.of("code", 0, "data", memberService.records(qq, type, page, size)));
+        return ResponseEntity.ok(MapBuilder.of("code", 0, "data",
+                memberService.records(qq, type, source, page, size)));
     }
 }

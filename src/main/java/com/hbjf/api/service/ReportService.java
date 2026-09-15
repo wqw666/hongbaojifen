@@ -24,8 +24,10 @@ import java.util.Map;
  * 报表展示（只读总览，供非技术人员查看经营数据）
  *
  * 口径约定（页面展示必须与之一致）：
- * - 「手动 vs 玩法」分流：reason LIKE '玩法:%' = 玩法结算流水（agent 恒写「玩法:{玩法名} 结算」），
- *   其余 = 手动资金流水（充值上分 / 提现下分）。point_records 永久保留，流水统计永久准确。
+ * - 「手动 vs 玩法」分流：source='game' = 玩法结算流水（GameRecordService 对局结算写入），
+ *   其余（manual 后台手动 / approve 群内审批）= 手动资金流水（充值上分 / 提现下分）。
+ *   V1.0.14 之前靠 reason LIKE '玩法:%' 文案约定，现改为读 source 字段（口径不变）。
+ *   point_records 永久保留，流水统计永久准确。
  * - 「今日」= created_at ≥ 今天 00:00:00。
  * - 抽水（房费）= SUM(−game_records.total_delta)；每局守恒：total_delta 恒为 −抽水。
  *   局数/抽水/人次来自 game_records，受保留期限制（配置键 game_record_retention_days，默认 30 天），
@@ -37,7 +39,9 @@ import java.util.Map;
 public class ReportService {
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    private static final String GAME_REASON_LIKE = "玩法:%";   // LIKE 匹配玩法结算流水
+    // 玩法结算流水判定：source='game'（历史 NULL/其他一律按手动口径，与迁移 V1.0.14 回填一致）
+    private static final String SRC_GAME = "COALESCE(source,'manual') = 'game'";
+    private static final String SRC_MANUAL = "COALESCE(source,'manual') <> 'game'";
     private static final int RANK_LIMIT = 10;
 
     private final JdbcTemplate jdbc;
@@ -118,15 +122,14 @@ public class ReportService {
     private Map<String, Object> todayStats(String todayStart) {
         Map<String, Object> points = jdbc.queryForMap(
                 "SELECT"
-                        + " COALESCE(SUM(CASE WHEN delta>0 AND reason NOT LIKE ? THEN delta END),0) AS up,"
-                        + " COALESCE(SUM(CASE WHEN delta<0 AND reason NOT LIKE ? THEN -delta END),0) AS down,"
-                        + " COALESCE(SUM(CASE WHEN delta>0 AND reason LIKE ? THEN delta END),0) AS game_in,"
-                        + " COALESCE(SUM(CASE WHEN delta<0 AND reason LIKE ? THEN -delta END),0) AS game_out,"
-                        + " COUNT(CASE WHEN reason NOT LIKE ? THEN 1 END) AS manual_cnt,"
-                        + " COUNT(CASE WHEN reason LIKE ? THEN 1 END) AS game_flow_cnt"
+                        + " COALESCE(SUM(CASE WHEN delta>0 AND " + SRC_MANUAL + " THEN delta END),0) AS up,"
+                        + " COALESCE(SUM(CASE WHEN delta<0 AND " + SRC_MANUAL + " THEN -delta END),0) AS down,"
+                        + " COALESCE(SUM(CASE WHEN delta>0 AND " + SRC_GAME + " THEN delta END),0) AS game_in,"
+                        + " COALESCE(SUM(CASE WHEN delta<0 AND " + SRC_GAME + " THEN -delta END),0) AS game_out,"
+                        + " COUNT(CASE WHEN " + SRC_MANUAL + " THEN 1 END) AS manual_cnt,"
+                        + " COUNT(CASE WHEN " + SRC_GAME + " THEN 1 END) AS game_flow_cnt"
                         + " FROM point_records WHERE created_at >= ?",
-                GAME_REASON_LIKE, GAME_REASON_LIKE, GAME_REASON_LIKE,
-                GAME_REASON_LIKE, GAME_REASON_LIKE, GAME_REASON_LIKE, todayStart);
+                todayStart);
         Map<String, Object> games = jdbc.queryForMap(
                 "SELECT COUNT(*) AS total, COALESCE(SUM(-total_delta),0) AS fee,"
                         + " COALESCE(SUM(member_count),0) AS persons,"
@@ -167,9 +170,9 @@ public class ReportService {
                 "SELECT SUBSTRING(created_at,1,10) AS d,"
                         + " COALESCE(SUM(CASE WHEN delta>0 THEN delta END),0) AS up,"
                         + " COALESCE(SUM(CASE WHEN delta<0 THEN -delta END),0) AS down"
-                        + " FROM point_records WHERE reason NOT LIKE ? AND created_at >= ?"
+                        + " FROM point_records WHERE " + SRC_MANUAL + " AND created_at >= ?"
                         + " GROUP BY SUBSTRING(created_at,1,10)",
-                new String[]{"up", "down"}, GAME_REASON_LIKE, trendStart);
+                new String[]{"up", "down"}, trendStart);
         Map<String, long[]> games = dayAgg(
                 "SELECT SUBSTRING(created_at,1,10) AS d, COUNT(*) AS game_count,"
                         + " COALESCE(SUM(-total_delta),0) AS fee"
@@ -458,9 +461,10 @@ public class ReportService {
                         + " SUM(" + (positive ? "delta" : "-delta") + ") AS amount, COUNT(*) AS flow_count"
                         + " FROM point_records pr LEFT JOIN members m ON m.qq=pr.qq"
                         + " WHERE pr.delta " + (positive ? "> 0" : "< 0")
-                        + " AND pr.reason " + (game ? "LIKE ?" : "NOT LIKE ?") + " AND pr.created_at >= ?"
+                        + " AND " + (game ? "COALESCE(pr.source,'manual') = 'game'"
+                        : "COALESCE(pr.source,'manual') <> 'game'") + " AND pr.created_at >= ?"
                         + " GROUP BY pr.qq ORDER BY amount DESC, pr.qq ASC LIMIT " + RANK_LIMIT,
-                new RowMapMapper(), GAME_REASON_LIKE, since);
+                new RowMapMapper(), since);
     }
 
     // ========== 内部 ==========

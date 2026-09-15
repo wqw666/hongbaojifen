@@ -26,7 +26,7 @@ from .query_export import write_query_csv
 from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
 from integration.member_sync import group_create_time_str, run_member_sync
 
-APP_VERSION = "2026.09.13-01"
+APP_VERSION = "2026.09.13-03"
 
 
 def _stat_text(total, recent) -> str:
@@ -1356,7 +1356,7 @@ class MainWindow(ctk.CTk):
             for qq in qqs:
                 try:
                     fn = client.up_points if action == "up" else client.down_points
-                    fn(qq, amount, reason=f"agent会员页手动{label}")
+                    fn(qq, amount, reason=f"agent会员页手动{label}", source="manual")
                     ok += 1
                 except (ExecutorBanned, OperatorDisabled) as e:
                     self.after(0, lambda e=e: self.lbl_members_tab_info.configure(

@@ -16,8 +16,8 @@ import java.util.Map;
  * 对外开放积分接口（供执行器 agent / 外部系统调用）
  * 需请求头 X-Api-Key（配置 app.open.api-key）
  * 契约：
- *   POST /api/open/points/up     {qq, points, reason, bizNo?, executor_token?}   上分
- *   POST /api/open/points/down   {qq, points, reason, bizNo?, executor_token?}   下分（余额不足拒绝）
+ *   POST /api/open/points/up     {qq, points, reason, bizNo?, executor_token?, source?}   上分
+ *   POST /api/open/points/down   {qq, points, reason, bizNo?, executor_token?, source?}   下分（余额不足拒绝）
  *   GET  /api/open/points/{qq}                                  查积分
  *   GET  /api/open/points/batch?qqs=10001,10002,...             批量查积分（≤500，逗号分隔）
  *   GET  /api/open/points/records?qq=&page=&size=               查流水
@@ -42,26 +42,32 @@ public class OpenPointController {
         this.executorService = executorService;
     }
 
-    /** 上分（增加积分；带 executor_token 时经操作员权限门禁） */
+    /** 上分（增加积分；带 executor_token 时经操作员权限门禁；source 可选 approve=群内审批，默认 manual） */
     @PostMapping("/up")
     public ResponseEntity<Map<String, Object>> up(@RequestBody Map<String, Object> body) {
         long points = parsePoints(body.get("points"));
         if (points <= 0) return err("上分数量必须大于0");
         Map<String, Object> result = memberService.adjustPoints(
                 str(body.get("qq")), points, str(body.get("reason")),
-                operator(body), str(body.get("bizNo")));
+                operator(body), str(body.get("bizNo")), source(body));
         return ok(result);
     }
 
-    /** 下分（减少积分；带 executor_token 时经操作员权限门禁） */
+    /** 下分（减少积分；带 executor_token 时经操作员权限门禁；source 可选 approve=群内审批，默认 manual） */
     @PostMapping("/down")
     public ResponseEntity<Map<String, Object>> down(@RequestBody Map<String, Object> body) {
         long points = parsePoints(body.get("points"));
         if (points <= 0) return err("下分数量必须大于0");
         Map<String, Object> result = memberService.adjustPoints(
                 str(body.get("qq")), -points, str(body.get("reason")),
-                operator(body), str(body.get("bizNo")));
+                operator(body), str(body.get("bizNo")), source(body));
         return ok(result);
+    }
+
+    /** 来源：只放行 approve（群内审批），其余一律 manual（game 仅对局结算可写） */
+    private String source(Map<String, Object> body) {
+        return MemberService.SOURCE_APPROVE.equals(str(body.get("source")))
+                ? MemberService.SOURCE_APPROVE : MemberService.SOURCE_MANUAL;
     }
 
     /** 查询某会员积分 */

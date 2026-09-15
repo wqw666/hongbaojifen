@@ -156,18 +156,23 @@ class HbjfClient:
         data = self._get("/api/open/points/batch", params={"qqs": ",".join(qqs)})
         return data.get("list") or []
 
-    def up_points(self, qq: str, points: int, reason: str = "", biz_no: str = "") -> dict:
-        """上分（积分审批通过）。biz_no 幂等：同单号重复提交不会重复加。"""
+    def up_points(self, qq: str, points: int, reason: str = "", biz_no: str = "",
+                  source: str = "manual") -> dict:
+        """上分（积分转入）。
+        source：manual=操作员手动改分（agent 会员页上分按钮）、approve=群内审批通过。
+        总后台按来源分列统计，**群内审批必须显式传 approve**，否则会记成手动。
+        biz_no 幂等：同单号重复提交不会重复加。"""
         body = {"qq": str(qq), "points": int(points), "reason": reason or "",
-                "executor_token": self.token}
+                "executor_token": self.token, "source": source}
         if biz_no:
             body["bizNo"] = biz_no
         return self._post("/api/open/points/up", body)
 
-    def down_points(self, qq: str, points: int, reason: str = "", biz_no: str = "") -> dict:
-        """下分（积分审批通过；余额不足会拒绝）。"""
+    def down_points(self, qq: str, points: int, reason: str = "", biz_no: str = "",
+                    source: str = "manual") -> dict:
+        """下分（余额不足会拒绝）。source 同 up_points：手动 manual / 群内审批 approve。"""
         body = {"qq": str(qq), "points": int(points), "reason": reason or "",
-                "executor_token": self.token}
+                "executor_token": self.token, "source": source}
         if biz_no:
             body["bizNo"] = biz_no
         return self._post("/api/open/points/down", body)

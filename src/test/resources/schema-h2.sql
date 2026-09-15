@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS point_records (
     member_id BIGINT DEFAULT 0, delta BIGINT NOT NULL, type VARCHAR(16) NOT NULL,
     reason VARCHAR(255) DEFAULT '', operator VARCHAR(64) DEFAULT '',
     biz_no VARCHAR(128) DEFAULT NULL, created_at VARCHAR(19) DEFAULT '',
-    flow_amount BIGINT DEFAULT 0,
+    flow_amount BIGINT DEFAULT 0, source VARCHAR(16) DEFAULT 'manual',
     CONSTRAINT uk_records_bizno UNIQUE (biz_no)
 );
 CREATE TABLE IF NOT EXISTS qq_accounts (

@@ -1,6 +1,8 @@
 # 红包积分管理系统 — 会话交接
 
-> 跨会话续接开发必读。最近一次完整验证：**2026-09-13**（群经营数据 + 流水额与积分分离：后端 52 测试全绿 + agent selftest 76 / integration 32 全绿 + play_engine ✓ + 前端 build ✓）。
+> 跨会话续接开发必读。最近一次完整验证：**2026-09-13**（积分来源分离：后端 64 测试全绿 + agent selftest 76 / integration 32 全绿 + play_engine ✓ + 前端 build ✓）。
+>
+> **2026-09-13 积分来源分离（迁移 V1.0.14）**：上分下分与结算得分失分分开——会员页此前只能靠 `reason` 文案区分「操作改分」与「游戏结算改分」，流水也混在一起。现在 `point_records.source` 落三类值：**manual 后台手动 / approve 群内审批 / game 玩法结算**（历史回填 `玩法:%`→game、`biz_no LIKE 'approve:%'`→approve、其余 manual；并补齐 V1.0.13 之后手动流水漏掉的 `flow_amount`）。① 写入侧：`MemberService.adjustPoints` 新增 5 参重载（`source` 白名单，非 approve 一律归 manual，**外部不能伪造 game**）；`OpenPointController` up/down 读可选 `source`（agent 审批传 approve）；`GameRecordService` 结算恒写 `source='game'`。② 读取侧：会员列表每行附 6 个来源聚合（`manual_income/manual_outcome/approve_income/approve_outcome/game_income/game_outcome/game_flow`，按「会员×来源」`GROUP BY` 实时聚合，不落计数列）；`/api/admin/point-records` 加 `source` 过滤并返回 `summary`（**全量口径，不随筛选变化**）。③ 展示：会员列表加 **手动上分/手动下分/玩法得分/玩法失分** 四列（手动 = 后台手动 + 群内审批，悬浮看拆分，保留累计上下分对账）；流水抽屉加合计卡（手动上分/下分、玩法得分/失分、玩法流水额）+ 来源筛选标签（全部/手动/审批/玩法）+ 类型细分 7 种标签（手动上分·下分 / 审批上分·下分 / 结算得分·失分 / 流水）。④ **报表口径改读 source**（`ReportService` 4 处 `reason LIKE '玩法:%'` 全部换掉）：手动 = 非 game（含 approve）、玩法 = game，显示口径不变但不再依赖文案约定。⑤ **agent 侧修正**：`integration/backend_client.py::up_points/down_points` 的 `source` 从写死的 `approve` 改成参数（默认 `manual`）——两个调用点此前共用同一个写死值，**agent 会员页的手动上/下分会被误记成「群内审批」**；现在 `approve_tab.py::_process_selected` 显式传 `approve`、`main_window.py::_members_manual` 显式传 `manual`，APP_VERSION → `2026.09.13-03`（此修复必须重新分发 agent 才生效）。测试：新增 `PointSourceSeparationTest`（7 用例：三类来源落库、伪造 game 被归一、列表聚合、summary 与过滤、报表按 source 而非 reason）+ `GameSettlementScenariosTest`（5 用例 / 8 局剧本：撑庄三方·四方·平局、大吃小两方·三方、未知会员跳过、余额不足跳过；逐局断言 Σdelta = −抽水、source=game、群计数累加、撑庄两侧流水对等、平局 FLOW 行不动分）。
 >
 > **2026-09-08 玩法播报迭代（R8）**：玩法群公告一律**普通消息、不带 @全体成员**（插件层移除前缀与 at-all，一处覆盖开局/停结/结算/作废）；开局只发 `————开始————` 一条横幅；停结 = `————停结————` / 玩法行（`本局玩法：撑庄（庄家：X）` 或 `本局玩法：大吃小`）/ `合计 N 分` 三段 + 汇总表图；成员下注只回当前这笔金额数字（@ 引擎带）；结算表加「红包金额」列（后台改/补值行标 `（代填）`），撑庄尾行 = `撑 甲（红包0.40 点4）：结算 -10`（未抢 = 红包0.00 点0）；总后台游戏记录列「净变动」改名「抽水」（恒显示正数绿色）。验证：agent 玩法 selftest 71 断言绿 + integration 30 绿 + 插件重建 0 处「全体成员」+ `frontend && npm run build` ✓；**后端 Java 零改动**（前端改样需重新 `mvn package` 进 jar 才生效）。R7 同批玩法语义（局号纯数字/封盘结算表格图/回放记录管理员改开奖）见 agent/docs/代码架构说明.md §8。
 >
@@ -13,14 +15,14 @@
 - **v1.0.4 功能集已完成**（后端 Spring Boot 3.5.3/JDK21/MySQL8/Flyway + 前端 React18/AntD5/Vite + agent 执行器）
 - 本迭代 = Request B 8 项：QQ群管理+创建时间/状态(封禁)；**删除普通QQ号管理**（QQ 只是 member 或 操作员）；执行器**封禁**（仅封禁 / 封禁并重置token）；执行器详情=最近心跳IP/绑定的操作员QQ；删 executors 负责群号列（一执行器多群）；**游戏记录**（agent 上报对局回放，默认保留 30 天，保留天数配置键可改）；操作员**禁手动**（can_manual_points，禁手动不禁自动）；完整流程（心跳带 admin_qq 自动登记操作员 → 群/会员同步 → 玩法 → 结算上报 → 后端实时入账，人工审核不需要——后端自动校验）
 - 默认管理员 `admin / admin123`（首次启动自动创建，BCrypt）
-- 数据库 `hongbaojifen`（root/19991020），flyway_schema_history：V1/1.0.1/1.0.2/1.0.3/1.0.4/1.0.7~1.0.13 全部 success（5/6 号跳号）
+- 数据库 `hongbaojifen`（root/19991020），flyway_schema_history：V1/1.0.1/1.0.2/1.0.3/1.0.4/1.0.7~1.0.14 全部 success（5/6 号跳号）
 - **不做红包金额↔积分自动挂钩**；玩法 delta 由玩法文件返回、对局结算时入账
 
 ## 服务与端口
 
 | 服务 | 端口 | 启动方式 |
 | --- | --- | --- |
-| 后端 | 8892 | **当前实例 = `start.bat` 启动的 java 进程（PID 18908，2026-09-13 重建的 jar，已跑 V1.0.13 迁移）**；日志 `logs/app.log`；重复执行 `start.bat` 即重启（自动杀占用者）。**注意 `start.bat` 优先取仓库根目录的 `hongbaojifen-api-*.jar`**（server 风格），根目录那份必须与 `target/` 同步——2026-09-13 就是根目录的旧 jar（09-12）盖住了新构建，导致启动后 Flyway 停在 1.0.12（见「坑与经验」16） |
+| 后端 | 8892 | **当前实例 = `start.bat` 启动的 java 进程（PID 18892，2026-09-13 23:13 重建的 jar，已跑 V1.0.14 迁移）**；日志 `logs/app.log`；重复执行 `start.bat` 即重启（自动杀占用者）。**注意 `start.bat` 优先取仓库根目录的 `hongbaojifen-api-*.jar`**（server 风格），根目录那份必须与 `target/` 同步——2026-09-13 就是根目录的旧 jar（09-12）盖住了新构建，导致启动后 Flyway 停在 1.0.12（见「坑与经验」16）。**在 Git Bash 里调 `start.bat` 必须写 `.\start.bat`**（`cmd //c "cd /d D:\work\hongbaojifen && start.bat local"` 会报「不是内部或外部命令」），且脚本末尾有 `pause`（`%cmdcmdline%` 含 start.bat 时触发）→ 用 `< /dev/null` 或后台跑 |
 | 前端开发 | 3002 | `cd frontend && npm run dev`（proxy /api → 8892）；生产构建进 jar static/admin |
 | agent GUI | — | `agent/run_dev.bat`（dev）；打包见 agent/README |
 
@@ -38,6 +40,7 @@
 - **群封禁**：qq_groups.status 收敛为 active/banned（旧 paused 废弃），封禁群不被 open upsert 解封；agent 侧封禁群不启玩法、不同步
 - **对局结算**：`POST /api/open/games/report`（round_id ≤96 幂等、events ≤2000、delta 逐事件入账、未知会员/停用/余额不足 → delta=0 + warning）；管理端 game-records 列表 + `/{id}` 回放；`RetentionCleanupService` @Scheduled 每 6h 清 30 天前（配置键 `game_record_retention_days` / `operation_log_retention_days`，走 dicts）
 - **积分与流水分离**（V1.0.13）：事件可带 `flow?`（流水额，缺省 = `delta`）；撑庄模式流水按「下注半额」恒正两侧对等记（积分仍全额按 `delta`），平局 `delta=0` 但记 `type=FLOW` 流水；群计数 `qq_groups.game_count`/`rake_total` 在**首次**入账时累加（重复上报不重复计数），供群列表「累计」列（不随 30 天记录清理缩水）
+- **积分来源分离**（V1.0.14）：`point_records.source` = `manual`（后台手动，含 open 接口不传 source 的历史语义）/ `approve`（群内审批，agent `up_points`/`down_points` 传 `source:"approve"`）/ `game`（对局结算，`GameRecordService` 恒写）；白名单外（含伪造 `game`）一律归一 `manual`。读取侧：会员列表 6 个来源聚合列（`manual_income/outcome`、`approve_income/outcome`、`game_income/outcome`、`game_flow`，按「会员×来源」实时 `GROUP BY`）+ `/api/admin/point-records?source=` 过滤与 `summary`（全量口径，不随筛选变）。**报表口径改读 source**（`ReportService.SRC_MANUAL`/`SRC_GAME` 常量，用 `COALESCE(source,'manual')` 兜历史 NULL）：手动 = 非 game（含 approve）、玩法 = game —— 显示口径与 V1.0.13 一致，但不再依赖 `reason` 文案
 - **操作员身份守卫**（agent 侧 `integration` 封禁/停用处理）：`ExecutorBanned` → 停摆红字；`OperatorDisabled`（40311）同
 - 授权边界：**后端 Java 改动已被授权**用于本功能集；约束：不主动 git commit（除非被要求）、redbag/ 永不入库、agent GUI 线程纪律（daemon + after(0)）、登录态/密钥/token 永不提交
 
@@ -65,7 +68,7 @@
 
 ## 测试与验证手段
 
-- 后端：`mvn -Dskip.fe=true test`（52 用例；测试用 H2 共享 mem 库，断言 id 前先 `TRUNCATE TABLE`）
+- 后端：`mvn -Dskip.fe=true test`（64 用例 = 原有 52 + `PointSourceSeparationTest` 7 + `GameSettlementScenariosTest` 5；测试用 H2 共享 mem 库，断言 id 前先 `TRUNCATE TABLE`；H2 建表脚本 `src/test/resources/schema-h2.sql` 是**手写维护**的，加列要同步改，否则新用例全挂）
 - 全链路 E2E（本机 MySQL 真实写入，可重复）：`python tools/e2e_full.py` — admin登录→建执行器→心跳自动登记操作员→群上报(create_time)→会员幂等注册→批量查分→对局上报+5/+2/未知会员warning→重复上报幂等→积分实时入账→管理端回放→封禁40310→解封恢复（13 步）
 - agent 冒烟：`cd agent && python -m integration.smoke --base http://localhost:8892 --key hbjf-open-2026 --token <token> --self-qq 60001 --self-nick 冒烟操作员 --member-count 3 --member-prefix 60030 --play-events 4`（操作员自动登记/群/会员同步/对局上报+幂等）
 - agent 引擎自测：`python -m integration.play_engine`（v2 delta/热重载/坏文件…）
@@ -91,12 +94,15 @@
 15. **打包产物必须校验**（2026-09-12 血泪）：`target/` 里的 jar 曾出现三份 `application-*.yml`（base/local/prod）**全是旧值**——password 123456，而 `src/main/resources` 与 `target/classes` 都是 19991020 → 启动 `Access denied for user 'root'@'localhost'`、健康检查永远不 `[ready]`；该 jar 时间戳与构建记录对不上，来源无法复原。**教训：交付/发版前别信 `target/` 里的既有 jar**——用 python zipfile 比对 jar 内 `BOOT-INF/classes/application*.yml` 与源码的 md5（顺带 `unzip -p … 'static/admin/assets/*.js' | grep -c 抽水` 确认前端是新的），不一致就 `mvn clean package -Drevision=1.0.0 -DskipTests` 重打。
 16. **根目录的 jar 会盖住新构建**（2026-09-13 血泪）：`start.bat` 选 jar 的顺序是「本目录优先，其次 `target\`」（第 35-44 行，照顾服务器风格），仓库根长期留着一份 `hongbaojifen-api-1.0.0.jar`（09-12 的旧产物）→ `mvn clean package` 出来的新 jar 在 `target/` 根本没被启动，日志显示 Flyway「Current version 1.0.12, up to date. No migration necessary」（新迁移压根不在 jar 里）。**判断**：`ls -l --time-style=+%m-%d_%H:%M hongbaojifen-api-*.jar target/hongbaojifen-api-*.jar` + `md5sum` 比两份；**处理**：`cp -f target/hongbaojifen-api-1.0.0.jar .` 覆盖根目录那份（或删掉根目录那份）再跑 `start.bat`；启动成功的标志是日志出现 `Migrating schema ... to version "1.0.13"` + `Successfully applied 1 migration`。
 17. **累计抽水可能是负数，是历史数据不是算错**：口径 `抽水 = Σ(-total_delta)`（与报表页、README 一致），真实牌局 Σdelta = −抽水 ≤ 0 → 抽水恒正；但库里有两类**非牌局**历史记录 Σdelta 为正——2026-09-05 的单人测试局（id 6~15，`红包玩法1`/`复合玩法1`，total_delta +6~+15）和 `tools/e2e_full.py` 造的 E2E 局（每条 +7/+2，纯算术测试）。它们会把累计抽水拉低甚至变负（如群 1121550065 显示 -36、E2E 群 -28）。**新产生的真实牌局一切正常**（2026-09-13 live 校验：撑庄局 delta +80/0/-90、flow 50/25/75 → Σdelta -10 → 群 rake_total +10 ✓）。若日后想让「累计抽水」永不为负，改口径为 `SUM(CASE WHEN total_delta < 0 THEN -total_delta ELSE 0 END)`（迁移 + `GameRecordService` 累加处同步改），但会与「游戏记录」页每局显示的口径脱钩，需用户拍板。
+18. **`-Dskip.fe=false` 仍会跳过前端构建**（2026-09-13 血泪）：pom 里跳过前端是**激活式 profile**（`<activation><property><name>skip.fe</name></property>`，第 165-172 行）——Maven 的 property 激活只看「属性是否存在」，不看值，所以 `-Dskip.fe=false` 反而把 profile 点亮了 → `frontend.skip=true` → vite 不跑、`copy-frontend-dist` 也不拷，打出来的 jar **没有 `BOOT-INF/classes/static/admin/`**（体积小 ~400KB，页面 404）。**要带前端就完全别传这个属性**：`mvn clean package -Drevision=1.0.0 -DskipTests`；打完必看三样——日志有 `vite build` + `Copying 2 resources from frontend\dist`、`unzip -l … | grep static/admin/index.html`、jar 内 `application*.yml` 与源码逐字节一致。
+19. **一个 client 方法服务两个语义相反的调用点 = 迟早串味**（2026-09-13）：`backend_client.up_points/down_points` 曾把 `source="approve"` **写死在函数体里**，但调用它的有两处——积分审批 tab（该 approve）和会员页手动上/下分（该 manual）→ agent 里手动改分会被记成「群内审批」，总后台来源列全错。**教训**：语义参数不写死，改成带默认值的形参（默认取「最保守/最常见」的那个），**每个调用点显式传值**（`approve_tab` 传 `approve`、`main_window` 传 `manual`），并在架构文档里点名这两处；验证用**拦截 `_post` 断言请求体**（不发真实请求），比读代码可靠。
+20. **Git Bash 里调 `.bat` 必须带 `.\` 或先 `cd /d`**（2026-09-13 二次踩）：`cmd //c "build.bat"` → 「'build.bat' 不是内部或外部命令」且**退出码仍是 0**（`; echo $?` 取的是后一条命令的），很容易误判成「构建成功」。可用写法：`cmd //c "cd /d D:\work\hongbaojifen\agent && .\build.bat" > log 2>&1 < /dev/null`（末尾 `pause` 靠 `< /dev/null` 直接返回）。**判据**：看产物时间戳/md5，别信退出码。
 
 ## 结构速览
 
 - `src/main/java/com/hbjf/api/` — controller（admin 管理端 + open 开放端）/ service（含 RetentionCleanupService 定时清理）/ security / dao（RowMapMapper）/ util（MapBuilder）
-- `src/main/resources/db/migration/` — V1__init.sql（9 表）+ V1.0.1(executor_commands)/V1.0.2(玩法种子)/V1.0.3(群封禁·执行器操作员·游戏记录)/V1.0.4(biz_no 加宽)/V1.0.7(红包玩法种子)/V1.0.8(游戏记录回放明细)/V1.0.9(保留天数配置)/V1.0.10(执行器费率)/V1.0.11(删旧玩法种子只留复合玩法)/V1.0.12(登录免责声明字典种子 disclaimer_text)/V1.0.13(群累计对局与累计抽水计数列 + point_records/game_record_events 流水额 flow_amount + game_records(group_id,created_at) 索引)；5/6 号跳号未用。玩法内置种子在 `src/main/resources/seed_rules/rule_fuhe.py`（启动 ensureSeedRules 兜底落盘 data/rules）
-- `frontend/src/App.jsx` — 9 菜单（报表默认隐藏：增值服务开关 `REPORT_MENU_ENABLED=false` 在文件顶部，改 true + 重新构建即放出菜单，路由保留可 /report 直达）；**登录免责声明弹窗**：登录后读字典 `disclaimer_text`（`GET /api/admin/dicts?key=`，值非空才弹、不可跳过、确认按钮「我已阅读并确认」关闭；配置管理可编辑，删除行则不再弹）：会员管理 / 报表（`Report.jsx` 只读经营总览：今日手动上分/下分与玩法赢/输四口径分开 + 抽水局数、近7日趋势**今天在最上**、执行器与群展开明细（含未绑定群）、5 个玩家榜 Top10、右侧「当前部署信息」卡（overview.deployment：服务器IP/系统/JDK/端口/环境 + DB 地址与版本）+ 顶部「下载报表」按钮（前端 Blob 生成当日 HTML 日报，文件名带日期），接口 `GET /api/admin/report/overview` → `ReportService`（trend 降序返回、deployment() 读 DataSource metadata + VERSION()））/ QQ群管理 / 操作员管理 / 配置管理 / 执行器管理 / 会员玩法管理 / 游戏记录 / 操作记录 / 用户管理（仅内置超级管理员 admin 可见可管，`AdminUsers.jsx` 增删用户/重置密码）；组件在 `components/`（QqGroupManager 有封禁状态 + 积分剩余/累计抽水/总对局三列 + 点群名开成员抽屉、QqAccountManager 有禁手动、ExecutorManager 有封禁按钮、GameRecordManager 回放 + 页头总抽水、MemberManager 流水额列）
+- `src/main/resources/db/migration/` — V1__init.sql（9 表）+ V1.0.1(executor_commands)/V1.0.2(玩法种子)/V1.0.3(群封禁·执行器操作员·游戏记录)/V1.0.4(biz_no 加宽)/V1.0.7(红包玩法种子)/V1.0.8(游戏记录回放明细)/V1.0.9(保留天数配置)/V1.0.10(执行器费率)/V1.0.11(删旧玩法种子只留复合玩法)/V1.0.12(登录免责声明字典种子 disclaimer_text)/V1.0.13(群累计对局与累计抽水计数列 + point_records/game_record_events 流水额 flow_amount + game_records(group_id,created_at) 索引)/V1.0.14(point_records.source 来源列 + 历史回填 + flow_amount 补齐 + (member_id,source) 索引)；5/6 号跳号未用。玩法内置种子在 `src/main/resources/seed_rules/rule_fuhe.py`（启动 ensureSeedRules 兜底落盘 data/rules）
+- `frontend/src/App.jsx` — 9 菜单（报表默认隐藏：增值服务开关 `REPORT_MENU_ENABLED=false` 在文件顶部，改 true + 重新构建即放出菜单，路由保留可 /report 直达）；**登录免责声明弹窗**：登录后读字典 `disclaimer_text`（`GET /api/admin/dicts?key=`，值非空才弹、不可跳过、确认按钮「我已阅读并确认」关闭；配置管理可编辑，删除行则不再弹）：会员管理 / 报表（`Report.jsx` 只读经营总览：今日手动上分/下分与玩法赢/输四口径分开 + 抽水局数、近7日趋势**今天在最上**、执行器与群展开明细（含未绑定群）、5 个玩家榜 Top10、右侧「当前部署信息」卡（overview.deployment：服务器IP/系统/JDK/端口/环境 + DB 地址与版本）+ 顶部「下载报表」按钮（前端 Blob 生成当日 HTML 日报，文件名带日期），接口 `GET /api/admin/report/overview` → `ReportService`（trend 降序返回、deployment() 读 DataSource metadata + VERSION()））/ QQ群管理 / 操作员管理 / 配置管理 / 执行器管理 / 会员玩法管理 / 游戏记录 / 操作记录 / 用户管理（仅内置超级管理员 admin 可见可管，`AdminUsers.jsx` 增删用户/重置密码）；组件在 `components/`（QqGroupManager 有封禁状态 + 积分剩余/累计抽水/总对局三列 + 点群名开成员抽屉、QqAccountManager 有禁手动、ExecutorManager 有封禁按钮、GameRecordManager 回放 + 页头总抽水、MemberManager 手动/玩法四列来源拆分 + 流水抽屉合计卡与来源筛选）
 - `agent/` — 执行器（README + docs/代码架构说明.md + docs/玩法v2结算与上报设计.md 见 agent 侧）；integration/ 对接包独立于 GUI
 - `data/rules/` — 玩法文件存储（运行时自动创建）
 - `tools/e2e_full.py` — 全链路 E2E（本机）

@@ -1,10 +1,23 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import { Card, Input, Select, Button, Space, Modal, Form, InputNumber, message,
-         Popconfirm, Tag, Drawer, Row, Col, Statistic } from 'antd'
+         Popconfirm, Tag, Drawer, Row, Col, Statistic, Tooltip, Segmented } from 'antd'
 import { PlusOutlined, SearchOutlined, ReloadOutlined, RiseOutlined, FallOutlined,
          HistoryOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons'
 import api from '../api'
 import ResizableTable from './ResizableTable'
+
+// 积分来源：manual 后台手动 / approve 群内审批 / game 玩法结算（与后端 V1.0.14 一致）
+const SOURCE_LABEL = { manual: '后台手动', approve: '群内审批', game: '玩法结算' }
+
+// 流水类型标签：来源 × 收支 细分 7 种（flow_amount≠0 且 delta=0 的是「流水」行）
+function typeTag (row) {
+  const src = row.source || 'manual'
+  const flowOnly = row.type === 'FLOW' || (!row.delta && row.flow_amount)
+  if (flowOnly) return <Tag color="blue">流水</Tag>
+  if (src === 'game') return <Tag color="geekblue">{row.delta > 0 ? '结算得分' : '结算失分'}</Tag>
+  if (src === 'approve') return <Tag color="cyan">{row.delta > 0 ? '审批上分' : '审批下分'}</Tag>
+  return <Tag color={row.delta > 0 ? 'green' : 'red'}>{row.delta > 0 ? '手动上分' : '手动下分'}</Tag>
+}
 
 export default function MemberManager() {
   const [list, setList] = useState([])
@@ -29,6 +42,8 @@ export default function MemberManager() {
   const [recordLoading, setRecordLoading] = useState(false)
   const [recordPage, setRecordPage] = useState(1)
   const [recordTotal, setRecordTotal] = useState(0)
+  const [recordSource, setRecordSource] = useState('')       // '' 全部 / manual / approve / game
+  const [recordSummary, setRecordSummary] = useState({})     // 全量口径合计（不随筛选变）
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -44,12 +59,15 @@ export default function MemberManager() {
 
   useEffect(() => { load() }, [load])
 
-  const loadRecords = useCallback(async (page) => {
+  const loadRecords = useCallback(async (page, source) => {
     setRecordLoading(true)
     try {
-      const res = await api.get('/api/admin/point-records', { params: { qq: recordQq, page, size: 20 } })
+      const params = { qq: recordQq, page, size: 20 }
+      if (source) params.source = source
+      const res = await api.get('/api/admin/point-records', { params })
       setRecords(res.data?.data?.list || [])
       setRecordTotal(res.data?.data?.total || 0)
+      setRecordSummary(res.data?.data?.summary || {})
       setRecordPage(page)
     } finally {
       setRecordLoading(false)
@@ -58,8 +76,9 @@ export default function MemberManager() {
 
   const openRecord = qq => {
     setRecordQq(qq)
+    setRecordSource('')
     setRecordOpen(true)
-    loadRecords(1)
+    loadRecords(1, '')
   }
 
   const openPoint = (row, mode) => {
@@ -99,6 +118,19 @@ export default function MemberManager() {
     { title: '当前积分', dataIndex: 'points', width: 90, sorter: (a, b) => a.points - b.points },
     { title: '累计上分', dataIndex: 'total_income', width: 90 },
     { title: '累计下分', dataIndex: 'total_outcome', width: 90 },
+    // 手动 = 后台手动 + 群内审批（点标题下的 tooltip 看拆分）；玩法 = 对局结算
+    { title: '手动上分', dataIndex: 'manual_income', width: 100,
+      render: (v, row) => (
+        <Tooltip title={`后台手动 ${v || 0} + 群内审批 ${row.approve_income || 0}`}>
+          <span>{(v || 0) + (row.approve_income || 0)}</span>
+        </Tooltip>) },
+    { title: '手动下分', dataIndex: 'manual_outcome', width: 100,
+      render: (v, row) => (
+        <Tooltip title={`后台手动 ${v || 0} + 群内审批 ${row.approve_outcome || 0}`}>
+          <span>{(v || 0) + (row.approve_outcome || 0)}</span>
+        </Tooltip>) },
+    { title: '玩法得分', dataIndex: 'game_income', width: 90, render: v => v || 0 },
+    { title: '玩法失分', dataIndex: 'game_outcome', width: 90, render: v => v || 0 },
     { title: '来源群', dataIndex: 'group_id', width: 100, render: v => v || '—' },
     { title: '注册人QQ', dataIndex: 'registrar_qq', width: 100, render: v => v || '—' },
     { title: '状态', dataIndex: 'status', width: 80, render: v =>
@@ -141,7 +173,7 @@ export default function MemberManager() {
         </Space>
 
         <ResizableTable rowKey="id" columns={columns} dataSource={list} loading={loading}
-               size="middle" scroll={{ x: 1100 }} pagination={{ pageSize: 20 }} />
+               size="middle" scroll={{ x: 1500 }} pagination={{ pageSize: 20 }} />
       </Card>
 
       {/* 新建/编辑 */}
@@ -176,18 +208,43 @@ export default function MemberManager() {
         </Form>
       </Modal>
 
-      {/* 流水抽屉 */}
-      <Drawer title={`积分流水 — ${recordQq}`} width={680} open={recordOpen} onClose={() => setRecordOpen(false)}>
+      {/* 流水抽屉：合计卡（全量口径）+ 来源筛选 + 类型细分 */}
+      <Drawer title={`积分流水 — ${recordQq}`} width={860} open={recordOpen} onClose={() => setRecordOpen(false)}>
+        <Card size="small" style={{ marginBottom: 12 }}>
+          <Row gutter={8}>
+            <Col span={5}><Statistic title="手动上分" value={(recordSummary.manual_income || 0) + (recordSummary.approve_income || 0)}
+                                    valueStyle={{ color: '#52c41a', fontSize: 18 }} /></Col>
+            <Col span={5}><Statistic title="手动下分" value={(recordSummary.manual_outcome || 0) + (recordSummary.approve_outcome || 0)}
+                                    valueStyle={{ color: '#fa8c16', fontSize: 18 }} /></Col>
+            <Col span={4}><Statistic title="玩法得分" value={recordSummary.game_income || 0}
+                                    valueStyle={{ color: '#2f54eb', fontSize: 18 }} /></Col>
+            <Col span={4}><Statistic title="玩法失分" value={recordSummary.game_outcome || 0}
+                                    valueStyle={{ color: '#ff4d4f', fontSize: 18 }} /></Col>
+            <Col span={6}><Statistic title="玩法流水额" value={recordSummary.game_flow || 0}
+                                    valueStyle={{ fontSize: 18 }} /></Col>
+          </Row>
+          <div style={{ marginTop: 8, color: '#8c8c8c', fontSize: 12 }}>
+            手动上/下分 = 后台手动 + 群内审批（后台手动 {recordSummary.manual_income || 0} / {recordSummary.manual_outcome || 0}；
+            群内审批 {recordSummary.approve_income || 0} / {recordSummary.approve_outcome || 0}）；以上为全量合计，不随下方筛选变化
+          </div>
+        </Card>
+
+        <Segmented style={{ marginBottom: 12 }} value={recordSource}
+                   onChange={v => { setRecordSource(v); loadRecords(1, v) }}
+                   options={[{ label: '全部', value: '' }, { label: '手动', value: 'manual' },
+                             { label: '审批', value: 'approve' }, { label: '玩法', value: 'game' }]} />
+
         <ResizableTable rowKey="id" size="small" loading={recordLoading} dataSource={records}
                pagination={{ current: recordPage, total: recordTotal, pageSize: 20, showTotal: t => `共 ${t} 条`,
-                 onChange: loadRecords }}
+                 onChange: p => loadRecords(p, recordSource) }}
                columns={[
                  { title: '变动', dataIndex: 'delta', width: 90, render: v =>
-                     <span style={{ color: v > 0 ? '#52c41a' : '#ff4d4f', fontWeight: 600 }}>{v > 0 ? '+' : ''}{v}</span> },
-                 { title: '类型', dataIndex: 'type', width: 90, render: v =>
-                     <Tag color={v === 'INCOME' ? 'green' : v === 'OUTCOME' ? 'red' : 'blue'}>
-                       {v === 'INCOME' ? '上分' : v === 'OUTCOME' ? '下分' : '流水'}
-                     </Tag> },
+                     <span style={{ color: v > 0 ? '#52c41a' : v < 0 ? '#ff4d4f' : '#8c8c8c', fontWeight: 600 }}>
+                       {v > 0 ? '+' : ''}{v}
+                     </span> },
+                 { title: '类型', width: 100, render: (_, row) => typeTag(row) },
+                 { title: '来源', dataIndex: 'source', width: 90,
+                   render: v => SOURCE_LABEL[v || 'manual'] },
                  { title: '流水', dataIndex: 'flow_amount', width: 80,
                    render: (v, row) => (v && v !== row.delta) ? v : '—' },
                  { title: '原因', dataIndex: 'reason', ellipsis: true },

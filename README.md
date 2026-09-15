@@ -2,7 +2,7 @@
 
 会员积分管理系统。会员从 QQ 群拉取，以 **QQ 号作为唯一标识**；系统对外开放接口，供外部程序（执行器 agent）上下分/查积分/上报对局结算。QQ 只有两种身份：**会员**（members，由 agent 从群成员同步）或 **操作员**（管理员登录的管理 QQ，agent 心跳自动登记）；不做普通 QQ 号池。仅管理员一人登录本系统，会员不能登录。
 
-版本迁移当前到 **V1.0.13**（flyway 历史：V1 / 1.0.1 / 1.0.2 / 1.0.3 / 1.0.4 / 1.0.7 / 1.0.8 / 1.0.9 / 1.0.10 / 1.0.11 / 1.0.12 / 1.0.13，版本号不连续为计划内跳过）。跨会话交接、上线部署注意见 [HANDOFF.md](HANDOFF.md)。
+版本迁移当前到 **V1.0.14**（flyway 历史：V1 / 1.0.1 / 1.0.2 / 1.0.3 / 1.0.4 / 1.0.7 / 1.0.8 / 1.0.9 / 1.0.10 / 1.0.11 / 1.0.12 / 1.0.13 / 1.0.14，版本号不连续为计划内跳过）。跨会话交接、上线部署注意见 [HANDOFF.md](HANDOFF.md)。
 
 ## 技术栈
 
@@ -32,7 +32,7 @@ cd frontend && npm install && npm run dev
 
 | 菜单 | 说明 |
 | --- | --- |
-| 会员管理 | 会员列表/新增/编辑/删除（有流水不可删）、手动上下分、积分流水抽屉、统计卡片 |
+| 会员管理 | 会员列表/新增/编辑/删除（有流水不可删）、手动上下分、积分流水抽屉、统计卡片。列表含**累计上分/下分**（对账用）与**手动上分/手动下分/玩法得分/玩法失分**四列（手动 = 后台手动 + 群内审批，悬浮看拆分）；流水抽屉含来源合计卡 + 来源筛选 + 类型细分标签（V1.0.14） |
 | 报表（增值） | **只读经营总览（非技术口径）**：存量总览（会员/积分存量/群/执行器/操作员）· 今日四口径分开（手动充值上分 / 手动提现下分 / 玩法结算赢 / 玩法结算输）+ 今日抽水/局数/参与玩家/玩法分布 · 近7日趋势（**今天在最上**）· 近N天游戏汇总（受保留期）· 执行器与群明细（展开看群，含未绑定群）· 5 个玩家榜 Top10 · **当前部署信息**（服务器 IP/系统/JDK + 数据库地址与版本）· **下载报表**按钮（把当日全部统计生成一份可留档/打印的 HTML 日报，文件名带日期）。流水永久、游戏数据按 `game_record_retention_days` 保留；抽水口径 = 每局净额 −Σtotal_delta。**当前菜单隐藏**（收费增值服务未开放，代码与路由保留）：`frontend/src/App.jsx` 顶部 `REPORT_MENU_ENABLED` 改为 `true` 并重新构建即放出菜单；已登录用户也可用 URL `/report` 直达 |
 | QQ群管理 | 群信息（群号/群名/创建时间/群主/管理员/人数）；**经营数据**：积分剩余（群内会员当前积分合计）、累计抽水、总对局数（悬浮看「近 30 天」值——累计存计数列不随记录清理缩水，近 30 天实时聚合）；**点群名开成员抽屉**（群统计 + 该群会员明细：积分/累计上下分/状态）；状态 **正常/封禁**（附封禁原因）——封禁的群 agent 停同步、停玩法，且不会被 agent 重新上报解封（只能后台手动解封） |
 | 操作员管理 | **操作员 QQ**（agent 上报本机登录的管理 QQ）：改备注/停用/**禁手动上下分**（can_manual_points）/删除；显示最近登录时间、来源 IP、主机名 |
@@ -51,8 +51,8 @@ cd frontend && npm install && npm run dev
 
 | 接口 | 说明 |
 | --- | --- |
-| `POST /api/open/points/up` | 上分 `{qq, points, reason, bizNo?}`；会员不存在自动建档 |
-| `POST /api/open/points/down` | 下分 `{qq, points, reason, bizNo?}`；余额不足拒绝 |
+| `POST /api/open/points/up` | 上分 `{qq, points, reason, bizNo?, source?}`；会员不存在自动建档；`source` 仅认 `approve`（群内审批），其余/缺省 = `manual` |
+| `POST /api/open/points/down` | 下分 `{qq, points, reason, bizNo?, source?}`；余额不足拒绝；`source` 同上 |
 | `GET /api/open/points/{qq}` | 查某会员积分（`exists` 区分是否建档） |
 | `GET /api/open/points/records?qq=&page=&size=` | 查积分增减记录（分页） |
 | `GET /api/open/points/batch?qqs=10001,10002` | 批量查积分（≤500，去重保序；未建档 `exists:false`） |
@@ -93,6 +93,21 @@ events 每条（≤2000/局）：{qq, nickname?, msg?, reply?, delta, flow?}   �
 - 首次入账同时累加群计数 `qq_groups.game_count`/`rake_total`（重复上报的 `duplicate` 路径不重复计数）。
 - 管理端「游戏记录」可看每局列表与逐条回放；记录默认保留 30 天，`RetentionCleanupService` 定时清理（每 6h，初始延迟 5min）——
   所以群列表的「累计抽水/总对局」用计数列（不随清理减少），「近 30 天」才实时聚合。
+
+### 积分来源分离（V1.0.14）
+
+`point_records.source` 把「操作改分」与「游戏结算改分」彻底分开，会员页与流水不再混在一起：
+
+| source | 含义 | 写入方 |
+| --- | --- | --- |
+| `manual` | 后台手动上下分（含 open 接口不传 `source` 的历史语义） | `POST /api/admin/members/{id}/points`、`/api/open/points/up|down` 不带 source |
+| `approve` | 群内审批通过 | agent `POST /api/open/points/up|down` 带 `"source":"approve"` |
+| `game` | 玩法结算 | `POST /api/open/games/report` 对局入账（后端恒写，外部无法伪造） |
+
+- 写入白名单：非 `approve` 一律归一 `manual`（传 `game`/乱值无效）。
+- **会员列表**：`GET /api/admin/members` 每行附 6 个来源聚合（`manual_income`/`manual_outcome`/`approve_income`/`approve_outcome`/`game_income`/`game_outcome`）+ `game_flow`（玩法流水额，撑庄半额口径）；页面列 **手动上分/手动下分/玩法得分/玩法失分**（手动 = 后台手动 + 群内审批，悬浮看拆分）。
+- **流水查询**：`GET /api/admin/point-records?qq=&type=&source=&page=&size=`（`source` 可空=全部）返回 `summary`（按来源合计，**全量口径不随筛选变化**）与每行 `source`；页面抽屉有合计卡 + 来源筛选（全部/手动/审批/玩法）+ 类型细分标签（手动上分·下分 / 审批上分·下分 / 结算得分·失分 / 流水）。
+- **报表口径**（`ReportService`）：手动 = 非 `game`（含 `approve`）、玩法 = `game`，改用 `source` 判定而不再依赖 `reason` 文案（历史 NULL 按 `manual` 兜底）。
 
 ### 响应格式
 
@@ -141,7 +156,7 @@ src/main/java/com/hbjf/api/
   dao/          RowMapMapper 行映射
   util/         MapBuilder 响应构造
 src/main/resources/
-  db/migration/ Flyway 迁移（V1__init.sql 建表 + V1.0.1~V1.0.4 / V1.0.7~V1.0.13 增量；5/6 号跳号未用）
+  db/migration/ Flyway 迁移（V1__init.sql 建表 + V1.0.1~V1.0.4 / V1.0.7~V1.0.14 增量；5/6 号跳号未用）
   seed_rules/   玩法内置种子（rule_fuhe.py 复合玩法，启动 ensureSeedRules 兜底落盘 data/rules/）
   application*.yml  配置（local 本地 / prod 生产）
 frontend/       PC 管理后台（React + AntD，打包进 static/admin）
@@ -153,5 +168,5 @@ tools/e2e_full.py   全链路 E2E 脚本（对本地 MySQL 真实写入，见 HA
 
 - API 字段 snake_case；`created_at/updated_at` 为 `yyyy-MM-dd HH:mm:ss` 字符串
 - 数据库变更只走 Flyway 迁移（新建 `V1.x.y__描述.sql`），禁止改已执行迁移；H2 测试库同步追加 `src/test/resources/schema-h2.sql`
-- 测试：`mvn -Dskip.fe=true test`（跳过前端构建，52 个用例，含命令通道/群封禁/操作员/对局结算/心跳超时离线/玩法种子兜底（含四副本一致性）/报表口径空库与部署信息/撑庄流水与群计数）
+- 测试：`mvn -Dskip.fe=true test`（跳过前端构建，64 个用例，含命令通道/群封禁/操作员/对局结算/心跳超时离线/玩法种子兜底（含四副本一致性）/报表口径空库与部署信息/撑庄流水与群计数/积分来源分离（三类来源落库·聚合·筛选·报表按 source）**/多场景牌局 8 局剧本**（撑庄三方·四方·平局、大吃小流水兜底、未知会员与余额不足跳过；逐局 Σdelta = −抽水 不变量））
 - 全链路验证：`tools/e2e_full.py`（本机后端 8892 + MySQL）；agent 冒烟 `python -m integration.smoke`（见 agent/README.md）

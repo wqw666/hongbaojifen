@@ -28,6 +28,7 @@ import java.util.Set;
  *   （本事务内逐事件 catch-and-continue 会触发 Spring rollback-only）
  * - 积分与流水分离：事件可带 flow（流水额，缺省 = delta）；积分按 delta 变动，流水按 flow 落库
  *   （撑庄模式：挑战者全额结算半额记流水，庄家记净额与半额流水；平局 delta=0 但 flow≠0 仍记流水）
+ * - 落账的 point_records.source 恒为 'game'（玩法结算），与后台手动 manual / 群内审批 approve 分开统计
  * - 首次入账同时累加群累计统计（qq_groups.game_count/rake_total）；重复上报走幂等提前返回，不会重复计数
  */
 @Service
@@ -187,12 +188,13 @@ public class GameRecordService {
                 }
                 // biz_no = game:{round_id}:{qq}:{事件序号} —— 同一玩家一局内可有多次增减，各自留痕；
                 // 整局幂等已由 game_records.round_id 唯一键保证（事件级不会真重复）
-                jdbc.update("INSERT INTO point_records (qq, member_id, delta, flow_amount, type, reason, operator, biz_no, created_at)"
-                                + " VALUES (?,?,?,?,?,?,?,?,?)",
+                // source=game：与后台手动(manual)/群内审批(approve)分开，会员列表与流水按来源聚合
+                jdbc.update("INSERT INTO point_records (qq, member_id, delta, flow_amount, type, reason, operator, biz_no, source, created_at)"
+                                + " VALUES (?,?,?,?,?,?,?,?,?,?)",
                         qq, memberId, delta, flow, delta > 0 ? "INCOME" : (delta < 0 ? "OUTCOME" : "FLOW"),
                         "玩法:" + (playName.isEmpty() ? "游戏" : playName) + " 结算",
                         "executor:" + executorName,
-                        "game:" + roundId + ":" + qq + ":" + evIndex, now);
+                        "game:" + roundId + ":" + qq + ":" + evIndex, MemberService.SOURCE_GAME, now);
                 applied = delta;
                 flowApplied = flow;
                 totalDelta += delta;

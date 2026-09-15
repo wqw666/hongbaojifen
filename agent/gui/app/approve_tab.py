@@ -167,7 +167,8 @@ class ApprovalTab(ctk.CTkFrame):
                 try:
                     if approve:
                         fn = client.up_points if r["action"] == "up" else client.down_points
-                        res = fn(r["qq"], r["amount"], reason=reason, biz_no=r["biz_no"])
+                        res = fn(r["qq"], r["amount"], reason=reason, biz_no=r["biz_no"],
+                                 source="approve")
                         status = "已通过"
                         if res.get("duplicate"):
                             status = "已通过(重复单，未重复入账)"
