@@ -29,6 +29,14 @@ def main() -> None:
         messagebox.showerror("缺少依赖", "请先安装: pip install customtkinter requests")
         sys.exit(1)
 
+    # agent 只访问本机（NapCat webui / OneBot / 插件回调）与内网总后台。
+    # 本机若开了系统代理（Steam++ / Clash 等），requests/urllib 默认会把
+    # 127.0.0.1 也走代理 → NapCat 探测永远失败（环境未就绪）、二维码加载失败。
+    # 全局强制绕过代理；play_tab/approve_tab 里无 session 的 requests.post 也靠这个兜底。
+    import os
+
+    os.environ["NO_PROXY"] = "*"
+
     from app.main_window import MainWindow
 
     app = MainWindow()

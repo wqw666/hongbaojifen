@@ -8,7 +8,7 @@ QQ 只有两种身份：**会员**（members，从群成员同步而来）或**�
 
 | 路径 | 说明 |
 |------|------|
-| `gui/` | Python + CustomTkinter 桌面端（扫码登录；主界面 7 个 tab：群管理/会员/游戏玩法/积分审批/实时监控/总后台对接/更多）。群管理表格含**积分剩余/累计抽水/总对局**三列（`累计（近30天 X）` 格式，点「刷新」更新；未上报到总后台的群该列为空）。**积分来源分开记**：`integration/backend_client.py::up_points/down_points` 带 `source`（默认 `manual`）→ 总后台会员流水里「手动」「群内审批」「玩法结算」分开统计（V1.0.14）。两个调用点必须区分：积分审批传 `approve`，会员页手动上/下分传 `manual`；旧版 agent 不传该字段，流水会被记为「后台手动」 |
+| `gui/` | Python + CustomTkinter 桌面端（扫码登录；主界面 7 个 tab：群管理/会员/游戏玩法/积分审批/实时监控/总后台对接/更多）。群管理表格含**积分剩余/累计抽水/总对局**三列（`累计（近30天 X）` 格式，点「刷新」更新；未上报到总后台的群该列为空）。**积分来源分开记**：`integration/backend_client.py::up_points/down_points` 带 `source`（默认 `manual`）→ 总后台会员流水里「手动」「群内审批」「玩法结算」分开统计（V1.0.14）。两个调用点必须区分：积分审批传 `approve`，会员页手动上/下分传 `manual`；旧版 agent 不传该字段，流水会被记为「后台手动」。**网络一律不走系统代理**（2026-09-15）：本机开 Steam++/Clash 等代理时，requests 默认连 127.0.0.1 也走代理 → NapCat 探测失败（「环境未就绪」）、二维码加载失败；三处 `requests.Session` 设 `trust_env=False` + 启动时 `NO_PROXY="*"` 兜底裸 `requests.post`（agent 只访问本机与内网总后台，无副作用） |
 | `integration/` | **总后台对接包**（独立于 GUI，纯 requests+标准库，见下文「与总后台对接」） |
 | `play_rules/` | 玩法文件样本（**rule_fuhe.py 复合玩法**——当前唯一玩法，与总后台内置种子同源镜像） |
 | `plugin/` | NapCat 插件 TS 源码（grabRedBag / pullDetail / play 玩法转发），构建产物 `plugin/dist/index.mjs` |

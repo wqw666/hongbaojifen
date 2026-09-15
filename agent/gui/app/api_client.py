@@ -57,6 +57,7 @@ class PluginClient:
         self.cfg = cfg
         self.timeout = timeout
         self.session = requests.Session()
+        self.session.trust_env = False  # 只访问本机 OneBot/插件：不走系统代理（有代理时会被劫持）
         self._resolved_plugin_id = cfg.plugin_id or "napcat-plugin-cleaner"
 
     def _candidate_ids(self) -> list[str]:

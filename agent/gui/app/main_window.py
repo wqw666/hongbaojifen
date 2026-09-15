@@ -26,7 +26,7 @@ from .query_export import write_query_csv
 from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
 from integration.member_sync import group_create_time_str, run_member_sync
 
-APP_VERSION = "2026.09.13-03"
+APP_VERSION = "2026.09.15-01"
 
 
 def _stat_text(total, recent) -> str:

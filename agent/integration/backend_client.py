@@ -40,6 +40,7 @@ class HbjfClient:
         self.api_key = api_key or ""
         self.token = (token or "").strip()
         self._session = requests.Session()
+        self._session.trust_env = False  # 总后台是本机/内网：不走系统代理（有代理时会被劫持）
         self._session.headers.update({X_API_KEY_HEADER: self.api_key, "User-Agent": "hbjf-agent/1.1"})
 
     # ---------- 底层请求 ----------

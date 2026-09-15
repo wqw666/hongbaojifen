@@ -44,6 +44,13 @@
 - **操作员身份守卫**（agent 侧 `integration` 封禁/停用处理）：`ExecutorBanned` → 停摆红字；`OperatorDisabled`（40311）同
 - 授权边界：**后端 Java 改动已被授权**用于本功能集；约束：不主动 git commit（除非被要求）、redbag/ 永不入库、agent GUI 线程纪律（daemon + after(0)）、登录态/密钥/token 永不提交
 
+## 部署包（2026-09-15）
+
+- **`D:\work\hongbaojifen\部署包-2026-09-16.zip`（147MB，另有同名可拷贝目录）——勿提交 git**。内容：`后端/`（jar 密码 123456、jlink JRE 78MB 含 jdk.charsets、start.bat/start.sh、启动后端.bat、建库.sql、VERSION）+ `agent执行器/`（agent.exe **2026.09.15-01** md5 `da75945e…`，强制绕过系统代理；全量 release 含 tools/NapCat）+ 部署说明.txt。**同名可拷贝目录若被运行中的 agent.exe 锁住，删不掉**——先关 agent 再刷新目录（zip 不受影响）。
+- **`部署包-2026-09-16-2.zip` = 同内容但密码 19991020**（jar md5 `659ea433…` 就是本机根 jar——后端代码零改动时可直接复用根 jar 当部署 jar，免重新构建；已按纪律重跑全新建库冒烟：打包 jre + 该 jar + 空库 → 14 迁移全绿、登录 OK、中文种子无损）。两个包选哪个看目标机 MySQL 密码，别混。
+- 构建方法：临时改三份 `application*.yml` 密码 → `mvn clean package -Drevision=1.0.0 -DskipTests` → jar 挪走 → **立刻改回并 `cp` 根 jar 回 `target/` 恢复本机状态**（根 jar `659ea433`=19991020，部署 jar `c9210348`=123456，别混）。`mvn` 期间本机 8892 实例不受影响。
+- 目标机 MySQL root/123456；agent 在目标机填后端地址 `http://<IP>:8892` + 密钥 `hbjf-open-2026` + 管理后台建的执行器 token。
+
 ## 待办（后续迭代方向）
 
 - [ ] 玩法文件版本管理（历史版本/回滚）
@@ -97,6 +104,8 @@
 18. **`-Dskip.fe=false` 仍会跳过前端构建**（2026-09-13 血泪）：pom 里跳过前端是**激活式 profile**（`<activation><property><name>skip.fe</name></property>`，第 165-172 行）——Maven 的 property 激活只看「属性是否存在」，不看值，所以 `-Dskip.fe=false` 反而把 profile 点亮了 → `frontend.skip=true` → vite 不跑、`copy-frontend-dist` 也不拷，打出来的 jar **没有 `BOOT-INF/classes/static/admin/`**（体积小 ~400KB，页面 404）。**要带前端就完全别传这个属性**：`mvn clean package -Drevision=1.0.0 -DskipTests`；打完必看三样——日志有 `vite build` + `Copying 2 resources from frontend\dist`、`unzip -l … | grep static/admin/index.html`、jar 内 `application*.yml` 与源码逐字节一致。
 19. **一个 client 方法服务两个语义相反的调用点 = 迟早串味**（2026-09-13）：`backend_client.up_points/down_points` 曾把 `source="approve"` **写死在函数体里**，但调用它的有两处——积分审批 tab（该 approve）和会员页手动上/下分（该 manual）→ agent 里手动改分会被记成「群内审批」，总后台来源列全错。**教训**：语义参数不写死，改成带默认值的形参（默认取「最保守/最常见」的那个），**每个调用点显式传值**（`approve_tab` 传 `approve`、`main_window` 传 `manual`），并在架构文档里点名这两处；验证用**拦截 `_post` 断言请求体**（不发真实请求），比读代码可靠。
 20. **Git Bash 里调 `.bat` 必须带 `.\` 或先 `cd /d`**（2026-09-13 二次踩）：`cmd //c "build.bat"` → 「'build.bat' 不是内部或外部命令」且**退出码仍是 0**（`; echo $?` 取的是后一条命令的），很容易误判成「构建成功」。可用写法：`cmd //c "cd /d D:\work\hongbaojifen\agent && .\build.bat" > log 2>&1 < /dev/null`（末尾 `pause` 靠 `< /dev/null` 直接返回）。**判据**：看产物时间戳/md5，别信退出码。
+21. **jlink 精简 JRE 必须带 `jdk.charsets` 模块**（2026-09-15 血泪，部署包差点发坏件）：缺它时 mysql-connector 的字符集协商会**静默退化成 eucjpms**，全新装库时 Flyway V1.0.2 中文种子直接 1366 `Incorrect string value: '\x8B\xE8...'` —— 报错字节是合法 UTF-8 中文，极具迷惑性（\x8B 其实是「测」的尾字节被 eucjpms 切错了边界）。**判定三件套**：`mysql -e "SELECT @@character_set_client"`（本机 CLI 默认 gbk 是客户端自己选的，属正常；应用连接必须 utf8mb4）、**用完整 JDK 跑同一命令对照**（JDK 好 jre 坏 → 秒定位 jlink 缺模块）、日志里 `Cannot convert ... from eucjpms` 警告。**部署包必须做「全新建库冒烟」**：`jre/bin/java -jar <部署jar> --server.port=8893 --spring.datasource.url=jdbc:mysql://localhost:3306/<新库>?…&createDatabaseIfNotExist=true --spring.datasource.password=<本机密码>` → 全量迁移 + admin 登录 + 中文种子回读 + `/admin/` 200，验完 taskkill + DROP 该库。另：目标机建库必须显式 utf8mb4（包内 `建库.sql`），否则 `createDatabaseIfNotExist` 建的库吃服务器默认字符集；本机 `character_set_server` 是 utf8mb4 但 CLI 会话默认 gbk，别被迷惑。
+22. **系统代理会劫持 localhost：agent 一律不走代理**（2026-09-15 血泪）：本机开系统代理（`HKCU\...\Internet Settings`，实测 Steam++ `127.0.0.1:26561`，ProxyOverride 只放行 10.*/192.168.* **不含 127.0.0.1**）后，requests/urllib 连 NapCat webui 都走代理 → 404 → agent「环境未就绪，正在重试」+ 二维码加载失败；**curl 直连是通的**（curl 不读注册表代理），所以拿 curl 和 python requests 对同一个 localhost URL 各打一发即可秒判：curl 200 / requests 404 = 代理劫持。修复（APP_VERSION 2026.09.15-01）：三个 `requests.Session()`（napcat_webui / api_client / backend_client）建后 `trust_env = False`；`gui/main.py` 启动 `os.environ["NO_PROXY"] = "*"` 兜底 play_tab/approve_tab 的裸 `requests.post`。**验证冻结 exe 时注意**：`self.session.trust_env = False` 的 `trust_env` 在 **co_names** 里不在 co_consts 里；入口脚本 `gui/main.py` 的代码在 CArchive 的 **`main` 条目**（不是 PYZ 的 `gui.main`），搜 NO_PROXY 要去那里。
 
 ## 结构速览
 

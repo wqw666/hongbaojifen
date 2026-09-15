@@ -35,6 +35,7 @@ class NapCatWebUI:
         self.token = token
         self.timeout = timeout
         self.session = requests.Session()
+        self.session.trust_env = False  # 只访问本机 NapCat webui：不走系统代理（有代理时会被劫持成 404）
 
     @classmethod
     def from_napcat_dir(cls, base_url: str, napcat_dir) -> "NapCatWebUI":
