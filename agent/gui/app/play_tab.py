@@ -142,6 +142,7 @@ class PlayTab(ctk.CTkScrollableFrame):
         row.pack(fill="x", padx=10, pady=2)
         ctk.CTkLabel(row, text="游戏群（勾选参与玩法的群，可多选）", width=230, anchor="w").pack(side="left")
         ctk.CTkButton(row, text="刷新群列表", width=100, command=self._refresh_group_checkboxes).pack(side="left", padx=4)
+        ctk.CTkButton(row, text="重新激活玩法", width=100, command=self._re_activate_play).pack(side="left", padx=4)
         self.var_auto_members = ctk.BooleanVar(value=self.cfg.play_auto_register_members)
         ctk.CTkCheckBox(row, text="启用时自动注册群成员为会员", variable=self.var_auto_members,
                         command=self._save_auto_members).pack(side="left", padx=8)
@@ -277,13 +278,25 @@ class PlayTab(ctk.CTkScrollableFrame):
                              "nickname": str(data.get("nickname") or ""), "text": text})
 
     def _on_callback_approve(self, data: dict) -> None:
-        """HTTP 线程：上/下积分申请 → 审批页（on_approve 由 MainWindow 挂接）。"""
+        """HTTP 线程：上/下积分申请 → 审批页（on_approve 由 MainWindow 挂接）。
+        不再静默吞异常：任何丢弃都记 _flog，方便对照「群里回了已提交、审批页没单」的现场。"""
         handler = getattr(self, "on_approve", None)
-        if callable(handler):
-            try:
-                handler(data)
-            except Exception:
-                pass
+        if not callable(handler):
+            _flog(f"✗ 上/下分申请被丢弃（审批页未挂接 on_approve）: {data}")
+            return
+        qq = str(data.get("qq") or "")
+        amount = data.get("amount")
+        try:
+            amount_int = int(amount)
+        except (TypeError, ValueError):
+            amount_int = 0
+        if not qq or amount_int <= 0:
+            _flog(f"✗ 非法上/下分申请被丢弃（qq 空或金额非正数）: {data}")
+            return
+        try:
+            handler(data)
+        except Exception as e:
+            _flog(f"✗ 审批申请入队异常（申请可能丢失）: {e}  data={data}")
 
     def _on_callback_redpacket(self, data: dict) -> None:
         """HTTP 线程：红包领取事件入队（红包计分玩法）。"""
@@ -1101,6 +1114,19 @@ class PlayTab(ctk.CTkScrollableFrame):
             ctk.CTkLabel(self.frame_group_list,
                          text="（暂无群：请到「群管理」页添加，或到「实时监控」填写监控群）",
                          text_color="gray").pack(anchor="w", padx=4, pady=4)
+        # 引擎已激活时，勾选列表里新出现的群自动加入转发（在「群管理」页后加的群，
+        # 点一下「刷新群列表」即生效，不必逐个勾选）；并同步「当前群」下拉框——
+        # 此前下拉框只在勾选变化/自动激活完成时刷新，群管理后加的群永远选不到。
+        if self.engine.is_active():
+            added = [g for g in checked if g not in self._active_groups]
+            if added:
+                self._active_groups.update(added)
+                self._push_play_groups()
+                self.cfg.play_group_id = ",".join(sorted(self._active_groups))
+                self.save_config(self.cfg)
+                self._log(f"已加入游戏群 {'、'.join(sorted(added))}")
+                self._apply_state()
+        self._refresh_group_optmenu()
         self._rounds_refresh()
 
     def _push_play_groups(self) -> None:
@@ -1366,7 +1392,23 @@ class PlayTab(ctk.CTkScrollableFrame):
             self.after(0, self._apply_state)
             self.after(0, self._rounds_refresh)
 
-        threading.Thread(target=run, name="play-autoload", daemon=True).start()
+        def run_guarded() -> None:
+            try:
+                run()
+            finally:
+                self.after(0, setattr, self, "_reactivating", False)
+
+        threading.Thread(target=run_guarded, name="play-autoload", daemon=True).start()
+
+    def _re_activate_play(self) -> None:
+        """手动重新激活玩法：启动时自动激活失败（当时未配总后台/后端未起/无群）的补救入口。
+        复用 _auto_restore 全流程：拉玩法列表 → 下载 → 按当前群列表推转发 → 激活引擎。"""
+        if getattr(self, "_reactivating", False):
+            self._log("重新激活进行中，请稍候…")
+            return
+        self._reactivating = True
+        self._log("重新激活玩法（重新拉取总后台玩法与游戏群转发配置）…")
+        self._auto_restore()
 
     def _reload_rule(self) -> None:
         """更新玩法文件：从总后台重新下载当前激活玩法（引擎 mtime 热重载生效）。"""

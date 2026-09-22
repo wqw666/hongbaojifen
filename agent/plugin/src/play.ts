@@ -94,9 +94,13 @@ export function handleApproveMessage(ctx: NapCatPluginContext, event: any): bool
   const text = extractPlainText(event);
   const m = /^(上|下)(?:分)?\s*(\d+)$/.exec(text);
   if (!m) return false;
-  // 群过滤：玩法群优先，否则监控群，都没有则全部
-  const allow = config.playGroups.length ? config.playGroups : (config.watchGroups || []);
-  if (allow.length && !allow.includes(groupId)) return false;
+  // 群过滤：与 handlePlayMessage 放行口径一致——玩法群或监控群任一即可，两个名单都空 = 不限群。
+  // （旧口径「玩法群优先，否则监控群」会在玩法群非空时把监控群的申请直接丢弃，
+  //   而玩法转发照样放行 → 群里回了「申请已提交」但审批页永远看不到申请）
+  const inPlay = config.playGroups.length ? config.playGroups.includes(groupId) : false;
+  const inWatch = (config.watchGroups || []).includes(groupId);
+  const allowAll = !config.playGroups.length && !(config.watchGroups || []).length;
+  if (!allowAll && !inPlay && !inWatch) return false;
   const base = config.playCallback || PLAY_CALLBACK_DEFAULT;
   let url: string;
   try {
@@ -104,18 +108,23 @@ export function handleApproveMessage(ctx: NapCatPluginContext, event: any): bool
   } catch {
     return false;
   }
-  fetch(url, {
+  const body = JSON.stringify({
+    kind: 'approve', group_id: groupId, qq,
+    nickname: String(event?.sender?.nickname ?? event?.nickname ?? ''),
+    action: m[1] === '上' ? 'up' : 'down',
+    amount: Number(m[2]),
+    msg_time: Number(event?.time || 0), // QQ 消息发送时间（秒）→ agent 审批页显示申请时间
+  });
+  // agent 回调瞬时不可用（重启/端口抖动）时重试一次，减少「回复了却丢申请」的概率
+  const send = () => fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      kind: 'approve', group_id: groupId, qq,
-      nickname: String(event?.sender?.nickname ?? event?.nickname ?? ''),
-      action: m[1] === '上' ? 'up' : 'down',
-      amount: Number(m[2]),
-      msg_time: Number(event?.time || 0), // QQ 消息发送时间（秒）→ agent 审批页显示申请时间
-    }),
+    body,
     signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
-  }).catch(() => {});
+  });
+  send().catch(() => send()).catch(() => {
+    /* 两次都失败：丢弃（agent 未监听时玩法也没法回复，不会出现「回了却丢单」） */
+  });
   return true;
 }
 

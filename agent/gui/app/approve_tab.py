@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import json
 import queue
 import threading
 from datetime import datetime
@@ -23,6 +24,7 @@ import customtkinter as ctk
 import requests
 
 from integration.backend_client import BackendError, ExecutorBanned, OperatorDisabled
+from .config_manager import config_dir
 
 if False:  # pragma: no cover — 仅类型注释用
     from .config_manager import AppConfig
@@ -33,13 +35,19 @@ class ApprovalTab(ctk.CTkFrame):
         super().__init__(master)
         self.cfg = cfg
         self.client_factory = client_factory  # () -> HbjfClient
-        self._queue: queue.Queue = queue.Queue()
+        self._queue: queue.Queue = queue.Queue()       # HTTP 线程 → worker
+        self._ui_queue: queue.Queue = queue.Queue()    # worker → UI 线程（轮询队列，禁止跨线程 after）
         self._rows: list[dict] = []
         self._stop = threading.Event()
 
         self._build_ui()
+        self._restore_rows()
         self._worker = threading.Thread(target=self._loop, name="approve-worker", daemon=True)
         self._worker.start()
+        # 主线程轮询器：跨线程 after() 会抛 RuntimeError('main thread is not in main loop')
+        # （启动/弹窗/切视图等主线程不在 mainloop 的窗口期），异常又被 except 吞掉 → 申请静默丢失。
+        # 改为纯 queue + 主线程 after 自续轮询，杜绝这条丢单路径。
+        self.after(200, self._ui_poll)
 
     # ================= 界面 =================
 
@@ -100,16 +108,18 @@ class ApprovalTab(ctk.CTkFrame):
             except queue.Empty:
                 continue
             try:
-                self._add_row(data)
+                row = self._build_row(data)
             except Exception:
-                pass
+                continue
+            self._ui_queue.put(row)
 
-    def _add_row(self, data: dict) -> None:
+    def _build_row(self, data: dict) -> dict:
+        """worker 线程：纯数据构建，不碰任何 UI。"""
         action = "上分" if data.get("action") == "up" else "下分"
         ts = int(data.get("msg_time") or 0)
         # 申请时间：优先 QQ 消息真实发送时刻（插件 msg_time）；没有则用 agent 收到时刻
         applied_at = (datetime.fromtimestamp(ts) if ts > 0 else datetime.now())
-        row = {
+        return {
             "time": applied_at.strftime("%m-%d %H:%M:%S"),
             "group_id": str(data.get("group_id") or ""),
             "qq": str(data.get("qq") or ""),
@@ -119,7 +129,17 @@ class ApprovalTab(ctk.CTkFrame):
             "status": "待审批",
             "biz_no": f"approve:{data.get('group_id')}:{data.get('qq')}:{data.get('amount')}:{int(datetime.now().timestamp())}",
         }
-        self.after(0, lambda: self._insert_row(row))
+
+    def _ui_poll(self) -> None:
+        """主线程：消费 worker 队列 → 入表（self.after 只在主线程调用，线程安全）。"""
+        try:
+            while True:
+                row = self._ui_queue.get_nowait()
+                self._insert_row(row)
+        except queue.Empty:
+            pass
+        if not self._stop.is_set():
+            self.after(200, self._ui_poll)
 
     def _insert_row(self, row: dict) -> None:
         if not row.get("amount") or not row.get("qq"):
@@ -130,6 +150,42 @@ class ApprovalTab(ctk.CTkFrame):
             row["time"], row["group_id"], row["qq"], row["nickname"],
             row["action"], row["amount"], row["status"]), tags=("pending",))
         self.lbl_info.configure(text=f"待审批 {self._pending_count()} 条（选中后点「通过/拒绝」）")
+        self._persist()
+
+    def _persist(self) -> None:
+        """审批行落盘（%APPDATA%/QQHongbaoMonitor/approve_rows.json）：
+        重启/闪退后待审批与已处理记录不丢——上分申请是钱，不能只活在内存里。"""
+        try:
+            (config_dir() / "approve_rows.json").write_text(
+                json.dumps(self._rows, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _restore_rows(self) -> None:
+        """启动时从磁盘恢复审批行（含已处理历史）。"""
+        try:
+            raw = json.loads((config_dir() / "approve_rows.json").read_text(encoding="utf-8"))
+            rows = raw if isinstance(raw, list) else []
+        except Exception:
+            rows = []
+        for r in rows:
+            if not r.get("amount") or not r.get("qq"):
+                continue
+            self._rows.append(r)
+            iid = f"{len(self._rows) - 1}"
+            status = str(r.get("status") or "待审批")
+            if status == "待审批":
+                tags = ("pending",)
+            elif status.startswith("已通过"):
+                tags = ("ok",)
+            else:
+                tags = ("rejected",)
+            self.tree.insert("", "end", iid=iid, values=(
+                r.get("time") or "", r.get("group_id") or "", r.get("qq") or "",
+                r.get("nickname") or "", r.get("action") or "up",
+                r.get("amount") or 0, status), tags=tags)
+        if self._rows:
+            self.lbl_info.configure(text=f"待审批 {self._pending_count()} 条（选中后点「通过/拒绝」）")
 
     # ================= 审批动作 =================
 
@@ -190,6 +246,7 @@ class ApprovalTab(ctk.CTkFrame):
                 text=f"处理完成：通过 {sum(1 for r in rows if r['status'].startswith('已通过'))}，"
                      f"拒绝 {sum(1 for r in rows if r['status'] == '已拒绝')}，"
                      f"失败 {sum(1 for r in rows if r['status'].startswith('失败'))}"))
+            self.after(0, self._persist)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -242,6 +299,7 @@ class ApprovalTab(ctk.CTkFrame):
                 r["time"], r["group_id"], r["qq"], r["nickname"],
                 r["action"], r["amount"], r["status"]), tags=("pending",))
         self.lbl_info.configure(text=f"待审批 {self._pending_count()} 条")
+        self._persist()
 
     def shutdown(self) -> None:
         self._stop.set()

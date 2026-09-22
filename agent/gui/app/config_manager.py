@@ -52,6 +52,9 @@ class AppConfig:
     game_fee_rate: int = 20                      # 游戏费率（千分比，20=2%）：修改即上报总后台执行器
     play_auto_register_members: bool = False     # 启用玩法后自动把游戏群成员注册为会员（幂等）
 
+    # ---- 界面显示 ----
+    ui_font_scale: float = 1.0                   # 界面字体缩放（1.0=100%；2K/4K 屏字太小可调到 1.3~1.5）
+
     def plays_dir(self) -> Path:
         """玩法规则文件本地缓存目录（%APPDATA%/QQHongbaoMonitor/plays）。"""
         d = config_dir() / "plays"

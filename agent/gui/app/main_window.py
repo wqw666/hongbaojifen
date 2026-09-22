@@ -26,7 +26,42 @@ from .query_export import write_query_csv
 from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
 from integration.member_sync import group_create_time_str, run_member_sync
 
-APP_VERSION = "2026.09.15-01"
+APP_VERSION = "2026.09.22-02"
+
+
+def apply_font_scale_all(root, prev_scale: float, new_scale: float, base_map: dict) -> dict:
+    """等比缩放整棵控件树的 CTkFont（CTk 6.0 的 set_widget_scaling 不改已有字体，
+    只改尺寸——所以字体要手动调）。base_map: id(font) -> 原始字号（字面值按上一档
+    比例折算），防止多次调整叠加漂移；返回更新后的 base_map。"""
+    def walk(w):
+        yield w
+        for c in w.winfo_children():
+            yield from walk(c)
+
+    for w in walk(root):
+        try:
+            font = w.cget("font")
+        except Exception:
+            continue
+        if isinstance(font, ctk.CTkFont):
+            key = id(font)
+            base = base_map.get(key)
+            if base is None:
+                base = font.cget("size") / max(prev_scale, 0.1)
+                base_map[key] = base
+            # tk 字体尺寸只收整数
+            font.configure(size=max(8, int(round(base * new_scale))))
+    # ttk 表格/页签字体不受 CTk 缩放影响，单独调全局样式
+    try:
+        import tkinter.ttk as ttk
+        st = ttk.Style(root)
+        sz = max(8, int(round(10 * new_scale)))
+        st.configure("Treeview", font=("Microsoft YaHei UI", sz))
+        st.configure("Treeview.Heading", font=("Microsoft YaHei UI", max(9, sz), "bold"))
+        st.configure("TNotebook.Tab", font=("Microsoft YaHei UI", sz))
+    except Exception:
+        pass
+    return base_map
 
 
 def _stat_text(total, recent) -> str:
@@ -103,6 +138,12 @@ class MainWindow(ctk.CTk):
         self.minsize(960, 640)
 
         self.cfg = load_config()
+        # 界面字体缩放：2K/4K 高分屏默认字太小；按配置调整（0.6~2.5），
+        # 必须先于 _build_ui 应用，否则首帧布局用旧比例。
+        startup_scale = max(0.6, min(2.5, float(self.cfg.ui_font_scale or 1.0)))
+        ctk.set_widget_scaling(startup_scale)
+        self._font_scale_applied = startup_scale   # 当前已生效比例（后建控件按此基准折算原始字号）
+        self._font_base_map: dict = {}             # id(font) -> 原始字号（防叠加漂移）
         self.client = PluginClient(self.cfg)
         self._poll_job: str | None = None
         self._polling = False
@@ -126,6 +167,21 @@ class MainWindow(ctk.CTk):
         self._schedule_login_poll()
 
     # ---------- UI ----------
+
+    def _font_scale(self, delta: float) -> None:
+        """顶栏 A−/A+：界面字体缩放（0.6~2.5，0.1 步进）。立即生效并持久化。
+        注意：CTk 6.0 的 set_widget_scaling 只改控件尺寸、**不改已有字体**（实测 15→15），
+        必须手动等比缩放整棵树的 CTkFont，另调 ttk 表格样式字体。"""
+        s = round(min(2.5, max(0.6, float(getattr(self.cfg, "ui_font_scale", 1.0) or 1.0) + delta)), 2)
+        if s == self.cfg.ui_font_scale:
+            return
+        self.cfg.ui_font_scale = s
+        self.save_config(self.cfg)
+        ctk.set_widget_scaling(s)
+        self._font_base_map = apply_font_scale_all(self, self._font_scale_applied, s, self._font_base_map)
+        self._font_scale_applied = s
+        self.lbl_font_scale.configure(text=f"{int(s * 100)}%")
+        self._log_status(f"界面字体已调整为 {int(s * 100)}%（立即生效，已保存）")
 
     def _setup_tree_styles(self) -> None:
         """ttk Treeview 在 CustomTkinter 下选中行常不可见，强制高亮。"""
@@ -203,13 +259,21 @@ class MainWindow(ctk.CTk):
         )
         self.lbl_conn = ctk.CTkLabel(header, text="连接: 检测中…", text_color="gray")
         self.lbl_conn.grid(row=0, column=1, sticky="e", padx=8)
+        ctk.CTkButton(header, text="A−", width=44, command=lambda: self._font_scale(-0.1)).grid(
+            row=0, column=2, sticky="e", padx=(8, 0)
+        )
+        self.lbl_font_scale = ctk.CTkLabel(header, text=f"{int(self.cfg.ui_font_scale * 100)}%", width=46)
+        self.lbl_font_scale.grid(row=0, column=3, sticky="e")
+        ctk.CTkButton(header, text="A+", width=44, command=lambda: self._font_scale(0.1)).grid(
+            row=0, column=4, sticky="e", padx=(0, 8)
+        )
         ctk.CTkButton(header, text="刷新", width=100, command=self.refresh_status).grid(
-            row=0, column=2, sticky="e"
+            row=0, column=5, sticky="e"
         )
         ctk.CTkButton(
             header, text="退出登录", width=100, fg_color="#c0392b", hover_color="#96281b",
             command=self.logout_qq,
-        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
+        ).grid(row=0, column=6, sticky="e", padx=(8, 0))
 
         self.tabs = ctk.CTkTabview(self.view_main)
         self.tabs.grid(row=1, column=0, sticky="nsew", padx=16, pady=12)
