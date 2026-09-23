@@ -67,7 +67,7 @@ def main() -> int:
     shutil.copy2(dist_exe, release / exe_name)
 
     # 启动脚本
-    for name in ("start_silent.bat", "一键启动.bat", "启动.vbs"):
+    for name in ("start_silent.bat", "一键启动.bat", "启动.vbs", "stop.bat"):
         p = root / name
         if p.exists():
             shutil.copy2(p, release / name)
@@ -131,6 +131,7 @@ def main() -> int:
   agent.exe            主程序
   一键启动.bat         推荐：自动启动 NapCat + 打开 GUI
   启动.vbs             无黑窗启动
+  stop.bat             彻底停止：agent + NapCat + QQ 全部结束
   tools\\NapCat\\        内置 QQ 框架（必需，勿删）
   使用说明.txt         本文件
   agent\\                开发者源码（日常使用可忽略）

@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """QQ 群红包监控 — 桌面客户端入口。"""
 
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,19 @@ def _bootstrap_paths() -> None:
 
 def main() -> None:
     _bootstrap_paths()
+    if getattr(sys, "frozen", False):
+        # PyInstaller onefile：bootloader 会把解包临时目录 _MEIxxxx 加进 PATH。
+        # 子进程（wscript→cmd→NapCat→QQ）继承 PATH 后，加载 VCRUNTIME140.dll 等
+        # 运行库时可能命中 _MEI 里的副本并一直占用 → agent 退出时 bootloader
+        # 删不掉临时目录，每次关窗弹「Failed to remove temporary directory」。
+        # 本进程的 DLL 在启动时已按全路径加载完，不需要 _MEI 在 PATH 里——剥掉即可；
+        # 顺带把 CWD 钉到 exe 目录，杜绝子进程以临时目录为工作目录。
+        cleaned = [p for p in os.environ.get("PATH", "").split(os.pathsep) if "_MEI" not in p]
+        os.environ["PATH"] = os.pathsep.join(cleaned)
+        try:
+            os.chdir(Path(sys.executable).resolve().parent)
+        except OSError:
+            pass
     try:
         import customtkinter  # noqa: F401
     except ImportError:
@@ -33,8 +47,6 @@ def main() -> None:
     # 本机若开了系统代理（Steam++ / Clash 等），requests/urllib 默认会把
     # 127.0.0.1 也走代理 → NapCat 探测永远失败（环境未就绪）、二维码加载失败。
     # 全局强制绕过代理；play_tab/approve_tab 里无 session 的 requests.post 也靠这个兜底。
-    import os
-
     os.environ["NO_PROXY"] = "*"
 
     from app.main_window import MainWindow

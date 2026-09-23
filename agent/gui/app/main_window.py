@@ -26,7 +26,7 @@ from .query_export import write_query_csv
 from integration.backend_client import BackendError, ExecutorBanned, HbjfClient, OperatorDisabled
 from integration.member_sync import group_create_time_str, run_member_sync
 
-APP_VERSION = "2026.09.22-02"
+APP_VERSION = "2026.09.22-03"
 
 
 def apply_font_scale_all(root, prev_scale: float, new_scale: float, base_map: dict) -> dict:
